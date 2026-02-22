@@ -1,0 +1,1154 @@
+{
+  "run_id": "5fa16cea-0f95-471f-ba28-d6c4c9371769",
+  "as_of": "2026-02-22T15:05:32.272194+00:00",
+  "mode": "mock",
+  "user_request": "애플(AAPL) 주식을 지금 매수해도 괜찮을까요? 6개월 투자 관점에서 분석해 주세요.",
+  "target_ticker": "AAPL",
+  "analysis_tasks": [
+    "macro",
+    "fundamental",
+    "sentiment",
+    "quant"
+  ],
+  "portfolio_context": {},
+  "orchestrator_directives": {
+    "current_iteration": 0,
+    "action_type": "initial_delegation",
+    "investment_brief": {
+      "rationale": "사용자 요청 '애플(AAPL) 주식을 지금 매수해도 괜찮을까요? 6개월 투자 관점에서 분석해 주세요.'을 분석하여 AAPL 중심의 롱 포지션 검토를 개시. 투자 기간 중기(1~6개월). 4개 데스크에 종합 분석을 지시.",
+      "target_universe": [
+        "AAPL"
+      ]
+    },
+    "desk_tasks": {
+      "macro": {
+        "horizon_days": 30,
+        "focus_areas": [
+          "금리 인하 확률",
+          "테크 섹터 베타 환경",
+          "GDP/CPI 추세"
+        ]
+      },
+      "fundamental": {
+        "horizon_days": 90,
+        "focus_areas": [
+          "부채비율 및 유동성",
+          "현금흐름 안정성",
+          "밸류에이션 적정성 (PER, PBR)"
+        ]
+      },
+      "sentiment": {
+        "horizon_days": 5,
+        "focus_areas": [
+          "옵션 스큐(Skew)",
+          "실적 발표 관련 뉴스 감성",
+          "내부자 매매 동향"
+        ]
+      },
+      "quant": {
+        "horizon_days": 10,
+        "risk_budget": "Moderate",
+        "focus_areas": [
+          "평균 회귀 Z-score",
+          "CVaR 한도 내 최적 비중",
+          "모멘텀 점수"
+        ]
+      }
+    }
+  },
+  "macro_analysis": {
+    "agent_type": "macro",
+    "run_id": "5fa16cea-0f95-471f-ba28-d6c4c9371769",
+    "generated_at": "2026-02-22T15:05:32.279532+00:00",
+    "as_of": "2026-02-22T15:05:32.272194+00:00",
+    "ticker": "AAPL",
+    "horizon_days": 30,
+    "primary_decision": "bullish",
+    "recommendation": "allow",
+    "confidence": 0.65,
+    "risk_flags": [],
+    "evidence": [
+      {
+        "source_type": "model",
+        "source_name": "mock",
+        "as_of": "2026-02-22T15:05:32.272194+00:00",
+        "metric": "yield_curve_spread",
+        "value": 1.78,
+        "quality_score": 0.3,
+        "note": null
+      },
+      {
+        "source_type": "model",
+        "source_name": "mock",
+        "as_of": "2026-02-22T15:05:32.272194+00:00",
+        "metric": "hy_oas",
+        "value": 391.0,
+        "quality_score": 0.3,
+        "note": null
+      },
+      {
+        "source_type": "model",
+        "source_name": "mock",
+        "as_of": "2026-02-22T15:05:32.272194+00:00",
+        "metric": "inflation_expectation",
+        "value": 1.65,
+        "quality_score": 0.3,
+        "note": null
+      },
+      {
+        "source_type": "model",
+        "source_name": "mock",
+        "as_of": "2026-02-22T15:05:32.272194+00:00",
+        "metric": "cpi_yoy",
+        "value": 3.6,
+        "quality_score": 0.3,
+        "note": null
+      },
+      {
+        "source_type": "model",
+        "source_name": "mock",
+        "as_of": "2026-02-22T15:05:32.272194+00:00",
+        "metric": "pmi",
+        "value": 47.1,
+        "quality_score": 0.3,
+        "note": null
+      },
+      {
+        "source_type": "model",
+        "source_name": "mock",
+        "as_of": "2026-02-22T15:05:32.272194+00:00",
+        "metric": "fed_funds_rate",
+        "value": 4.55,
+        "quality_score": 0.3,
+        "note": null
+      },
+      {
+        "source_type": "model",
+        "source_name": "mock",
+        "as_of": "2026-02-22T15:05:32.272194+00:00",
+        "metric": "gdp_growth",
+        "value": 4.03,
+        "quality_score": 0.3,
+        "note": null
+      },
+      {
+        "source_type": "model",
+        "source_name": "macro_engine",
+        "as_of": "2026-02-22T15:05:32.272194+00:00",
+        "metric": "curve_state",
+        "value": "steep",
+        "quality_score": 0.9,
+        "note": null
+      },
+      {
+        "source_type": "model",
+        "source_name": "macro_engine",
+        "as_of": "2026-02-22T15:05:32.272194+00:00",
+        "metric": "credit_stress_level",
+        "value": "normal",
+        "quality_score": 0.9,
+        "note": null
+      },
+      {
+        "source_type": "model",
+        "source_name": "macro_engine",
+        "as_of": "2026-02-22T15:05:32.272194+00:00",
+        "metric": "inflation_state",
+        "value": "falling",
+        "quality_score": 0.9,
+        "note": null
+      },
+      {
+        "source_type": "model",
+        "source_name": "macro_engine",
+        "as_of": "2026-02-22T15:05:32.272194+00:00",
+        "metric": "growth_state",
+        "value": "below_trend",
+        "quality_score": 0.9,
+        "note": null
+      }
+    ],
+    "limitations": [
+      "Mock 데이터 사용 — 실제 매크로 지표와 차이 가능"
+    ],
+    "data_ok": true,
+    "summary": "Macro regime: expansion. cyclicals, growth > value",
+    "status": "ok",
+    "macro_regime_raw": "expansion",
+    "macro_regime": "expansion",
+    "overlay_guidance": {
+      "regime": "expansion",
+      "equity_overlay_guidance": "cyclicals, growth > value",
+      "risk_overlay": "normal net exposure",
+      "tail_risk_warning": false
+    },
+    "tail_risk_warning": false,
+    "indicators": {
+      "curve_state": "steep",
+      "credit_stress_level": "normal",
+      "inflation_state": "falling",
+      "growth_state": "below_trend",
+      "real_policy_stance": "restrictive",
+      "credit_stress_override": false,
+      "macro_regime": "expansion",
+      "tail_risk_warning": false
+    },
+    "regime": "expansion",
+    "gdp_growth": 4.03,
+    "interest_rate": 4.55,
+    "iteration_generated": 1
+  },
+  "fundamental_analysis": {
+    "agent_type": "fundamental",
+    "run_id": "5fa16cea-0f95-471f-ba28-d6c4c9371769",
+    "generated_at": "2026-02-22T15:05:32.279448+00:00",
+    "as_of": "2026-02-22T15:05:32.272194+00:00",
+    "ticker": "AAPL",
+    "horizon_days": 90,
+    "primary_decision": "bullish",
+    "recommendation": "allow",
+    "confidence": 0.65,
+    "risk_flags": [],
+    "evidence": [
+      {
+        "source_type": "model",
+        "source_name": "mock",
+        "as_of": "2026-02-22T15:05:32.272194+00:00",
+        "metric": "revenue_growth",
+        "value": 22.83,
+        "quality_score": 0.3,
+        "note": null
+      },
+      {
+        "source_type": "model",
+        "source_name": "mock",
+        "as_of": "2026-02-22T15:05:32.272194+00:00",
+        "metric": "operating_margin",
+        "value": 25.54,
+        "quality_score": 0.3,
+        "note": null
+      },
+      {
+        "source_type": "model",
+        "source_name": "mock",
+        "as_of": "2026-02-22T15:05:32.272194+00:00",
+        "metric": "roe",
+        "value": 28.24,
+        "quality_score": 0.3,
+        "note": null
+      },
+      {
+        "source_type": "model",
+        "source_name": "mock",
+        "as_of": "2026-02-22T15:05:32.272194+00:00",
+        "metric": "debt_to_equity",
+        "value": 0.67,
+        "quality_score": 0.3,
+        "note": null
+      },
+      {
+        "source_type": "model",
+        "source_name": "mock",
+        "as_of": "2026-02-22T15:05:32.272194+00:00",
+        "metric": "pe_ratio",
+        "value": 35.14,
+        "quality_score": 0.3,
+        "note": null
+      },
+      {
+        "source_type": "model",
+        "source_name": "mock",
+        "as_of": "2026-02-22T15:05:32.272194+00:00",
+        "metric": "free_cash_flow",
+        "value": 24169.0,
+        "quality_score": 0.3,
+        "note": null
+      },
+      {
+        "source_type": "model",
+        "source_name": "fundamental_engine",
+        "as_of": "2026-02-22T15:05:32.272194+00:00",
+        "metric": "altman_z_score",
+        "value": 4.6569,
+        "quality_score": 0.9,
+        "note": "bucket=safe"
+      },
+      {
+        "source_type": "model",
+        "source_name": "fundamental_engine",
+        "as_of": "2026-02-22T15:05:32.272194+00:00",
+        "metric": "interest_coverage",
+        "value": 5.95,
+        "quality_score": 0.9,
+        "note": null
+      },
+      {
+        "source_type": "model",
+        "source_name": "fundamental_engine",
+        "as_of": "2026-02-22T15:05:32.272194+00:00",
+        "metric": "debt_to_ebitda",
+        "value": 1.3,
+        "quality_score": 0.9,
+        "note": null
+      }
+    ],
+    "limitations": [
+      "Mock 재무제표 — 실제 SEC filing과 차이 가능",
+      "SEC 텍스트 분석 미수행 — going concern/restatement 확인 불가"
+    ],
+    "data_ok": true,
+    "summary": "핵심 구조적 리스크 없음. 재무 건전성 양호.",
+    "status": "ok",
+    "valuation_block": {
+      "pe_ratio": 35.14,
+      "revenue_growth_pct": 22.83,
+      "roe_pct": 28.24,
+      "debt_to_equity": 0.67
+    },
+    "quality_block": {
+      "altman": {
+        "z_score": 4.6569,
+        "bucket": "safe",
+        "altman_red_flag": false,
+        "error": null
+      },
+      "coverage": {
+        "interest_coverage": 5.95,
+        "icr_bucket": "strong",
+        "interest_red_flag": false,
+        "debt_to_ebitda": 1.3,
+        "leverage_bucket": "low",
+        "leverage_red_flag": false
+      },
+      "fcf_quality": {
+        "fcf_margin_pct": 10.18,
+        "fcf_negative_streak_years": 2,
+        "fcf_quality_flag": false
+      }
+    },
+    "structural_risk_flag": false,
+    "hard_red_flags": [],
+    "soft_flags": [],
+    "notes_for_risk_manager": "핵심 구조적 리스크 없음. 재무 건전성 양호.",
+    "sector": "Technology",
+    "revenue_growth": 22.83,
+    "roe": 28.24,
+    "debt_to_equity": 0.67,
+    "pe_ratio": 35.14,
+    "iteration_generated": 1
+  },
+  "sentiment_analysis": {
+    "agent_type": "sentiment",
+    "run_id": "5fa16cea-0f95-471f-ba28-d6c4c9371769",
+    "generated_at": "2026-02-22T15:05:32.281370+00:00",
+    "as_of": "2026-02-22T15:05:32.272194+00:00",
+    "ticker": "AAPL",
+    "horizon_days": 7,
+    "primary_decision": "neutral",
+    "recommendation": "allow_with_limits",
+    "confidence": 0.45,
+    "risk_flags": [],
+    "evidence": [
+      {
+        "source_type": "model",
+        "source_name": "mock",
+        "as_of": "2026-02-22T15:05:32.272194+00:00",
+        "metric": "put_call_ratio",
+        "value": 1.12,
+        "quality_score": 0.3,
+        "note": null
+      },
+      {
+        "source_type": "model",
+        "source_name": "mock",
+        "as_of": "2026-02-22T15:05:32.272194+00:00",
+        "metric": "pcr_percentile_90d",
+        "value": 54.4,
+        "quality_score": 0.3,
+        "note": null
+      },
+      {
+        "source_type": "model",
+        "source_name": "mock",
+        "as_of": "2026-02-22T15:05:32.272194+00:00",
+        "metric": "vix_level",
+        "value": 23.47,
+        "quality_score": 0.3,
+        "note": null
+      },
+      {
+        "source_type": "model",
+        "source_name": "mock",
+        "as_of": "2026-02-22T15:05:32.272194+00:00",
+        "metric": "short_interest_pct",
+        "value": 10.4,
+        "quality_score": 0.3,
+        "note": null
+      },
+      {
+        "source_type": "model",
+        "source_name": "mock",
+        "as_of": "2026-02-22T15:05:32.272194+00:00",
+        "metric": "news_sentiment_score",
+        "value": 0.6,
+        "quality_score": 0.3,
+        "note": null
+      },
+      {
+        "source_type": "model",
+        "source_name": "sentiment_engine",
+        "as_of": "2026-02-22T15:05:32.272194+00:00",
+        "metric": "pcr_state",
+        "value": "neutral",
+        "quality_score": 0.9,
+        "note": null
+      },
+      {
+        "source_type": "model",
+        "source_name": "sentiment_engine",
+        "as_of": "2026-02-22T15:05:32.272194+00:00",
+        "metric": "volatility_regime",
+        "value": "normal",
+        "quality_score": 0.9,
+        "note": null
+      },
+      {
+        "source_type": "model",
+        "source_name": "sentiment_engine",
+        "as_of": "2026-02-22T15:05:32.272194+00:00",
+        "metric": "sentiment_regime",
+        "value": "neutral",
+        "quality_score": 0.9,
+        "note": null
+      },
+      {
+        "source_type": "model",
+        "source_name": "sentiment_engine",
+        "as_of": "2026-02-22T15:05:32.272194+00:00",
+        "metric": "positioning_crowding",
+        "value": "balanced",
+        "quality_score": 0.9,
+        "note": null
+      },
+      {
+        "source_type": "model",
+        "source_name": "sentiment_engine",
+        "as_of": "2026-02-22T15:05:32.272194+00:00",
+        "metric": "tilt_factor",
+        "value": 1.0,
+        "quality_score": 0.9,
+        "note": "hard_cap [0.7, 1.3]"
+      }
+    ],
+    "limitations": [
+      "Mock 감성 데이터 — 실제 시장 포지셔닝과 차이 가능",
+      "Sentiment는 tactical overlay만 — 단독 방향성 결정 불가 (R5)"
+    ],
+    "data_ok": true,
+    "summary": "Sentiment: neutral, Vol: normal, Timing: neutral, Tilt: 1.0",
+    "status": "ok",
+    "sentiment_regime": "neutral",
+    "positioning_crowding": "balanced",
+    "volatility_regime": "normal",
+    "entry_timing_signal": "neutral",
+    "catalysts": [],
+    "tilt_factor": 1.0,
+    "tactical_notes": "Tilt 1.00 applied. Vol regime normal.",
+    "overall_sentiment": "neutral",
+    "sentiment_score": 0.6,
+    "iteration_generated": 1
+  },
+  "technical_analysis": {
+    "agent_type": "quant",
+    "run_id": "5fa16cea-0f95-471f-ba28-d6c4c9371769",
+    "generated_at": "2026-02-22T15:05:32.272194+00:00",
+    "as_of": "2026-02-22T15:05:32.272194+00:00",
+    "ticker": "AAPL",
+    "decision": "LONG",
+    "final_allocation_pct": 0.0,
+    "z_score": -2.3344,
+    "asset_cvar_99_daily": 0.026549,
+    "quant_payload": {
+      "timestamp": "2026-02-22T15:05:32Z",
+      "market_regime_context": {
+        "model_used": "GaussianHMM_3_States",
+        "state_probabilities": {
+          "regime_0_calm": 0.2327,
+          "regime_1_mean_revert": 0.7673,
+          "regime_2_high_vol": 0.0
+        },
+        "volatility_forecast": {
+          "model": "GARCH(1,1)",
+          "t_plus_1_volatility": 0.1806
+        }
+      },
+      "alpha_signals": {
+        "statistical_arbitrage": {
+          "adf_test": {
+            "p_value": 0.0054,
+            "is_stationary": true
+          },
+          "execution": {
+            "hedge_ratio": 0.2176,
+            "current_z_score": -2.3344,
+            "half_life_days": 11.14
+          }
+        },
+        "factor_exposures": {
+          "newey_west_t_stat": -0.2464,
+          "p_value": 0.8055
+        }
+      },
+      "portfolio_risk_parameters": {
+        "max_portfolio_cvar_limit": 0.015,
+        "asset_cvar_99_daily": 0.026549,
+        "kelly_optimization": {
+          "full_kelly_fraction": 0.0,
+          "fractional_multiplier": 0.25
+        }
+      },
+      "_diagnostics": {
+        "statarb_error": null,
+        "factor_error": null,
+        "regime_error": null,
+        "kelly_error": null
+      },
+      "_data_ok": true
+    },
+    "llm_decision": {
+      "cot_reasoning": "[Step1] regime_2_high_vol=0% ≤ 50% → 정상. [Step2] ADF p=0.0054 유의. Factor 비유의. [Step3] Z-Score=-2.33 → LONG. [Step4] final_alloc=0.0.",
+      "decision": "LONG",
+      "final_allocation_pct": 0.0
+    },
+    "evidence": [
+      {
+        "source_type": "model",
+        "source_name": "mock",
+        "as_of": "2026-02-22T15:05:32.272194+00:00",
+        "metric": "adj_close",
+        "value": "504pt OU synth",
+        "quality_score": 0.3,
+        "note": "AAPL synthetic via OU process"
+      },
+      {
+        "source_type": "model",
+        "source_name": "quant_engine",
+        "as_of": "2026-02-22T15:05:32.272194+00:00",
+        "metric": "z_score",
+        "value": -2.3344,
+        "quality_score": 0.9,
+        "note": null
+      },
+      {
+        "source_type": "model",
+        "source_name": "quant_engine",
+        "as_of": "2026-02-22T15:05:32.272194+00:00",
+        "metric": "asset_cvar_99_daily",
+        "value": 0.026549,
+        "quality_score": 0.9,
+        "note": null
+      }
+    ],
+    "summary": "Quant: LONG alloc=0.0, Z=-2.3344",
+    "status": "ok",
+    "data_ok": true,
+    "primary_decision": "bullish",
+    "recommendation": "allow",
+    "confidence": 0.6,
+    "risk_flags": [],
+    "limitations": [
+      "Mock data"
+    ],
+    "iteration_generated": 1
+  },
+  "risk_assessment": {
+    "grade": "Low",
+    "risk_decision": {
+      "per_ticker_decisions": {
+        "AAPL": {
+          "final_weight": 0.0,
+          "decision": "approve",
+          "flags": [],
+          "rationale_short": "모든 리스크 게이트 통과 — 원안 승인."
+        }
+      },
+      "portfolio_actions": {
+        "hedge_recommendations": [],
+        "gross_net_adjustment": null
+      },
+      "orchestrator_feedback": {
+        "required": false,
+        "reasons": [],
+        "detail": "모든 Gate 통과."
+      },
+      "_disagreement_score": 0.275,
+      "_canonical_regime": "expansion"
+    },
+    "risk_payload": {
+      "timestamp": "2026-02-22T15:05:32Z",
+      "risk_limits": {
+        "max_leverage": 2.0,
+        "max_gross_exposure": 2.0,
+        "max_net_exposure": 0.8,
+        "max_portfolio_cvar_1d": 0.015,
+        "max_single_name_weight": 0.15,
+        "max_sector_weight": 0.35,
+        "max_hhi": 0.25,
+        "max_quant_weight_anomaly": 0.2,
+        "conservative_fallback_weight": 0.03,
+        "liquidity_days_warning": 5
+      },
+      "portfolio_risk_summary": {
+        "total_gross_exposure": 0.0,
+        "total_net_exposure": 0.0,
+        "leverage_ratio": 0.0,
+        "portfolio_cvar_1d": 0.0,
+        "component_var_by_ticker": {
+          "AAPL": 0.0
+        },
+        "herfindahl_index": 0.0,
+        "liquidity_score_by_ticker": {
+          "AAPL": 0.01
+        },
+        "sector_exposure": {
+          "Technology": 0.0
+        },
+        "error": null
+      },
+      "analyst_reports": {
+        "macro": {
+          "agent_type": "macro",
+          "run_id": "5fa16cea-0f95-471f-ba28-d6c4c9371769",
+          "generated_at": "2026-02-22T15:05:32.279532+00:00",
+          "as_of": "2026-02-22T15:05:32.272194+00:00",
+          "ticker": "AAPL",
+          "horizon_days": 30,
+          "primary_decision": "bullish",
+          "recommendation": "allow",
+          "confidence": 0.65,
+          "risk_flags": [],
+          "evidence": [
+            {
+              "source_type": "model",
+              "source_name": "mock",
+              "as_of": "2026-02-22T15:05:32.272194+00:00",
+              "metric": "yield_curve_spread",
+              "value": 1.78,
+              "quality_score": 0.3,
+              "note": null
+            },
+            {
+              "source_type": "model",
+              "source_name": "mock",
+              "as_of": "2026-02-22T15:05:32.272194+00:00",
+              "metric": "hy_oas",
+              "value": 391.0,
+              "quality_score": 0.3,
+              "note": null
+            },
+            {
+              "source_type": "model",
+              "source_name": "mock",
+              "as_of": "2026-02-22T15:05:32.272194+00:00",
+              "metric": "inflation_expectation",
+              "value": 1.65,
+              "quality_score": 0.3,
+              "note": null
+            },
+            {
+              "source_type": "model",
+              "source_name": "mock",
+              "as_of": "2026-02-22T15:05:32.272194+00:00",
+              "metric": "cpi_yoy",
+              "value": 3.6,
+              "quality_score": 0.3,
+              "note": null
+            },
+            {
+              "source_type": "model",
+              "source_name": "mock",
+              "as_of": "2026-02-22T15:05:32.272194+00:00",
+              "metric": "pmi",
+              "value": 47.1,
+              "quality_score": 0.3,
+              "note": null
+            },
+            {
+              "source_type": "model",
+              "source_name": "mock",
+              "as_of": "2026-02-22T15:05:32.272194+00:00",
+              "metric": "fed_funds_rate",
+              "value": 4.55,
+              "quality_score": 0.3,
+              "note": null
+            },
+            {
+              "source_type": "model",
+              "source_name": "mock",
+              "as_of": "2026-02-22T15:05:32.272194+00:00",
+              "metric": "gdp_growth",
+              "value": 4.03,
+              "quality_score": 0.3,
+              "note": null
+            },
+            {
+              "source_type": "model",
+              "source_name": "macro_engine",
+              "as_of": "2026-02-22T15:05:32.272194+00:00",
+              "metric": "curve_state",
+              "value": "steep",
+              "quality_score": 0.9,
+              "note": null
+            },
+            {
+              "source_type": "model",
+              "source_name": "macro_engine",
+              "as_of": "2026-02-22T15:05:32.272194+00:00",
+              "metric": "credit_stress_level",
+              "value": "normal",
+              "quality_score": 0.9,
+              "note": null
+            },
+            {
+              "source_type": "model",
+              "source_name": "macro_engine",
+              "as_of": "2026-02-22T15:05:32.272194+00:00",
+              "metric": "inflation_state",
+              "value": "falling",
+              "quality_score": 0.9,
+              "note": null
+            },
+            {
+              "source_type": "model",
+              "source_name": "macro_engine",
+              "as_of": "2026-02-22T15:05:32.272194+00:00",
+              "metric": "growth_state",
+              "value": "below_trend",
+              "quality_score": 0.9,
+              "note": null
+            }
+          ],
+          "limitations": [
+            "Mock 데이터 사용 — 실제 매크로 지표와 차이 가능"
+          ],
+          "data_ok": true,
+          "summary": "Macro regime: expansion. cyclicals, growth > value",
+          "status": "ok",
+          "macro_regime_raw": "expansion",
+          "macro_regime": "expansion",
+          "overlay_guidance": {
+            "regime": "expansion",
+            "equity_overlay_guidance": "cyclicals, growth > value",
+            "risk_overlay": "normal net exposure",
+            "tail_risk_warning": false
+          },
+          "tail_risk_warning": false,
+          "indicators": {
+            "curve_state": "steep",
+            "credit_stress_level": "normal",
+            "inflation_state": "falling",
+            "growth_state": "below_trend",
+            "real_policy_stance": "restrictive",
+            "credit_stress_override": false,
+            "macro_regime": "expansion",
+            "tail_risk_warning": false
+          },
+          "regime": "expansion",
+          "gdp_growth": 4.03,
+          "interest_rate": 4.55,
+          "iteration_generated": 1
+        },
+        "fundamental": {
+          "agent_type": "fundamental",
+          "run_id": "5fa16cea-0f95-471f-ba28-d6c4c9371769",
+          "generated_at": "2026-02-22T15:05:32.279448+00:00",
+          "as_of": "2026-02-22T15:05:32.272194+00:00",
+          "ticker": "AAPL",
+          "horizon_days": 90,
+          "primary_decision": "bullish",
+          "recommendation": "allow",
+          "confidence": 0.65,
+          "risk_flags": [],
+          "evidence": [
+            {
+              "source_type": "model",
+              "source_name": "mock",
+              "as_of": "2026-02-22T15:05:32.272194+00:00",
+              "metric": "revenue_growth",
+              "value": 22.83,
+              "quality_score": 0.3,
+              "note": null
+            },
+            {
+              "source_type": "model",
+              "source_name": "mock",
+              "as_of": "2026-02-22T15:05:32.272194+00:00",
+              "metric": "operating_margin",
+              "value": 25.54,
+              "quality_score": 0.3,
+              "note": null
+            },
+            {
+              "source_type": "model",
+              "source_name": "mock",
+              "as_of": "2026-02-22T15:05:32.272194+00:00",
+              "metric": "roe",
+              "value": 28.24,
+              "quality_score": 0.3,
+              "note": null
+            },
+            {
+              "source_type": "model",
+              "source_name": "mock",
+              "as_of": "2026-02-22T15:05:32.272194+00:00",
+              "metric": "debt_to_equity",
+              "value": 0.67,
+              "quality_score": 0.3,
+              "note": null
+            },
+            {
+              "source_type": "model",
+              "source_name": "mock",
+              "as_of": "2026-02-22T15:05:32.272194+00:00",
+              "metric": "pe_ratio",
+              "value": 35.14,
+              "quality_score": 0.3,
+              "note": null
+            },
+            {
+              "source_type": "model",
+              "source_name": "mock",
+              "as_of": "2026-02-22T15:05:32.272194+00:00",
+              "metric": "free_cash_flow",
+              "value": 24169.0,
+              "quality_score": 0.3,
+              "note": null
+            },
+            {
+              "source_type": "model",
+              "source_name": "fundamental_engine",
+              "as_of": "2026-02-22T15:05:32.272194+00:00",
+              "metric": "altman_z_score",
+              "value": 4.6569,
+              "quality_score": 0.9,
+              "note": "bucket=safe"
+            },
+            {
+              "source_type": "model",
+              "source_name": "fundamental_engine",
+              "as_of": "2026-02-22T15:05:32.272194+00:00",
+              "metric": "interest_coverage",
+              "value": 5.95,
+              "quality_score": 0.9,
+              "note": null
+            },
+            {
+              "source_type": "model",
+              "source_name": "fundamental_engine",
+              "as_of": "2026-02-22T15:05:32.272194+00:00",
+              "metric": "debt_to_ebitda",
+              "value": 1.3,
+              "quality_score": 0.9,
+              "note": null
+            }
+          ],
+          "limitations": [
+            "Mock 재무제표 — 실제 SEC filing과 차이 가능",
+            "SEC 텍스트 분석 미수행 — going concern/restatement 확인 불가"
+          ],
+          "data_ok": true,
+          "summary": "핵심 구조적 리스크 없음. 재무 건전성 양호.",
+          "status": "ok",
+          "valuation_block": {
+            "pe_ratio": 35.14,
+            "revenue_growth_pct": 22.83,
+            "roe_pct": 28.24,
+            "debt_to_equity": 0.67
+          },
+          "quality_block": {
+            "altman": {
+              "z_score": 4.6569,
+              "bucket": "safe",
+              "altman_red_flag": false,
+              "error": null
+            },
+            "coverage": {
+              "interest_coverage": 5.95,
+              "icr_bucket": "strong",
+              "interest_red_flag": false,
+              "debt_to_ebitda": 1.3,
+              "leverage_bucket": "low",
+              "leverage_red_flag": false
+            },
+            "fcf_quality": {
+              "fcf_margin_pct": 10.18,
+              "fcf_negative_streak_years": 2,
+              "fcf_quality_flag": false
+            }
+          },
+          "structural_risk_flag": false,
+          "hard_red_flags": [],
+          "soft_flags": [],
+          "notes_for_risk_manager": "핵심 구조적 리스크 없음. 재무 건전성 양호.",
+          "sector": "Technology",
+          "revenue_growth": 22.83,
+          "roe": 28.24,
+          "debt_to_equity": 0.67,
+          "pe_ratio": 35.14,
+          "iteration_generated": 1
+        },
+        "sentiment": {
+          "agent_type": "sentiment",
+          "run_id": "5fa16cea-0f95-471f-ba28-d6c4c9371769",
+          "generated_at": "2026-02-22T15:05:32.281370+00:00",
+          "as_of": "2026-02-22T15:05:32.272194+00:00",
+          "ticker": "AAPL",
+          "horizon_days": 7,
+          "primary_decision": "neutral",
+          "recommendation": "allow_with_limits",
+          "confidence": 0.45,
+          "risk_flags": [],
+          "evidence": [
+            {
+              "source_type": "model",
+              "source_name": "mock",
+              "as_of": "2026-02-22T15:05:32.272194+00:00",
+              "metric": "put_call_ratio",
+              "value": 1.12,
+              "quality_score": 0.3,
+              "note": null
+            },
+            {
+              "source_type": "model",
+              "source_name": "mock",
+              "as_of": "2026-02-22T15:05:32.272194+00:00",
+              "metric": "pcr_percentile_90d",
+              "value": 54.4,
+              "quality_score": 0.3,
+              "note": null
+            },
+            {
+              "source_type": "model",
+              "source_name": "mock",
+              "as_of": "2026-02-22T15:05:32.272194+00:00",
+              "metric": "vix_level",
+              "value": 23.47,
+              "quality_score": 0.3,
+              "note": null
+            },
+            {
+              "source_type": "model",
+              "source_name": "mock",
+              "as_of": "2026-02-22T15:05:32.272194+00:00",
+              "metric": "short_interest_pct",
+              "value": 10.4,
+              "quality_score": 0.3,
+              "note": null
+            },
+            {
+              "source_type": "model",
+              "source_name": "mock",
+              "as_of": "2026-02-22T15:05:32.272194+00:00",
+              "metric": "news_sentiment_score",
+              "value": 0.6,
+              "quality_score": 0.3,
+              "note": null
+            },
+            {
+              "source_type": "model",
+              "source_name": "sentiment_engine",
+              "as_of": "2026-02-22T15:05:32.272194+00:00",
+              "metric": "pcr_state",
+              "value": "neutral",
+              "quality_score": 0.9,
+              "note": null
+            },
+            {
+              "source_type": "model",
+              "source_name": "sentiment_engine",
+              "as_of": "2026-02-22T15:05:32.272194+00:00",
+              "metric": "volatility_regime",
+              "value": "normal",
+              "quality_score": 0.9,
+              "note": null
+            },
+            {
+              "source_type": "model",
+              "source_name": "sentiment_engine",
+              "as_of": "2026-02-22T15:05:32.272194+00:00",
+              "metric": "sentiment_regime",
+              "value": "neutral",
+              "quality_score": 0.9,
+              "note": null
+            },
+            {
+              "source_type": "model",
+              "source_name": "sentiment_engine",
+              "as_of": "2026-02-22T15:05:32.272194+00:00",
+              "metric": "positioning_crowding",
+              "value": "balanced",
+              "quality_score": 0.9,
+              "note": null
+            },
+            {
+              "source_type": "model",
+              "source_name": "sentiment_engine",
+              "as_of": "2026-02-22T15:05:32.272194+00:00",
+              "metric": "tilt_factor",
+              "value": 1.0,
+              "quality_score": 0.9,
+              "note": "hard_cap [0.7, 1.3]"
+            }
+          ],
+          "limitations": [
+            "Mock 감성 데이터 — 실제 시장 포지셔닝과 차이 가능",
+            "Sentiment는 tactical overlay만 — 단독 방향성 결정 불가 (R5)"
+          ],
+          "data_ok": true,
+          "summary": "Sentiment: neutral, Vol: normal, Timing: neutral, Tilt: 1.0",
+          "status": "ok",
+          "sentiment_regime": "neutral",
+          "positioning_crowding": "balanced",
+          "volatility_regime": "normal",
+          "entry_timing_signal": "neutral",
+          "catalysts": [],
+          "tilt_factor": 1.0,
+          "tactical_notes": "Tilt 1.00 applied. Vol regime normal.",
+          "overall_sentiment": "neutral",
+          "sentiment_score": 0.6,
+          "iteration_generated": 1
+        },
+        "quant": {
+          "agent_type": "quant",
+          "run_id": "5fa16cea-0f95-471f-ba28-d6c4c9371769",
+          "generated_at": "2026-02-22T15:05:32.272194+00:00",
+          "as_of": "2026-02-22T15:05:32.272194+00:00",
+          "ticker": "AAPL",
+          "decision": "LONG",
+          "final_allocation_pct": 0.0,
+          "z_score": -2.3344,
+          "asset_cvar_99_daily": 0.026549,
+          "quant_payload": {
+            "timestamp": "2026-02-22T15:05:32Z",
+            "market_regime_context": {
+              "model_used": "GaussianHMM_3_States",
+              "state_probabilities": {
+                "regime_0_calm": 0.2327,
+                "regime_1_mean_revert": 0.7673,
+                "regime_2_high_vol": 0.0
+              },
+              "volatility_forecast": {
+                "model": "GARCH(1,1)",
+                "t_plus_1_volatility": 0.1806
+              }
+            },
+            "alpha_signals": {
+              "statistical_arbitrage": {
+                "adf_test": {
+                  "p_value": 0.0054,
+                  "is_stationary": true
+                },
+                "execution": {
+                  "hedge_ratio": 0.2176,
+                  "current_z_score": -2.3344,
+                  "half_life_days": 11.14
+                }
+              },
+              "factor_exposures": {
+                "newey_west_t_stat": -0.2464,
+                "p_value": 0.8055
+              }
+            },
+            "portfolio_risk_parameters": {
+              "max_portfolio_cvar_limit": 0.015,
+              "asset_cvar_99_daily": 0.026549,
+              "kelly_optimization": {
+                "full_kelly_fraction": 0.0,
+                "fractional_multiplier": 0.25
+              }
+            },
+            "_diagnostics": {
+              "statarb_error": null,
+              "factor_error": null,
+              "regime_error": null,
+              "kelly_error": null
+            },
+            "_data_ok": true
+          },
+          "llm_decision": {
+            "cot_reasoning": "[Step1] regime_2_high_vol=0% ≤ 50% → 정상. [Step2] ADF p=0.0054 유의. Factor 비유의. [Step3] Z-Score=-2.33 → LONG. [Step4] final_alloc=0.0.",
+            "decision": "LONG",
+            "final_allocation_pct": 0.0
+          },
+          "evidence": [
+            {
+              "source_type": "model",
+              "source_name": "mock",
+              "as_of": "2026-02-22T15:05:32.272194+00:00",
+              "metric": "adj_close",
+              "value": "504pt OU synth",
+              "quality_score": 0.3,
+              "note": "AAPL synthetic via OU process"
+            },
+            {
+              "source_type": "model",
+              "source_name": "quant_engine",
+              "as_of": "2026-02-22T15:05:32.272194+00:00",
+              "metric": "z_score",
+              "value": -2.3344,
+              "quality_score": 0.9,
+              "note": null
+            },
+            {
+              "source_type": "model",
+              "source_name": "quant_engine",
+              "as_of": "2026-02-22T15:05:32.272194+00:00",
+              "metric": "asset_cvar_99_daily",
+              "value": 0.026549,
+              "quality_score": 0.9,
+              "note": null
+            }
+          ],
+          "summary": "Quant: LONG alloc=0.0, Z=-2.3344",
+          "status": "ok",
+          "data_ok": true,
+          "primary_decision": "bullish",
+          "recommendation": "allow",
+          "confidence": 0.6,
+          "risk_flags": [],
+          "limitations": [
+            "Mock data"
+          ],
+          "iteration_generated": 1
+        },
+        "_target_ticker": "AAPL"
+      }
+    },
+    "_iteration_evaluated": 1,
+    "summary": "Risk assessment completed.",
+    "evidence": [],
+    "status": "ok"
+  },
+  "final_report": "# 📊 Investment Committee Memo — AAPL\n\n> **Date:** 2026-02-22 15:05 UTC | **Prepared by:** AI IC Report Writer | **Iterations:** 1\n\n---\n\n## 1. Executive Summary\n\n| Item | Value |\n|------|-------|\n| **Verdict** | **BUY** |\n| **Final Weight** | **0.00%** |\n| **Risk Grade** | Low |\n| **Macro Regime** | expansion |\n\n> **핵심 논거:** AAPL는 퀀트 모델의 매수 신호(Z-score: -2.3344)와 견고한 펀더멘털(매출 성장 22.83%, ROE 28.24%)을 기반으로, 현행 리스크 한도 내에서 **0.00%** 비중의 롱 포지션이 승인됨.\n\n---\n\n## 2. Alpha Thesis\n\n### 퀀트 엣지\n- **Quant Signal:** LONG | Z-score: **-2.3344**\n- **Asset CVaR (99%, 1d):** 2.65%\n- **추천 비중:** 0.00%\n\n### 매크로 환경\n- **GDP 성장률:** 4.03% | **기준금리:** 4.55%\n- **레짐:** expansion\n\n### 펀더멘털\n| 지표 | 값 |\n|------|-----|\n| 매출 성장률 | 22.83% |\n| ROE | 28.24% |\n| 부채비율 | 0.67 |\n| PER | 35.14 |\n\n### 센티먼트\n- **Overall:** neutral (Score: 0.6)\n\n---\n\n## 3. Risk & Mitigation\n\n| Risk Flag | 설명 |\n|-----------|------|\n| (없음) | 모든 리스크 게이트 통과 |\n\n> **리스크 매니저 판단:** 모든 리스크 게이트 통과 — 원안 승인.\n\n\n\n\n\n---\n\n## 4. Sizing & Execution\n\n| 항목 | 값 |\n|------|-----|\n| Quant 추천 비중 | 0.00% |\n| Risk-adjusted 최종 비중 | **0.00%** |\n| Portfolio CVaR (1d, 99%) | 0.00% |\n| Leverage | 0.0 |\n| Stress Test Loss | N/A |\n| HHI (집중도) | 0.0 |\n\n---\n\n## 5. Key Assumptions & Review Triggers\n\n1. **매크로 레짐** — 현재 'expansion' 레짐이 유지된다고 가정. 레짐이 'recession'/'crisis'로 전환 시 즉시 재검토.\n2. **펀더멘털** — 다음 분기 실적 발표까지 현재 매출 성장률(22.83%)이 유지된다고 가정.\n3. **유동성** — 일평균 거래대금이 충분하여 포지션 진입/청산에 슬리피지가 미미하다고 가정.\n4. **재검토 트리거** — Z-score 반전(0 이상 → 0 이하), CVaR 한도 초과, 또는 구조적 리스크 플래그 발생 시.\n\n---\n\n*본 보고서는 AI 투자 분석 시스템에 의해 자동 생성되었습니다. 최종 투자 결정은 반드시 인간 심의위원의 승인이 필요합니다.*",
+  "iteration_count": 1,
+  "completed_tasks": {
+    "macro": true,
+    "fundamental": true,
+    "sentiment": true,
+    "quant": true
+  },
+  "errors": [],
+  "trace": [
+    {
+      "node": "orchestrator",
+      "iteration": 1,
+      "action_type": "initial_delegation",
+      "analysis_tasks": [
+        "macro",
+        "fundamental",
+        "sentiment",
+        "quant"
+      ]
+    }
+  ]
+}
