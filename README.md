@@ -67,5 +67,51 @@ python investment_team.py --mode live
 - `engines/`: Deterministic numerical computation engines.
 - `data_providers/`: API connectors and data normalization.
 - `schemas/`: Pydantic models for type-safe state and evidence.
-- `runs/`: Output directory for audit logs and final states.
-- `tests/`: Comprehensive test suite for engines and agents.
+- `llm/`: Multi-provider LLM router (Groq, Gemini).
+- `risk/`: Risk gate engine — `risk/engine.py` (fixed 1→5 order) + `risk/gates/` (Gate 1–5 files).
+- `portfolio/`: Deterministic multi-ticker portfolio allocator.
+- `storage/`: Point-in-Time snapshot store — `pit_store.py`.
+- `validators/`: LLM output fact-check — `factcheck.py`.
+- `backtest/`: PIT-based reproducible backtest runner.
+- `runs/`: Output directory per `run_id` (raw/features/decisions/llm_io/final_report/config).
+- `tests/`: 58 tests covering all engines, agents, gates, and invariants.
+
+## 🧪 Running Tests
+
+```bash
+./.venv/bin/python -m pytest tests/ -v
+```
+
+Key test files:
+| File | Purpose |
+|------|---------|
+| `test_gate_order.py` | Risk Gates run strictly 1→2→3→4→5 |
+| `test_gate_parity.py` | New engine matches old compute_risk_decision (decision-level) |
+| `test_report_factcheck.py` | T3: LLM report/narrative fact-check + fallback |
+| `test_pipeline_reproducibility.py` | T4: same PIT → identical positions_final + gate_trace |
+| `test_quant_engine_isolation.py` | T1: quant_engine has no HTTP imports |
+
+## 📊 Backtest
+
+```bash
+# Mock mode (deterministic, no API keys needed)
+./.venv/bin/python backtest/runner.py \
+  --start 2024-01-01 --end 2024-06-30 \
+  --universe AAPL MSFT --mode mock --seed 42
+```
+
+Output files written to `runs/backtest_{id}/`:
+- `backtest_results.csv` — per-period returns, turnover, drawdown
+- `backtest_summary.json` — CAGR, Sharpe, MaxDD, config_hash
+- `config/config_hash.txt` — reproducibility key
+
+## ✅ Definition of Done (DoD)
+
+| DoD | Status |
+|-----|--------|
+| DoD1: All agent outputs Pydantic-validated | ✅ `schemas/common.py` BaseAnalystOutput |
+| DoD2: `runs/{run_id}/raw/features/decisions/llm_io/final_report/config` | ✅ `storage/pit_store.py` |
+| DoD3: Risk gate trace always 1→2→3→4→5 | ✅ `risk/engine.py` GATES fixed array |
+| DoD4: Report/narrative fact-check + retry/fallback | ✅ `validators/factcheck.py` |
+| DoD5: Backtest runner reproducible PIT results | ✅ `backtest/runner.py` |
+| DoD6: T1–T4 pytest all PASS | ✅ 58/58 tests green |

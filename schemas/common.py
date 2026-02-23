@@ -48,6 +48,28 @@ class RiskFlag(BaseModel):
     linked_metrics: List[str] = Field(default_factory=list)
 
 
+class DataQuality(BaseModel):
+    """에이전트 출력의 데이터 품질 메타데이터."""
+    missing_pct: float = Field(default=0.0, ge=0.0, le=1.0, description="결측 필드 비율")
+    delay_hrs: float = Field(default=0.0, ge=0.0, description="데이터 지연 시간(시간)")
+    anomaly_flags: List[str] = Field(default_factory=list, description="이상 플래그 (예: lookahead_violation)")
+    source_timestamps: Dict[str, str] = Field(default_factory=dict, description="소스별 타임스탬프")
+    is_mock: bool = False
+
+
+class Assumption(BaseModel):
+    """에이전트 결정의 핵심 가정."""
+    key: str
+    text: str
+    value: Any = None
+
+
+class ReviewTrigger(BaseModel):
+    """결정 재검토 조건."""
+    condition: str = Field(description="재검토가 필요한 조건")
+    action: str = Field(description="권장 대응 액션")
+
+
 def make_evidence(
     metric: str,
     value: Any,
@@ -167,8 +189,12 @@ class BaseAnalystOutput(BaseModel):
         "allow", "allow_with_limits", "reject", "no_trade"
     ] = "allow_with_limits"
     confidence: float = Field(default=0.5, ge=0.0, le=1.0)
+    signal_strength: float = Field(default=0.5, ge=0.0, le=1.0, description="신호 강도 (0=약, 1=강)")
     risk_flags: List[RiskFlag] = Field(default_factory=list)
     evidence: List[EvidenceItem] = Field(default_factory=list)
+    data_quality: DataQuality = Field(default_factory=DataQuality)
+    assumptions: List[Assumption] = Field(default_factory=list)
+    review_triggers: List[ReviewTrigger] = Field(default_factory=list)
     limitations: List[str] = Field(default_factory=list)
     data_ok: bool = True
     summary: str = ""
@@ -249,11 +275,19 @@ def _merge_lists(a: list, b: list) -> list:
 
 
 class InvestmentState(TypedDict, total=False):
-    """LangGraph 공유 상태 (V2). Annotated 필드는 병렬 노드 동시 쓰기 지원."""
+    """LangGraph 공유 상태 (V3). 멀티 종목 + 포지션 추적 + 감사 지원."""
+    # Run context
     run_id: str
     as_of: str
     mode: str
+    run_context: dict  # {run_id, as_of, mode, seed, git_commit, config_hash}
 
+    # Universe & positions
+    universe: List[str]          # 분석 대상 티커 목록
+    positions_proposed: dict     # Allocator 출력: {ticker -> weight}
+    positions_final: dict        # Risk 최종 확정: {ticker -> weight}
+
+    # Legacy
     user_request: str
     target_ticker: str
     analysis_tasks: list
@@ -274,6 +308,9 @@ class InvestmentState(TypedDict, total=False):
     errors: Annotated[list, _merge_lists]
     trace: Annotated[list, _merge_lists]
 
+    # Audit
+    audit: dict  # {paths, gate_trace, validations}
+
 
 def generate_run_id() -> str:
     return str(uuid.uuid4())
@@ -287,12 +324,25 @@ def create_initial_state(
     user_request: str,
     mode: str = "mock",
     portfolio_context: dict | None = None,
+    universe: list | None = None,
+    seed: int | None = None,
 ) -> InvestmentState:
     """초기 InvestmentState 팩토리."""
+    run_id = generate_run_id()
+    as_of = now_iso()
     return InvestmentState(
-        run_id=generate_run_id(),
-        as_of=now_iso(),
+        run_id=run_id,
+        as_of=as_of,
         mode=mode,
+        run_context={
+            "run_id": run_id,
+            "as_of": as_of,
+            "mode": mode,
+            "seed": seed,
+        },
+        universe=universe or [],
+        positions_proposed={},
+        positions_final={},
         user_request=user_request,
         target_ticker="",
         analysis_tasks=[],
@@ -308,4 +358,5 @@ def create_initial_state(
         completed_tasks={},
         errors=[],
         trace=[],
+        audit={"paths": {}, "gate_trace": [], "validations": []},
     )
