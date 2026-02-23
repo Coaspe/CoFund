@@ -50,6 +50,7 @@ from schemas.common import (
     compute_disagreement_score,
 )
 from schemas.taxonomy import map_macro_regime_to_canonical, RISK_OFF_REGIMES
+from llm.router import get_llm
 
 warnings.filterwarnings("ignore")
 
@@ -350,10 +351,10 @@ def _call_llm(payload: dict) -> dict:
     decision = compute_risk_decision(payload)
 
     # Step 2: Optional LLM narrative enrichment
-    key = os.environ.get("OPENAI_API_KEY", "")
-    if key and HAS_LC:
+    llm = get_llm("risk_manager")
+    if llm is not None and HAS_LC:
         try:
-            decision = _enrich_risk_narrative_with_llm(payload, decision)
+            decision = _enrich_risk_narrative_with_llm(llm, payload, decision)
         except Exception as exc:
             print(f"   [LLM] ⚠️ Narrative enrichment failed (decision unchanged): {exc}")
     else:
@@ -362,15 +363,11 @@ def _call_llm(payload: dict) -> dict:
     return decision
 
 
-def _enrich_risk_narrative_with_llm(payload: dict, decision: dict) -> dict:
+def _enrich_risk_narrative_with_llm(llm, payload: dict, decision: dict) -> dict:
     """
     LLM enriches rationale_short and feedback.detail text ONLY.
     final_weight, decision, flags are IMMUTABLE from Python engine.
     """
-    from langchain_openai import ChatOpenAI  # type: ignore
-
-    llm = ChatOpenAI(model="gpt-4o-mini", temperature=0,
-                     api_key=os.environ.get("OPENAI_API_KEY", ""))
     prompt = (
         "Below is a risk payload and a Python-computed decision. "
         "Your job: generate ONLY a 1-2 sentence Korean rationale for each ticker decision, "

@@ -32,6 +32,7 @@ except ImportError:
     HAS_LC = False
 
 from schemas.common import InvestmentState
+from llm.router import get_llm
 
 
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
@@ -106,14 +107,12 @@ def _build_report_human_msg(state: dict) -> str:
 
 def _call_llm(state: dict) -> str:
     """LLM 호출 → 마크다운 보고서 문자열. API 키 없으면 Mock."""
-    key = os.environ.get("OPENAI_API_KEY", "")
-    if not key or not HAS_LC:
+    llm = get_llm("report_writer")
+    if llm is None or not HAS_LC:
         print("   [LLM] API 키 없음 → 규칙 기반 Mock 보고서 생성")
         return _mock_generate_report(state)
 
     try:
-        from langchain_openai import ChatOpenAI  # type: ignore
-        llm = ChatOpenAI(model="gpt-4o-mini", temperature=0.3, api_key=key)
         msgs = [
             SystemMessage(content=REPORT_SYSTEM_PROMPT),
             HumanMessage(content=_build_report_human_msg(state)),

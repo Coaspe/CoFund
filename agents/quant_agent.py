@@ -67,6 +67,7 @@ except ImportError:
     HAS_LC = False
 
 from schemas.common import InvestmentState
+from llm.router import get_llm, get_agent_config
 
 warnings.filterwarnings("ignore")
 
@@ -590,35 +591,42 @@ def _build_human_msg(payload: dict) -> str:
 
 def _call_llm(payload: dict) -> dict:
     """
-    LLM 호출 → QuantDecision 구조 반환.
-    OPENAI_API_KEY 없으면 규칙 기반 Mock 사용.
+    Quant decision pipeline (Invariant A: Python 의사결정 우선):
+      1. _mock_decision() → Python 규칙 기반 의사결정 (ALWAYS, source of truth)
+      2. (Optional) LLM이 enabled=True이면, payload 기반 "설명만" 생성
+      3. LLM은 결정값(decision/final_allocation_pct)을 절대 변경하지 않음
     """
-    key = os.environ.get("OPENAI_API_KEY", "")
-    if not key or not HAS_LC:
-        print("   [LLM] API 키 없음 → 규칙 기반 Mock 결정")
-        return _mock_decision(payload)
+    # Step 1: Python deterministic decision (ALWAYS)
+    decision = _mock_decision(payload)
+
+    # Step 2: Optional LLM explanation enrichment
+    config = get_agent_config("quant")
+    if not config.get("enabled", False):
+        return decision
+
+    llm = get_llm("quant")
+    if llm is None or not HAS_LC:
+        return decision
 
     try:
-        from langchain_openai import ChatOpenAI  # type: ignore
-        llm = ChatOpenAI(model="gpt-4o-mini", temperature=0, api_key=key)
-        if HAS_PYDANTIC:
-            structured = llm.with_structured_output(QuantDecision)
-            msgs = [
-                SystemMessage(content=QUANT_SYSTEM_PROMPT),
-                HumanMessage(content=_build_human_msg(payload)),
-            ]
-            resp: QuantDecision = structured.invoke(msgs)
-            return resp.model_dump()
-        else:
-            msgs = [
-                SystemMessage(content=QUANT_SYSTEM_PROMPT),
-                HumanMessage(content=_build_human_msg(payload)),
-            ]
-            raw = llm.invoke(msgs)
-            return json.loads(raw.content)
+        prompt = (
+            "Below is a quant analysis payload and a Python-computed decision. "
+            "Generate a 2-3 sentence Korean explanation of WHY this decision makes sense. "
+            "DO NOT change decision, final_allocation_pct, or any numerical values.\n\n"
+            f"Payload (summary): Z-score={payload.get('alpha_signals', {}).get('statistical_arbitrage', {}).get('execution', {}).get('current_z_score')}, "
+            f"CVaR={payload.get('portfolio_risk_parameters', {}).get('asset_cvar_99_daily')}\n\n"
+            f"Decision: {json.dumps(decision, ensure_ascii=False)}\n\n"
+            "Return ONLY the explanation text, nothing else."
+        )
+        msgs = [HumanMessage(content=prompt)]
+        raw = llm.invoke(msgs)
+        explanation = raw.content.strip()
+        if explanation:
+            decision["cot_reasoning"] = decision.get("cot_reasoning", "") + f" [LLM] {explanation}"
     except Exception as exc:
-        print(f"   [LLM] ⚠️ 호출 실패 → Mock: {exc}")
-        return _mock_decision(payload)
+        print(f"   [LLM] ⚠️ 설명 생성 실패 (decision 동일): {exc}")
+
+    return decision
 
 
 def _mock_decision(payload: dict) -> dict:

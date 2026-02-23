@@ -40,6 +40,7 @@ except ImportError:
     HAS_LC = False
 
 from schemas.common import InvestmentState
+from llm.router import get_llm_with_cache, set_cache
 
 
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
@@ -193,16 +194,21 @@ def _call_llm(
     risk_feedback: Optional[dict] = None,
 ) -> dict:
     """LLM 호출 → OrchestratorOutput. API 키 없으면 규칙 기반 Mock."""
-    key = os.environ.get("OPENAI_API_KEY", "")
-    if not key or not HAS_LC:
+    if not HAS_LC:
+        print("   [LLM] langchain 미설치 → 규칙 기반 Mock 결정")
+        return _mock_orchestrator_decision(user_request, iteration, risk_feedback)
+
+    human_msg = _build_orchestrator_human_msg(user_request, iteration, risk_feedback)
+
+    # 캐시 확인 (iteration 피드백 루프 최적화)
+    llm, cached = get_llm_with_cache("orchestrator", human_msg)
+    if cached is not None:
+        return cached
+    if llm is None:
         print("   [LLM] API 키 없음 → 규칙 기반 Mock 결정")
         return _mock_orchestrator_decision(user_request, iteration, risk_feedback)
 
     try:
-        from langchain_openai import ChatOpenAI  # type: ignore
-        llm = ChatOpenAI(model="gpt-4o-mini", temperature=0, api_key=key)
-        human_msg = _build_orchestrator_human_msg(user_request, iteration, risk_feedback)
-
         if HAS_PYDANTIC:
             structured = llm.with_structured_output(OrchestratorOutput)
             msgs = [
@@ -210,14 +216,16 @@ def _call_llm(
                 HumanMessage(content=human_msg),
             ]
             resp = structured.invoke(msgs)
-            return resp.model_dump()
+            result = resp.model_dump()
         else:
             msgs = [
                 SystemMessage(content=ORCHESTRATOR_SYSTEM_PROMPT),
                 HumanMessage(content=human_msg),
             ]
             raw = llm.invoke(msgs)
-            return json.loads(raw.content)
+            result = json.loads(raw.content)
+        set_cache("orchestrator", human_msg, result)
+        return result
     except Exception as exc:
         print(f"   [LLM] ⚠️ 호출 실패 → Mock: {exc}")
         return _mock_orchestrator_decision(user_request, iteration, risk_feedback)
