@@ -115,3 +115,23 @@ Output files written to `runs/backtest_{id}/`:
 | DoD4: Report/narrative fact-check + retry/fallback | ✅ `validators/factcheck.py` |
 | DoD5: Backtest runner reproducible PIT results | ✅ `backtest/runner.py` |
 | DoD6: T1–T4 pytest all PASS | ✅ 58/58 tests green |
+
+## 🧮 Coverage Expansion v1 — Key Definitions
+
+### news_volume_z
+- **Definition**: `(today_article_count - 30d_mean) / 30d_std`
+- **When None**: `effective_article_count < 10` OR `baseline_days_with_data < 10`  
+- **When 0**: `std == 0` (all days identical volume)  
+- **data_quality.warnings**: `"insufficient_news_baseline"` added when None
+
+### vol_regime (infer_vol_regime)
+Priority chain — uses first available source:
+1. **Quant HMM** `regime_2_high_vol`: `≥0.50→crisis / ≥0.35→high / else normal`
+2. **Macro** `tail_risk_warning=True + credit_stress stressed → crisis`; `risk_off → high`
+3. **VIX** `≥30→crisis / ≥22→high / else normal`
+4. **Default fallback**: `normal` + `warnings: ["vol_regime_unknown"]`
+
+### Tilt hardening (R5 preserved)
+- `catalyst_risk_level="high"` → `tilt = 1.0` (no directional bet during catalyst)
+- `vol_regime="crisis"` → `tilt ≤ 0.9`
+- Hard cap [0.7, 1.3] always applies

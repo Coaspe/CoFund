@@ -17,6 +17,7 @@ orchestrator_agent.py — ① Orchestrator Agent (CIO/PM)
 
 from __future__ import annotations
 
+import hashlib
 import json
 import os
 import re
@@ -185,29 +186,147 @@ def _build_orchestrator_human_msg(
 
 
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-# LLM 호출 (실제 / Mock)
+# Intent 분류 (규칙 기반 fallback)
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+_INTENT_INTENTS = ["single_ticker_entry", "overheated_check", "compare_tickers",
+                   "market_outlook", "event_risk"]
+
+
+def _default_desk_tasks(
+    horizon_days: int = 30,
+    risk_budget: str = "Moderate",
+    focus: str = "",
+) -> dict:
+    """Default desk_tasks for fallback / mock."""
+    return {
+        "macro":       {"horizon_days": min(30, horizon_days), "focus_areas": ["레짐 확인", "리스크온/오프"]},
+        "fundamental": {"horizon_days": max(30, horizon_days),
+                        "focus_areas": ["밸류에이션" if focus == "valuation" else "구조적 리스크", "FCF 품질"]},
+        "sentiment":   {"horizon_days": min(14, horizon_days),
+                        "focus_areas": ["이벤트 리스크" if focus == "event" else "포지셔닝", "뉴스 볼륨"]},
+        "quant":       {"horizon_days": horizon_days, "risk_budget": risk_budget,
+                        "focus_areas": ["CVaR 최적화", "Z-score"]},
+    }
+
+
+def classify_intent_rules(user_request: str) -> dict:
+    """
+    규칙 기반 intent 분류 — LLM 실패 시 fallback.
+    5 intents: single_ticker_entry | overheated_check | compare_tickers | market_outlook | event_risk
+    """
+    text    = user_request.lower()
+    tickers = [m for m in _TICKER_RE.findall(user_request)
+               if m not in ("AI", "ETF", "PM", "CEO", "CIO", "IPO")]
+
+    # compare_tickers: ≥2 tickers or VS keywords
+    compare_kws = ["vs", "비교", "대비", "or ", "대 ", "비해"]
+    if len(tickers) >= 2 or any(kw in text for kw in compare_kws):
+        universe = tickers[:4] if len(tickers) >= 2 else ["AAPL", "MSFT"]
+        return {"intent": "compare_tickers", "universe": universe,
+                "horizon_days": 30,
+                "desk_tasks": _default_desk_tasks(30, "Moderate", "valuation")}
+
+    # overheated_check
+    heat_kws = ["과열", "너무 올랐", "오른", "고점", "거품", "overbought", "expensive", "stretched", "비싸"]
+    if any(kw in text for kw in heat_kws):
+        ticker = _extract_ticker(user_request)
+        return {"intent": "overheated_check", "universe": [ticker, "SPY"],
+                "horizon_days": 90,
+                "desk_tasks": _default_desk_tasks(90, "Conservative", "valuation")}
+
+    # event_risk
+    event_kws = ["실적", "earnings", "이벤트", "발표", "fomc", "어닝", "앞두", "before"]
+    if any(kw in text for kw in event_kws):
+        ticker = _extract_ticker(user_request)
+        return {"intent": "event_risk", "universe": [ticker],
+                "horizon_days": 14,
+                "desk_tasks": _default_desk_tasks(14, "Conservative", "event")}
+
+    # market_outlook
+    outlook_kws = ["시장", "market", "전망", "outlook", "섹터", "sector", "경기", "economy"]
+    if any(kw in text for kw in outlook_kws) and not tickers:
+        return {"intent": "market_outlook", "universe": ["SPY", "QQQ", "IWM"],
+                "horizon_days": 30,
+                "desk_tasks": _default_desk_tasks(30, "Moderate")}
+
+    # default: single_ticker_entry
+    ticker = _extract_ticker(user_request)
+    return {"intent": "single_ticker_entry", "universe": [ticker],
+            "horizon_days": 30,
+            "desk_tasks": _default_desk_tasks(30, "Moderate")}
+
+
+def _plan_cache_key(user_request: str, iteration: int, risk_feedback: Optional[dict]) -> str:
+    """(user_request + iteration + risk_feedback_hash) → md5 key."""
+    fb_str = json.dumps(risk_feedback or {}, sort_keys=True)
+    raw    = f"{user_request}::{iteration}::{fb_str}"
+    return hashlib.md5(raw.encode()).hexdigest()
+
+
+_PLAN_CACHE: dict[str, dict] = {}
+
+
+# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+# LLM 호출 (LLM-first, rules fallback)
+# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+def _validate_llm_plan(result: dict, user_request: str) -> bool:
+    """LLM plan 유효성 검사. 비현실적이면 False."""
+    if not isinstance(result, dict):
+        return False
+    # Must have investment_brief and desk_tasks
+    brief = result.get("investment_brief", {})
+    if not brief or not brief.get("target_universe"):
+        return False
+    tasks = result.get("desk_tasks", {})
+    if not tasks or not isinstance(tasks, dict):
+        return False
+    # universe must be non-empty list of strings
+    universe = brief.get("target_universe", [])
+    if not universe or not all(isinstance(t, str) for t in universe):
+        return False
+    # desk_tasks must have at least macro and quant
+    return "macro" in tasks and "quant" in tasks
+
 
 def _call_llm(
     user_request: str,
     iteration: int,
     risk_feedback: Optional[dict] = None,
 ) -> dict:
-    """LLM 호출 → OrchestratorOutput. API 키 없으면 규칙 기반 Mock."""
+    """
+    LLM-first: LLM plan을 생성하고 Pydantic 검증.
+    실패/불일치 시 classify_intent_rules 결과로 fallback.
+    캐시 키: (user_request + iteration + risk_feedback_hash).
+    """
+    # ── Plan cache check ──────────────────────────────────────────────
+    cache_key = _plan_cache_key(user_request, iteration, risk_feedback)
+    if cache_key in _PLAN_CACHE:
+        print("   [LLM] plan cache hit")
+        return _PLAN_CACHE[cache_key]
+
+    # ── Rules fallback always computed (for validation/fallback) ───────
+    rules_plan = _mock_orchestrator_decision(user_request, iteration, risk_feedback)
+
     if not HAS_LC:
-        print("   [LLM] langchain 미설치 → 규칙 기반 Mock 결정")
-        return _mock_orchestrator_decision(user_request, iteration, risk_feedback)
+        print("   [LLM] langchain 미설치 → rules fallback")
+        _PLAN_CACHE[cache_key] = rules_plan
+        return rules_plan
 
     human_msg = _build_orchestrator_human_msg(user_request, iteration, risk_feedback)
 
-    # 캐시 확인 (iteration 피드백 루프 최적화)
+    # llm_router cache (response-level)
     llm, cached = get_llm_with_cache("orchestrator", human_msg)
     if cached is not None:
+        _PLAN_CACHE[cache_key] = cached
         return cached
     if llm is None:
-        print("   [LLM] API 키 없음 → 규칙 기반 Mock 결정")
-        return _mock_orchestrator_decision(user_request, iteration, risk_feedback)
+        print("   [LLM] API 키 없음 → rules fallback")
+        _PLAN_CACHE[cache_key] = rules_plan
+        return rules_plan
 
+    # ── LLM call ──────────────────────────────────────────────────────
     try:
         if HAS_PYDANTIC:
             structured = llm.with_structured_output(OrchestratorOutput)
@@ -215,20 +334,35 @@ def _call_llm(
                 SystemMessage(content=ORCHESTRATOR_SYSTEM_PROMPT),
                 HumanMessage(content=human_msg),
             ]
-            resp = structured.invoke(msgs)
+            resp   = structured.invoke(msgs)
             result = resp.model_dump()
         else:
             msgs = [
                 SystemMessage(content=ORCHESTRATOR_SYSTEM_PROMPT),
                 HumanMessage(content=human_msg),
             ]
-            raw = llm.invoke(msgs)
+            raw    = llm.invoke(msgs)
             result = json.loads(raw.content)
+
+        # ── Validate ──────────────────────────────────────────────────
+        if not _validate_llm_plan(result, user_request):
+            print("   [LLM] plan 검증 실패 → rules fallback")
+            result = rules_plan
+        else:
+            # Intent enrichment from rules (rules adds intent field)
+            intent_info = classify_intent_rules(user_request)
+            result.setdefault("intent",        intent_info["intent"])
+            result.setdefault("horizon_days",  intent_info["horizon_days"])
+            print(f"   [LLM] ✅ plan 사용 (intent={result.get('intent')})")
+
         set_cache("orchestrator", human_msg, result)
+        _PLAN_CACHE[cache_key] = result
         return result
+
     except Exception as exc:
-        print(f"   [LLM] ⚠️ 호출 실패 → Mock: {exc}")
-        return _mock_orchestrator_decision(user_request, iteration, risk_feedback)
+        print(f"   [LLM] ⚠️ 호출 실패 → rules fallback: {exc}")
+        _PLAN_CACHE[cache_key] = rules_plan
+        return rules_plan
 
 
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━

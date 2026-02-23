@@ -74,6 +74,28 @@ C. 포맷팅 가이드라인
 
 def _build_report_human_msg(state: dict) -> str:
     """InvestmentState 전체를 요약하여 LLM Human 메시지로 조립."""
+
+    def _desk_narrative(desk_key: str) -> str:
+        desk = state.get(desk_key, {})
+        lines = []
+        kd = desk.get("key_drivers") or []
+        if kd:
+            lines.append("  Key Drivers: " + " | ".join(kd))
+        ww = desk.get("what_to_watch") or []
+        if ww:
+            lines.append("  What to watch:\n" + "\n".join(f"    - {w}" for w in ww))
+        sn = desk.get("scenario_notes") or {}
+        if sn:
+            lines.append(f"  Scenarios:\n    Bull: {sn.get('bull','')}\n    Base: {sn.get('base','')}\n    Bear: {sn.get('bear','')}")
+        dq = desk.get("data_quality") or {}
+        missing = dq.get("missing_fields") or []
+        if missing:
+            lines.append(f"  Data gaps: {', '.join(str(m) for m in missing)}")
+        limitations = desk.get("limitations") or []
+        if limitations:
+            lines.append(f"  Limitations: {'; '.join(limitations[:2])}")
+        return "\n".join(lines) if lines else "  (데이터 없음)"
+
     parts = [
         f"[작성 시각] {datetime.utcnow().strftime('%Y-%m-%dT%H:%M:%SZ')}",
         f"[사용자 요청] {state.get('user_request', '')}",
@@ -94,6 +116,15 @@ def _build_report_human_msg(state: dict) -> str:
         "",
         "[Quant 분석]",
         f"```json\n{json.dumps(state.get('technical_analysis', {}), ensure_ascii=False, indent=2)}\n```",
+        "",
+        "[Macro 핵심 내용]",
+        _desk_narrative("macro_analysis"),
+        "",
+        "[Fundamental 핵심 내용]",
+        _desk_narrative("fundamental_analysis"),
+        "",
+        "[Sentiment 핵심 내용]",
+        _desk_narrative("sentiment_analysis"),
         "",
         "[Risk Assessment]",
         f"```json\n{json.dumps(state.get('risk_assessment', {}), ensure_ascii=False, indent=2)}\n```",

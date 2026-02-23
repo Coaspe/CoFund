@@ -176,3 +176,139 @@ def compute_overlay_guidance(features: dict) -> dict:
         "risk_overlay": g["risk_overlay"],
         "tail_risk_warning": tail,
     }
+
+
+# ── v2 additions ──────────────────────────────────────────────────────────────
+
+def compute_macro_axes(indicators: dict) -> dict:
+    """
+    5축 분해: growth/inflation/rates/credit/liquidity → {state, score(-3..+3)}.
+    입력 결측 지표는 score=0(중립)으로 처리.
+    """
+    gdp = indicators.get("gdp_growth")
+    pmi = indicators.get("pmi")
+    cpi = indicators.get("cpi_yoy")
+    core_cpi = indicators.get("core_cpi_yoy")
+    infl_exp = indicators.get("inflation_expectation")
+    ffr = indicators.get("fed_funds_rate")
+    yc = indicators.get("yield_curve_spread")
+    hy = indicators.get("hy_oas")
+    fci = indicators.get("financial_conditions_index")
+
+    # ── Growth ────────────────────────────────────────────────────────
+    g_score = 0
+    if pmi is not None:
+        if pmi > 57: g_score += 3
+        elif pmi > 55: g_score += 2
+        elif pmi > 50: g_score += 1
+        elif pmi < 45: g_score -= 3
+        elif pmi < 48: g_score -= 2
+        elif pmi < 50: g_score -= 1
+    elif gdp is not None:
+        if gdp > 4: g_score += 2
+        elif gdp > 2: g_score += 1
+        elif gdp < 0: g_score -= 3
+        elif gdp < 1: g_score -= 1
+    g_score = max(-3, min(3, g_score))
+    g_state = {3: "hot", 2: "hot", 1: "ok", 0: "ok", -1: "cool", -2: "cool", -3: "recession"}[g_score]
+
+    # ── Inflation ─────────────────────────────────────────────────────
+    infl_val = core_cpi or cpi or infl_exp
+    i_score = 0
+    if infl_val is not None:
+        if infl_val > 6:   i_score = 3
+        elif infl_val > 4: i_score = 2
+        elif infl_val > 2.5: i_score = 1
+        elif infl_val > 1.5: i_score = 0
+        elif infl_val > 0:   i_score = -1
+        else:                i_score = -2
+    i_score = max(-3, min(3, i_score))
+    i_state = {3: "hot", 2: "hot", 1: "ok", 0: "ok", -1: "cool", -2: "deflation", -3: "deflation"}[i_score]
+
+    # ── Rates ─────────────────────────────────────────────────────────
+    r_score = 0
+    if ffr is not None:
+        if ffr > 5:  r_score -= 2
+        elif ffr > 3: r_score -= 1
+        elif ffr < 1: r_score += 2
+        elif ffr < 2: r_score += 1
+    if yc is not None:
+        if yc < -0.50: r_score -= 1   # deeply inverted = very restrictive
+        elif yc > 2.0: r_score += 1   # steep = accommodative
+    r_score = max(-3, min(3, r_score))
+    r_state = "rising" if r_score <= -1 else ("falling" if r_score >= 1 else "flat")
+
+    # ── Credit ────────────────────────────────────────────────────────
+    c_score = 0
+    if hy is not None:
+        if hy > 700:   c_score = -3
+        elif hy > 500: c_score = -2
+        elif hy > 350: c_score = -1
+        elif hy < 250: c_score = 1
+    if fci is not None:
+        if fci > 1.0:   c_score -= 1
+        elif fci < -1.0: c_score += 1
+    c_score = max(-3, min(3, c_score))
+    c_state = {3: "easy", 2: "easy", 1: "easy", 0: "normal", -1: "tight", -2: "stressed", -3: "stressed"}[c_score]
+
+    # ── Liquidity ─────────────────────────────────────────────────────
+    l_score = 0
+    if ffr is not None:
+        if ffr > 5:  l_score -= 2
+        elif ffr > 3: l_score -= 1
+        elif ffr < 1: l_score += 2
+        elif ffr < 2: l_score += 1
+    if yc is not None and yc < 0:
+        l_score -= 1   # inverted => drained liquidity
+    if fci is not None:
+        if fci < -0.5: l_score += 1
+        elif fci > 0.5: l_score -= 1
+    l_score = max(-3, min(3, l_score))
+    l_state = "easy" if l_score >= 1 else ("tight" if l_score <= -1 else "neutral")
+
+    return {
+        "growth":    {"state": g_state, "score": g_score},
+        "inflation": {"state": i_state, "score": i_score},
+        "rates":     {"state": r_state, "score": r_score},
+        "credit":    {"state": c_state, "score": c_score},
+        "liquidity": {"state": l_state, "score": l_score},
+    }
+
+
+def compute_risk_on_off(axes: dict, indicators: dict) -> dict:
+    """
+    5축 합성 → risk_on|neutral|risk_off (+risk_score -100..+100) + enhanced tail_risk.
+    """
+    yc  = indicators.get("yield_curve_spread")
+    hy  = indicators.get("hy_oas")
+    fci = indicators.get("financial_conditions_index")
+
+    g = axes.get("growth",    {}).get("score", 0)
+    i = axes.get("inflation", {}).get("score", 0)
+    r = axes.get("rates",     {}).get("score", 0)  # positive = falling (good)
+    c = axes.get("credit",    {}).get("score", 0)
+    l = axes.get("liquidity", {}).get("score", 0)
+
+    # growth(+), credit(+), liquidity(+) → risk-on; inflation(−), rates(−) → risk-off
+    raw = g * 20 + (-i * 10) + r * 15 + c * 20 + l * 15
+    risk_score = int(max(-100, min(100, round(raw))))
+
+    if risk_score >= 30:  risk_on_off = "risk_on"
+    elif risk_score <= -20: risk_on_off = "risk_off"
+    else:                 risk_on_off = "neutral"
+
+    # Tail risk: need ≥2 of inverted yc / stressed hy / tight fci
+    curve_inv  = yc  is not None and yc  < -0.20
+    credit_str = hy  is not None and hy  > 500
+    fci_tight  = fci is not None and fci > 0.5
+    tail_count = sum([curve_inv, credit_str, fci_tight])
+    tail_warning = tail_count >= 2 or (tail_count >= 1 and risk_on_off == "risk_off")
+    tail_level   = "high" if tail_count >= 2 else ("medium" if tail_count == 1 else "low")
+
+    return {
+        "risk_on_off": risk_on_off,
+        "risk_score":  risk_score,
+        "tail_risk_warning": tail_warning,
+        "tail_risk_level":   tail_level,
+        "component_scores":  {"growth": g, "inflation": i, "rates": r, "credit": c, "liquidity": l},
+    }
