@@ -6,4 +6,6 @@ __pycache__/
 *.pyo
 runs/
 *.db
+*.log
+logs/
 .venv/
