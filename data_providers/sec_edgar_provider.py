@@ -8,10 +8,12 @@ No API key needed. Requires SEC_USER_AGENT header.
 
 from __future__ import annotations
 
+import hashlib
 import re
 from datetime import datetime, timezone
 from typing import Dict, List, Tuple
 
+from api_usage_stats import record_api_request
 from schemas.common import make_evidence
 from config.settings import get_settings
 from data_providers.base import BaseProvider, ProviderError
@@ -49,6 +51,45 @@ class SECEdgarProvider(BaseProvider):
 
     def _headers(self) -> dict:
         return {"User-Agent": self._user_agent, "Accept-Encoding": "gzip, deflate"}
+
+    def _search_filings(self, ticker: str, forms: str, startdt: str = "2023-01-01", size: int = 5) -> list[dict]:
+        url = f"{_SEC_BASE}/search-index"
+        params = {
+            "q": f'"{ticker}"',
+            "forms": forms,
+            "dateRange": "custom",
+            "startdt": startdt,
+            "from": 0,
+            "size": size,
+        }
+        data = self.get_json(url, params, headers=self._headers())
+        return data.get("hits", {}).get("hits", []) or []
+
+    @staticmethod
+    def _hit_to_evidence_item(hit: dict, *, kind: str, ticker: str, resolver_path: str) -> dict:
+        src = hit.get("_source", {})
+        filing_url = src.get("file_url", "")
+        if filing_url and filing_url.startswith("/"):
+            filing_url = f"https://efts.sec.gov{filing_url}"
+        title = src.get("display_names", []) or []
+        title_text = " | ".join(str(t) for t in title[:2]) if title else f"{ticker} {kind}"
+        published_at = src.get("file_date", "")
+        source = "sec.gov"
+        raw = f"{filing_url}|{title_text}|{published_at}|{source}"
+        return {
+            "url": filing_url or "https://sec.gov",
+            "title": title_text[:300],
+            "published_at": published_at,
+            "snippet": str(src.get("description", ""))[:600],
+            "source": source,
+            "retrieved_at": datetime.now(timezone.utc).isoformat(),
+            "hash": hashlib.sha256(raw.encode("utf-8")).hexdigest()[:16],
+            "kind": kind,
+            "desk": "fundamental",
+            "ticker": ticker,
+            "trust_tier": 1.0,
+            "resolver_path": resolver_path,
+        }
 
     def _resolve_cik(self, ticker: str) -> str | None:
         url = f"{_SEC_BASE}/search-index?q=%22{ticker}%22&dateRange=custom&startdt=2020-01-01&forms=10-K"
@@ -103,6 +144,7 @@ class SECEdgarProvider(BaseProvider):
                                 f"https://efts.sec.gov{filing_url}" if filing_url.startswith("/") else filing_url,
                                 headers=self._headers(), timeout=self._timeout,
                             )
+                            record_api_request(self.PROVIDER_NAME, success=True, category="data")
                             text = resp.text.lower()[:500_000]  # limit for performance
                             for flag_name, keywords in _FLAG_KEYWORDS.items():
                                 for kw in keywords:
@@ -110,6 +152,7 @@ class SECEdgarProvider(BaseProvider):
                                         flags[flag_name] = True
                                         break
                         except Exception:
+                            record_api_request(self.PROVIDER_NAME, success=False, category="data")
                             limitations.append("Could not fetch filing text for keyword scan")
 
                     for flag_name, found in flags.items():
@@ -138,6 +181,46 @@ class SECEdgarProvider(BaseProvider):
             "limitations": limitations,
             "as_of": as_of,
         }
+
+    def get_ownership_identity(self, ticker: str, as_of: str = "") -> dict:
+        """
+        Ownership identity evidence (Form 4 / 13F / 13D / 13G).
+        Resolver priority uses this provider first.
+        """
+        as_of = as_of or datetime.now(timezone.utc).isoformat()
+        if not self.has_agent:
+            return {"items": [], "data_ok": False, "limitations": ["SEC_USER_AGENT not set"], "as_of": as_of}
+        forms = "4,13F-HR,SC 13D,SC 13G"
+        limitations: list[str] = []
+        try:
+            hits = self._search_filings(ticker, forms=forms, startdt="2023-01-01", size=8)
+        except ProviderError as exc:
+            limitations.append(f"SEC ownership search error: {exc}")
+            return {"items": [], "data_ok": False, "limitations": limitations, "as_of": as_of}
+        items = [
+            self._hit_to_evidence_item(h, kind="ownership_identity", ticker=ticker, resolver_path="sec_forms")
+            for h in hits
+        ]
+        return {"items": items, "data_ok": bool(items), "limitations": limitations, "as_of": as_of}
+
+    def get_8k_exhibits(self, ticker: str, as_of: str = "") -> dict:
+        """
+        8-K filings as primary source for press_release_or_ir resolution.
+        """
+        as_of = as_of or datetime.now(timezone.utc).isoformat()
+        if not self.has_agent:
+            return {"items": [], "data_ok": False, "limitations": ["SEC_USER_AGENT not set"], "as_of": as_of}
+        limitations: list[str] = []
+        try:
+            hits = self._search_filings(ticker, forms="8-K", startdt="2023-01-01", size=6)
+        except ProviderError as exc:
+            limitations.append(f"SEC 8-K search error: {exc}")
+            return {"items": [], "data_ok": False, "limitations": limitations, "as_of": as_of}
+        items = [
+            self._hit_to_evidence_item(h, kind="press_release_or_ir", ticker=ticker, resolver_path="sec_8k")
+            for h in hits
+        ]
+        return {"items": items, "data_ok": bool(items), "limitations": limitations, "as_of": as_of}
 
 
 if __name__ == "__main__":

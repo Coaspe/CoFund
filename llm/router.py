@@ -1,21 +1,15 @@
 """
-llm/router.py — Multi-Provider LLM Router
-==========================================
-에이전트별로 서로 다른 LLM Provider/Model을 라우팅합니다.
+llm/router.py — Multi-Provider LLM Router (Z.ai primary, bounded concurrency)
+===============================================================================
+모든 LLM 요청은 기본적으로 Z.ai(GLM-4.7-flash)를 사용합니다.
+기존 Groq/Gemini는 fallback 체인으로 유지합니다.
 
-Provider 우선순위 (무료 쿼터 중심):
-  - Groq    : orchestrator, macro, fundamental, sentiment, quant(opt), risk_manager
-  - Gemini  : report_writer (fallback → Groq → Mock)
-
-환경변수:
-  GROQ_API_KEY     — Groq 호출에 필수
-  GOOGLE_API_KEY   — Gemini 호출에 필수 (또는 GEMINI_API_KEY)
-  에이전트별 모델 오버라이드: ORCH_MODEL, RISK_MODEL, REPORT_MODEL 등
-
-토큰/비용 절감:
-  - temperature=0 (구조화 노드)
-  - max_tokens 기본 낮게 제한
-  - in-memory 캐시로 동일 입력 반복 호출 방지
+핵심 정책:
+  - Primary provider: Z.ai (OpenAI-compatible endpoint)
+  - Fallback provider(s): 기존 Groq/Gemini
+  - Global concurrent LLM invokes: 기본 1개 (초과 시 대기 + 콘솔 로그)
+  - Rate limit 감지 시 콘솔 로그 + fallback 시도
+  - pytest 실행 중에는 기본적으로 캐시를 비활성화하여 실호출을 강제
 """
 
 from __future__ import annotations
@@ -23,95 +17,219 @@ from __future__ import annotations
 import hashlib
 import json
 import os
-from typing import Any, Optional
+import threading
+import time
+from pathlib import Path
+from typing import Any
 
-# ── 에이전트별 기본 LLM 설정 ──────────────────────────────────────────────
+from api_usage_stats import record_api_request
+
+# Auto-load .env from project root (for python -c / direct module calls)
+try:
+    from dotenv import load_dotenv
+
+    _env_path = Path(__file__).resolve().parent.parent / ".env"
+    load_dotenv(_env_path)
+except ImportError:
+    pass
+
+
+# ── Runtime flags ─────────────────────────────────────────────────────────────
+
+def _env_flag(name: str, default: bool = False) -> bool:
+    raw = os.environ.get(name)
+    if raw is None:
+        return default
+    return raw.strip().lower() in {"1", "true", "yes", "on"}
+
+
+def _is_pytest_running() -> bool:
+    return bool(os.environ.get("PYTEST_CURRENT_TEST")) or _env_flag("PYTEST_RUNNING", False)
+
+
+def _llm_trace_enabled() -> bool:
+    return _env_flag("LLM_TRACE", False)
+
+
+def _llm_trace(agent_name: str, message: str) -> None:
+    if _llm_trace_enabled():
+        print(f"   [LLM TRACE] {agent_name}: {message}", flush=True)
+
+
+def _force_real_llm_in_tests() -> bool:
+    # 테스트에서는 기본적으로 실호출 강제 (캐시 비활성)
+    return _env_flag("LLM_FORCE_REAL_IN_TESTS", default=_is_pytest_running())
+
+
+def force_real_llm_in_tests() -> bool:
+    """Public accessor for test-time real LLM policy."""
+    return _force_real_llm_in_tests()
+
+
+def _safe_int_env(name: str, default: int) -> int:
+    raw = os.environ.get(name, str(default))
+    try:
+        return int(raw)
+    except (TypeError, ValueError):
+        return default
+
+
+def _safe_float_env(name: str, default: float) -> float:
+    raw = os.environ.get(name, str(default))
+    try:
+        return float(raw)
+    except (TypeError, ValueError):
+        return default
+
+
+def _llm_min_request_interval_sec() -> float:
+    """
+    Global minimum interval between any LLM API requests.
+    Priority: LLM_MIN_REQUEST_INTERVAL_SEC > ZAI_MIN_REQUEST_INTERVAL_SEC > default(2.0s)
+    """
+    raw = os.environ.get("LLM_MIN_REQUEST_INTERVAL_SEC")
+    if raw is None:
+        raw = os.environ.get("ZAI_MIN_REQUEST_INTERVAL_SEC")
+    if raw is None:
+        return 2.0
+    try:
+        return float(raw)
+    except (TypeError, ValueError):
+        return 2.0
+
+
+_LLM_MAX_CONCURRENCY = max(1, _safe_int_env("LLM_MAX_CONCURRENCY", 1))
+_LLM_CONCURRENCY_SEM = threading.BoundedSemaphore(_LLM_MAX_CONCURRENCY)
+_ZAI_RL_RETRY_DELAY_SEC = 10
+_ZAI_RL_RETRY_MAX = 1
+_ZAI_REQUEST_TIMEOUT_SEC = max(5.0, _safe_float_env("ZAI_REQUEST_TIMEOUT_SEC", 180.0))
+_ZAI_MAX_TOKENS = max(1, _safe_int_env("ZAI_MAX_TOKENS", 5000))
+_LLM_REQUEST_TIMEOUT_SEC = max(5.0, _safe_float_env("LLM_REQUEST_TIMEOUT_SEC", 180.0))
+_LLM_TRACE_PREVIEW_CHARS = max(80, _safe_int_env("LLM_TRACE_PREVIEW_CHARS", 260))
+_LLM_MIN_REQUEST_INTERVAL_SEC = max(0.0, _llm_min_request_interval_sec())
+_LLM_REQUEST_GUARD_LOCK = threading.Lock()
+_LLM_LAST_REQUEST_TS = 0.0
+
+
+# ── Agent config ──────────────────────────────────────────────────────────────
 
 AGENT_LLM_CONFIG: dict[str, dict[str, Any]] = {
     "orchestrator": {
-        "provider": "groq",
-        "model": "llama-3.3-70b-versatile",
+        "provider": "zai",
+        "model": "glm-4.7-flash",
         "temperature": 0,
-        "max_tokens": 1200,
+        "max_tokens": 5000,
         "structured": True,
         "enabled": True,
         "env_model_key": "ORCH_MODEL",
+        "fallback_chain": [
+            {"provider": "groq", "model": "llama-3.3-70b-versatile"},
+            {"provider": "gemini", "model": "gemini-2.5-flash"},
+        ],
     },
     "macro": {
-        "provider": "groq",
-        "model": "llama-3.1-8b-instant",
+        "provider": "zai",
+        "model": "glm-4.7-flash",
         "temperature": 0,
-        "max_tokens": 700,
+        "max_tokens": 5000,
         "structured": True,
         "enabled": True,
         "env_model_key": "MACRO_MODEL",
+        "fallback_chain": [
+            {"provider": "groq", "model": "llama-3.1-8b-instant"},
+            {"provider": "gemini", "model": "gemini-2.5-flash"},
+        ],
     },
     "fundamental": {
-        "provider": "groq",
-        "model": "llama-3.1-8b-instant",
+        "provider": "zai",
+        "model": "glm-4.7-flash",
         "temperature": 0,
-        "max_tokens": 900,
+        "max_tokens": 5000,
         "structured": True,
         "enabled": True,
         "env_model_key": "FUNDA_MODEL",
+        "fallback_chain": [
+            {"provider": "groq", "model": "llama-3.1-8b-instant"},
+            {"provider": "gemini", "model": "gemini-2.5-flash"},
+        ],
     },
     "sentiment": {
-        "provider": "groq",
-        "model": "llama-3.1-8b-instant",
+        "provider": "zai",
+        "model": "glm-4.7-flash",
         "temperature": 0,
-        "max_tokens": 700,
+        "max_tokens": 5000,
         "structured": True,
         "enabled": True,
         "env_model_key": "SENTI_MODEL",
+        "fallback_chain": [
+            {"provider": "groq", "model": "llama-3.1-8b-instant"},
+            {"provider": "gemini", "model": "gemini-2.5-flash"},
+        ],
     },
     "quant": {
-        "provider": "groq",
-        "model": "llama-3.1-8b-instant",
+        "provider": "zai",
+        "model": "glm-4.7-flash",
         "temperature": 0,
-        "max_tokens": 400,
+        "max_tokens": 5000,
         "structured": False,
         "enabled": False,  # 기본 OFF — Python 규칙 기반 의사결정 우선
         "env_model_key": "QUANT_MODEL",
+        "fallback_chain": [
+            {"provider": "groq", "model": "llama-3.1-8b-instant"},
+        ],
     },
     "risk_manager": {
-        "provider": "groq",
-        "model": "llama-3.3-70b-versatile",
+        "provider": "zai",
+        "model": "glm-4.7-flash",
         "temperature": 0,
-        "max_tokens": 1200,
+        "max_tokens": 5000,
         "structured": True,
         "enabled": True,
         "env_model_key": "RISK_MODEL",
+        "fallback_chain": [
+            {"provider": "groq", "model": "llama-3.3-70b-versatile"},
+            {"provider": "gemini", "model": "gemini-2.5-flash"},
+        ],
     },
     "report_writer": {
-        "provider": "gemini",
-        "model": "gemini-2.5-flash-lite",
+        "provider": "zai",
+        "model": "glm-4.7-flash",
         "temperature": 0.3,
-        "max_tokens": 3000,
+        "max_tokens": 5000,
         "structured": False,
         "enabled": True,
         "env_model_key": "REPORT_MODEL",
-        "fallback_model": "gemini-2.5-flash",
+        "fallback_chain": [
+            {"provider": "gemini", "model": "gemini-2.5-flash-lite"},
+            {"provider": "groq", "model": "llama-3.1-8b-instant"},
+        ],
     },
 }
 
 
-# ── In-memory 캐시 (iteration 피드백 루프 최적화) ─────────────────────────
+# ── Response cache ────────────────────────────────────────────────────────────
 
 _response_cache: dict[str, Any] = {}
 
 
 def _cache_key(agent_name: str, content: str) -> str:
-    """에이전트명 + 입력 콘텐츠 해시로 캐시 키 생성."""
     h = hashlib.sha256(content.encode()).hexdigest()[:16]
     return f"{agent_name}:{h}"
 
 
 def clear_cache() -> None:
-    """캐시 전체 초기화 (새 run 시작 시 호출)."""
     _response_cache.clear()
 
 
-# ── Provider별 API 키 확인 ────────────────────────────────────────────────
+# ── Provider keys ─────────────────────────────────────────────────────────────
+
+def _get_zai_key() -> str:
+    return (
+        os.environ.get("ZAI_API_KEY", "")
+        or os.environ.get("ZHIPU_API_KEY", "")
+        or os.environ.get("BIGMODEL_API_KEY", "")
+    )
+
 
 def _get_groq_key() -> str:
     return os.environ.get("GROQ_API_KEY", "")
@@ -121,121 +239,383 @@ def _get_gemini_key() -> str:
     return os.environ.get("GOOGLE_API_KEY", "") or os.environ.get("GEMINI_API_KEY", "")
 
 
-# ── LLM 인스턴스 생성 ────────────────────────────────────────────────────
+# ── Provider constructors ─────────────────────────────────────────────────────
 
-def _create_groq_llm(config: dict):
-    """Groq ChatModel 생성. langchain-groq 필요."""
+def _resolved_model(config: dict[str, Any]) -> str:
+    env_key = str(config.get("env_model_key", "")).strip()
+    if env_key:
+        override = os.environ.get(env_key, "").strip()
+        if override:
+            return override
+    return str(config.get("model", "")).strip()
+
+
+def _create_zai_llm(config: dict[str, Any]):
+    key = _get_zai_key()
+    if not key:
+        return None
+    try:
+        from langchain_openai import ChatOpenAI  # type: ignore
+
+        model = _resolved_model(config) or "glm-4.7-flash"
+        base_url = os.environ.get("ZAI_BASE_URL", "").strip() or "https://api.z.ai/api/paas/v4"
+        return ChatOpenAI(
+            model=model,
+            temperature=config.get("temperature", 0),
+            max_tokens=_ZAI_MAX_TOKENS,
+            api_key=key,
+            base_url=base_url,
+            request_timeout=_ZAI_REQUEST_TIMEOUT_SEC,
+        )
+    except ImportError:
+        print("   [LLM Router] ⚠️ langchain-openai 미설치", flush=True)
+        return None
+    except Exception as exc:
+        print(f"   [LLM Router] ⚠️ Z.ai 생성 실패: {exc}", flush=True)
+        return None
+
+
+def _create_groq_llm(config: dict[str, Any]):
     key = _get_groq_key()
     if not key:
         return None
     try:
         from langchain_groq import ChatGroq  # type: ignore
-        model = os.environ.get(config.get("env_model_key", ""), "") or config["model"]
+
+        model = _resolved_model(config)
         return ChatGroq(
             model=model,
             temperature=config.get("temperature", 0),
             max_tokens=config.get("max_tokens", 1000),
             api_key=key,
+            request_timeout=_LLM_REQUEST_TIMEOUT_SEC,
         )
     except ImportError:
-        print("   [LLM Router] ⚠️ langchain-groq 미설치")
+        print("   [LLM Router] ⚠️ langchain-groq 미설치", flush=True)
         return None
     except Exception as exc:
-        print(f"   [LLM Router] ⚠️ Groq 생성 실패: {exc}")
+        print(f"   [LLM Router] ⚠️ Groq 생성 실패: {exc}", flush=True)
         return None
 
 
-def _create_gemini_llm(config: dict):
-    """Gemini ChatModel 생성. langchain-google-genai 필요."""
+def _create_gemini_llm(config: dict[str, Any]):
     key = _get_gemini_key()
     if not key:
         return None
     try:
         from langchain_google_genai import ChatGoogleGenerativeAI  # type: ignore
-        model = os.environ.get(config.get("env_model_key", ""), "") or config["model"]
+
+        model = _resolved_model(config)
         return ChatGoogleGenerativeAI(
             model=model,
             temperature=config.get("temperature", 0.3),
             max_output_tokens=config.get("max_tokens", 3000),
             google_api_key=key,
+            timeout=_LLM_REQUEST_TIMEOUT_SEC,
         )
     except ImportError:
-        print("   [LLM Router] ⚠️ langchain-google-genai 미설치")
+        print("   [LLM Router] ⚠️ langchain-google-genai 미설치", flush=True)
         return None
     except Exception as exc:
-        print(f"   [LLM Router] ⚠️ Gemini 생성 실패: {exc}")
-        # Fallback: Gemini 실패 → Groq로 시도
-        if _get_groq_key():
-            print("   [LLM Router] Gemini → Groq fallback")
-            fallback_config = dict(config)
-            fallback_config["provider"] = "groq"
-            fallback_config["model"] = "llama-3.1-8b-instant"
-            return _create_groq_llm(fallback_config)
+        print(f"   [LLM Router] ⚠️ Gemini 생성 실패: {exc}", flush=True)
         return None
 
 
 _PROVIDER_FACTORY = {
+    "zai": _create_zai_llm,
     "groq": _create_groq_llm,
     "gemini": _create_gemini_llm,
 }
 
 
-# ── 공개 API ──────────────────────────────────────────────────────────────
+def _is_rate_limit_error(exc: Exception) -> bool:
+    text = str(exc).lower()
+    keys = (
+        "429",
+        "rate limit",
+        "too many requests",
+        "quota",
+        "resource exhausted",
+        "tokens per minute",
+        "tpm",
+        "rpm",
+    )
+    return any(k in text for k in keys)
+
+
+def _provider_label(config: dict[str, Any]) -> str:
+    return f"{config.get('provider', 'unknown')}:{config.get('model', '')}"
+
+
+def _apply_llm_request_interval_guard(agent_name: str, label: str) -> None:
+    global _LLM_LAST_REQUEST_TS
+    if _LLM_MIN_REQUEST_INTERVAL_SEC <= 0:
+        return
+
+    wait_sec = 0.0
+    with _LLM_REQUEST_GUARD_LOCK:
+        now = time.monotonic()
+        elapsed = now - _LLM_LAST_REQUEST_TS
+        if elapsed < _LLM_MIN_REQUEST_INTERVAL_SEC:
+            wait_sec = _LLM_MIN_REQUEST_INTERVAL_SEC - elapsed
+        _LLM_LAST_REQUEST_TS = now + wait_sec
+
+    if wait_sec > 0:
+        print(
+            f"   [LLM Router] {agent_name}: LLM 호출 간격 보호 대기 {wait_sec:.2f}초 ({label})",
+            flush=True,
+        )
+        time.sleep(wait_sec)
+
+
+def _to_trace_text(value: Any) -> str:
+    if value is None:
+        return ""
+    if isinstance(value, str):
+        return value
+    if isinstance(value, (int, float, bool)):
+        return str(value)
+    if isinstance(value, dict):
+        try:
+            return json.dumps(value, ensure_ascii=False)
+        except Exception:
+            return str(value)
+    if isinstance(value, list):
+        parts: list[str] = []
+        for item in value:
+            if isinstance(item, dict):
+                text = item.get("text") or item.get("input_text") or item.get("content") or item.get("type")
+                if text is not None:
+                    parts.append(str(text))
+            else:
+                parts.append(str(item))
+        return " ".join(parts)
+    return str(value)
+
+
+def _preview_text(text: str, max_len: int | None = None) -> str:
+    cap = int(max_len or _LLM_TRACE_PREVIEW_CHARS)
+    s = " ".join(str(text).split())
+    if len(s) <= cap:
+        return s
+    return s[: cap - 3].rstrip() + "..."
+
+
+def _invoke_payload_trace_lines(args: tuple[Any, ...], kwargs: dict[str, Any]) -> list[str]:
+    kw_keys = sorted(kwargs.keys())
+    if not args:
+        return [f"payload args=0 kwargs={kw_keys}"]
+
+    first = args[0]
+    if isinstance(first, list):
+        lines = [f"payload messages={len(first)} kwargs={kw_keys}"]
+        for i, msg in enumerate(first[:4]):
+            role = str(getattr(msg, "type", msg.__class__.__name__)).lower()
+            content = _to_trace_text(getattr(msg, "content", msg))
+            lines.append(
+                f"msg[{i}] role={role} chars={len(content)} preview={_preview_text(content)}"
+            )
+        if len(first) > 4:
+            lines.append(f"msg[...]=+{len(first)-4} more")
+        return lines
+
+    content = _to_trace_text(first)
+    return [
+        f"payload arg0_type={type(first).__name__} kwargs={kw_keys}",
+        f"payload chars={len(content)} preview={_preview_text(content)}",
+    ]
+
+
+def _invoke_response_trace_line(out: Any) -> str:
+    content = _to_trace_text(getattr(out, "content", out))
+    return f"response chars={len(content)} preview={_preview_text(content)}"
+
+
+class _BoundedLLMProxy:
+    """Global concurrency bound + fallback invoke wrapper."""
+
+    def __init__(self, agent_name: str, backends: list[tuple[str, Any]]):
+        self._agent_name = agent_name
+        self._backends = list(backends)
+
+    def _acquire_slot(self) -> None:
+        if _LLM_CONCURRENCY_SEM.acquire(blocking=False):
+            return
+        msg = (
+            f"   [LLM Router] {self._agent_name}: 동시 호출 한도({_LLM_MAX_CONCURRENCY}) "
+            f"초과로 대기 중..."
+        )
+        print(msg, flush=True)
+        if _is_pytest_running():
+            print(
+                f"   [LLM Router][TEST] {self._agent_name}: 대기 로그 기록",
+                flush=True,
+            )
+        _LLM_CONCURRENCY_SEM.acquire()
+
+    def _release_slot(self) -> None:
+        try:
+            _LLM_CONCURRENCY_SEM.release()
+        except ValueError:
+            pass
+
+    def _invoke_with_fallback(self, method_name: str, *args, **kwargs):
+        self._acquire_slot()
+        last_exc: Exception | None = None
+        all_rate_limited = True
+        try:
+            for idx, (label, backend) in enumerate(self._backends):
+                method = getattr(backend, method_name, None)
+                if method is None:
+                    all_rate_limited = False
+                    continue
+                zai_rl_retry = 0
+                while True:
+                    _apply_llm_request_interval_guard(self._agent_name, label)
+                    _llm_trace(self._agent_name, f"{method_name} 시도 -> {label}")
+                    if _llm_trace_enabled():
+                        for line in _invoke_payload_trace_lines(args, kwargs):
+                            _llm_trace(self._agent_name, line)
+                    try:
+                        out = method(*args, **kwargs)
+                        record_api_request(label, success=True, category="llm")
+                        _llm_trace(self._agent_name, f"{method_name} 성공 <- {label}")
+                        if _llm_trace_enabled():
+                            _llm_trace(self._agent_name, _invoke_response_trace_line(out))
+                        return out
+                    except Exception as exc:
+                        record_api_request(label, success=False, category="llm")
+                        last_exc = exc
+                        is_rl = _is_rate_limit_error(exc)
+                        if is_rl:
+                            print(
+                                f"   [LLM Router] {self._agent_name}: rate limit 감지 ({label})",
+                                flush=True,
+                            )
+                            if label.startswith("zai:") and zai_rl_retry < _ZAI_RL_RETRY_MAX:
+                                zai_rl_retry += 1
+                                print(
+                                    f"   [LLM Router] {self._agent_name}: "
+                                    f"GLM 재시도 대기 {_ZAI_RL_RETRY_DELAY_SEC}초 "
+                                    f"({zai_rl_retry}/{_ZAI_RL_RETRY_MAX})",
+                                    flush=True,
+                                )
+                                time.sleep(_ZAI_RL_RETRY_DELAY_SEC)
+                                continue
+                        else:
+                            all_rate_limited = False
+                            print(
+                                f"   [LLM Router] {self._agent_name}: 호출 실패 ({label}) - {exc}",
+                                flush=True,
+                            )
+                        if idx < len(self._backends) - 1:
+                            nxt = self._backends[idx + 1][0]
+                            print(
+                                f"   [LLM Router] {self._agent_name}: fallback 시도 → {nxt}",
+                                flush=True,
+                            )
+                        break
+            if all_rate_limited and last_exc is not None:
+                print("   [LLM Router] ⚠️ 모든 LLM API가 rate limit 상태입니다.", flush=True)
+            if last_exc is not None:
+                raise last_exc
+            raise RuntimeError(f"{self._agent_name}: invoke 가능한 LLM backend가 없습니다.")
+        finally:
+            self._release_slot()
+
+    def invoke(self, *args, **kwargs):
+        return self._invoke_with_fallback("invoke", *args, **kwargs)
+
+    def with_structured_output(self, *args, **kwargs):
+        structured_backends: list[tuple[str, Any]] = []
+        errors = []
+        for label, backend in self._backends:
+            try:
+                structured_backends.append((label, backend.with_structured_output(*args, **kwargs)))
+            except Exception as exc:
+                errors.append(f"{label}:{exc}")
+        if not structured_backends:
+            msg = "; ".join(errors) if errors else "unknown"
+            raise RuntimeError(
+                f"{self._agent_name}: structured output backend 생성 실패 ({msg})"
+            )
+        return _BoundedLLMProxy(self._agent_name, structured_backends)
+
+    def __getattr__(self, name: str):
+        # invoke/with_structured_output 외 속성은 첫 backend로 위임.
+        return getattr(self._backends[0][1], name)
+
+
+def _build_provider_chain(config: dict[str, Any]) -> list[dict[str, Any]]:
+    chain: list[dict[str, Any]] = []
+    primary = dict(config)
+    primary.pop("fallback_chain", None)
+    chain.append(primary)
+    # TEMP: fallback chain 비활성화 (GLM 단일 경로 강제)
+    # for fb in config.get("fallback_chain", []) or []:
+    #     if not isinstance(fb, dict):
+    #         continue
+    #     merged = dict(config)
+    #     merged.update(fb)
+    #     merged.pop("fallback_chain", None)
+    #     chain.append(merged)
+    return chain
+
+
+# ── Public API ────────────────────────────────────────────────────────────────
 
 def get_llm(agent_name: str):
     """
-    에이전트별 LLM ChatModel을 반환합니다.
-
-    Returns:
-        BaseChatModel 또는 None (API 키 없거나 disabled)
+    에이전트별 LLM ChatModel proxy를 반환.
+    - Primary: Z.ai
+    - Fallback: AGENT_LLM_CONFIG[fallback_chain]
     """
     config = AGENT_LLM_CONFIG.get(agent_name)
     if config is None:
-        print(f"   [LLM Router] ⚠️ 알 수 없는 에이전트: {agent_name}")
+        print(f"   [LLM Router] ⚠️ 알 수 없는 에이전트: {agent_name}", flush=True)
         return None
 
     if not config.get("enabled", True):
         return None
 
-    provider = config.get("provider", "groq")
-    factory = _PROVIDER_FACTORY.get(provider)
-    if factory is None:
-        print(f"   [LLM Router] ⚠️ 알 수 없는 provider: {provider}")
+    backends: list[tuple[str, Any]] = []
+    for candidate in _build_provider_chain(config):
+        provider = str(candidate.get("provider", "zai")).strip().lower()
+        factory = _PROVIDER_FACTORY.get(provider)
+        if factory is None:
+            print(f"   [LLM Router] ⚠️ 알 수 없는 provider: {provider}", flush=True)
+            continue
+        llm = factory(candidate)
+        if llm is None:
+            continue
+        backends.append((_provider_label(candidate), llm))
+
+    if not backends:
+        msg = f"   [LLM Router] {agent_name}: 사용 가능한 LLM provider가 없습니다."
+        print(msg, flush=True)
+        if _force_real_llm_in_tests():
+            raise RuntimeError(f"{agent_name}: 실호출 테스트 모드에서 사용 가능한 LLM provider 없음")
+        print(f"{msg} → Mock fallback", flush=True)
         return None
 
-    llm = factory(config)
+    _llm_trace(agent_name, "provider chain = " + " -> ".join(label for label, _ in backends))
 
-    # Gemini-specific fallback chain: Gemini → Groq → None
-    if llm is None and provider == "gemini" and _get_groq_key():
-        print("   [LLM Router] Gemini 키 없음 → Groq fallback")
-        fallback_config = dict(config)
-        fallback_config["model"] = "llama-3.1-8b-instant"
-        llm = _create_groq_llm(fallback_config)
-
-    if llm is None:
-        print(f"   [LLM Router] {agent_name}: API 키 없음 → Mock fallback")
-
-    return llm
+    return _BoundedLLMProxy(agent_name, backends)
 
 
 def get_llm_with_cache(agent_name: str, cache_content: str):
     """
-    캐시 키를 확인하고 캐시 히트면 (llm, cached_response) 반환,
-    미스면 (llm, None) 반환.
-
-    Usage:
-        llm, cached = get_llm_with_cache("orchestrator", input_text)
-        if cached is not None:
-            return cached
-        if llm is None:
-            return mock_fallback()
-        response = llm.invoke(msgs)
-        set_cache("orchestrator", input_text, response)
+    캐시 조회 후 (llm, cached_response) 반환.
+    테스트 실호출 모드에서는 캐시를 사용하지 않는다.
     """
+    if _force_real_llm_in_tests():
+        llm = get_llm(agent_name)
+        return llm, None
+
     key = _cache_key(agent_name, cache_content)
     cached = _response_cache.get(key)
     if cached is not None:
-        print(f"   [LLM Router] {agent_name}: 캐시 히트")
+        print(f"   [LLM Router] {agent_name}: 캐시 히트", flush=True)
         return None, cached
 
     llm = get_llm(agent_name)
@@ -243,11 +623,11 @@ def get_llm_with_cache(agent_name: str, cache_content: str):
 
 
 def set_cache(agent_name: str, cache_content: str, response: Any) -> None:
-    """LLM 응답을 캐시에 저장."""
+    if _force_real_llm_in_tests():
+        return
     key = _cache_key(agent_name, cache_content)
     _response_cache[key] = response
 
 
-def get_agent_config(agent_name: str) -> dict:
-    """에이전트의 LLM 설정을 반환."""
+def get_agent_config(agent_name: str) -> dict[str, Any]:
     return dict(AGENT_LLM_CONFIG.get(agent_name, {}))
