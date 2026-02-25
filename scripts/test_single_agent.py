@@ -69,7 +69,7 @@ def _risk_payload():
 
 def test_orchestrator():
     print("=" * 60)
-    print("🤖 Orchestrator Agent (Groq — 구조화 JSON)")
+    print("🤖 Orchestrator Agent (LLM Router)")
     print("=" * 60)
     from agents.orchestrator_agent import _call_llm
     result = _call_llm("삼성전자 매수해도 될까?", iteration=1)
@@ -106,13 +106,16 @@ def test_fundamental():
     from agents.fundamental_agent import fundamental_analyst_run
     result = fundamental_analyst_run(
         ticker=TICKER,
-        fundamentals={
-            "current_ratio": 2.0,
+        financials={
+            "total_assets": 100000,
+            "total_liabilities": 35000,
+            "revenue_growth": 8.0,
             "debt_to_equity": 0.35,
-            "operating_margin": 0.20,
-            "revenue_growth_1y": 0.08,
-            "earnings_yield": 0.05,
-            "altman_z": 4.5,
+            "operating_margin": 20.0,
+            "roe": 18.0,
+            "pe_ratio": 18.0,
+            "free_cash_flow": 2000,
+            "interest_expense": 200,
         },
         run_id="test",
     )
@@ -126,10 +129,15 @@ def test_sentiment():
     from agents.sentiment_agent import sentiment_analyst_run
     result = sentiment_analyst_run(
         ticker=TICKER,
-        news_items=[
-            {"headline": "삼성전자 HBM 공급계약 체결", "sentiment": 0.8, "source": "reuters"},
-            {"headline": "반도체 수출 증가세 지속", "sentiment": 0.6, "source": "bloomberg"},
-        ],
+        sentiment_indicators={
+            "put_call_ratio": 0.9,
+            "vix_level": 18,
+            "news_sentiment_score": 0.6,
+            "news_articles": [
+                {"title": "삼성전자 HBM 공급계약 체결", "source": "reuters", "published_at": "2026-01-01T00:00:00Z"},
+                {"title": "반도체 수출 증가세 지속", "source": "bloomberg", "published_at": "2026-01-01T00:00:00Z"},
+            ],
+        },
         run_id="test",
     )
     print(json.dumps({k: result[k] for k in ["primary_decision", "recommendation", "confidence", "summary"]}, indent=2, ensure_ascii=False))

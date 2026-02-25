@@ -20,6 +20,7 @@ from data_providers.sec_edgar_provider import SECEdgarProvider
 from data_providers.newsapi_provider import NewsAPIProvider
 from data_providers.alphavantage_provider import AlphaVantageProvider
 from data_providers.twelvedata_provider import TwelveDataProvider
+from data_providers.base import is_rate_limit_error
 
 # Legacy mock wrappers
 from data_providers.fred_provider import (
@@ -103,8 +104,12 @@ class DataHub:
             return data, evidence, {"data_ok": True, "limitations": ["Mock data"]}
 
         # Try Alpha Vantage first (higher quality), fallback to NewsAPI
+        av_rate_limited = False
         if hasattr(self, '_av') and self._av.has_key:
             av_result = self._av.get_news_sentiment(ticker, days=days)
+            av_rate_limited = any(
+                is_rate_limit_error(msg) for msg in av_result.get("limitations", [])
+            )
             if av_result["data_ok"] and av_result["data"]:
                 indicators = {
                     "news_sentiment_score": av_result["data"]["sentiment_score"],
@@ -118,6 +123,9 @@ class DataHub:
 
         # NewsAPI
         result = self._news.search_ticker_news(ticker, days=days)
+        news_rate_limited = any(is_rate_limit_error(msg) for msg in result.get("limitations", []))
+        if av_rate_limited and news_rate_limited:
+            print("   [API Router] ⚠️ 모든 Sentiment API가 rate limit 상태입니다.", flush=True)
         return result["data"], result["evidence"], {
             "data_ok": result["data_ok"], "limitations": result["limitations"],
         }

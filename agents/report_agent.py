@@ -96,6 +96,21 @@ def _build_report_human_msg(state: dict) -> str:
             lines.append(f"  Limitations: {'; '.join(limitations[:2])}")
         return "\n".join(lines) if lines else "  (데이터 없음)"
 
+    def _evidence_section(state: dict) -> str:
+        """evidence_store를 요약 렌더. 링크/제목/날짜만."""
+        ev_store = state.get("evidence_store", {})
+        ev_score = state.get("evidence_score", 0)
+        if not ev_store:
+            return f"[Evidence] score={ev_score} (수집된 증거 없음)"
+        lines = [f"[Evidence Sources] (score={ev_score}, items={len(ev_store)})"]
+        for _hash, item in list(ev_store.items())[:10]:
+            url = item.get("url", "")
+            title = item.get("title", "(제목 없음)")
+            pub = item.get("published_at", "")
+            tier = item.get("trust_tier", 0)
+            lines.append(f"  - [{title}]({url}) | {pub} | trust={tier}")
+        return "\n".join(lines)
+
     parts = [
         f"[작성 시각] {datetime.utcnow().strftime('%Y-%m-%dT%H:%M:%SZ')}",
         f"[사용자 요청] {state.get('user_request', '')}",
@@ -128,7 +143,15 @@ def _build_report_human_msg(state: dict) -> str:
         "",
         "[Risk Assessment]",
         f"```json\n{json.dumps(state.get('risk_assessment', {}), ensure_ascii=False, indent=2)}\n```",
+        "",
+        _evidence_section(state),
     ]
+    if state.get("user_action_required"):
+        parts.extend([
+            "",
+            "[User Action Required]",
+            f"```json\n{json.dumps({'research_stop_reason': state.get('research_stop_reason', ''), 'user_action_items': state.get('user_action_items', [])}, ensure_ascii=False, indent=2)}\n```",
+        ])
     return "\n".join(parts)
 
 
@@ -329,7 +352,9 @@ def _mock_generate_report(state: dict) -> str:
 
 ---
 
-*본 보고서는 AI 투자 분석 시스템에 의해 자동 생성되었습니다. 최종 투자 결정은 반드시 인간 심의위원의 승인이 필요합니다.*"""
+*본 보고서는 AI 투자 분석 시스템에 의해 자동 생성되었습니다. 최종 투자 결정은 반드시 인간 심의위원의 승인이 필요합니다.*
+
+{_fmt_research_appendix(state)}"""
 
     # ── REJECT / FALLBACK 시나리오 ────────────────────────────────────────
     else:
@@ -422,7 +447,9 @@ def _mock_generate_report(state: dict) -> str:
 
 ---
 
-*본 보고서는 AI 투자 분석 시스템에 의해 자동 생성되었습니다. 최종 투자 결정은 반드시 인간 심의위원의 승인이 필요합니다.*"""
+*본 보고서는 AI 투자 분석 시스템에 의해 자동 생성되었습니다. 최종 투자 결정은 반드시 인간 심의위원의 승인이 필요합니다.*
+
+{_fmt_research_appendix(state)}"""
 
     return report
 
@@ -495,6 +522,57 @@ def _fmt_per_ticker_table(per_ticker: dict) -> str:
             f"| {t} | {d.get('decision', 'N/A')} | "
             f"{_fmt_pct(d.get('final_weight', 'N/A'))} | {flags_str} |"
         )
+    return "\n".join(lines)
+
+
+def _fmt_research_appendix(state: dict) -> str:
+    ev_score = state.get("evidence_score", 0)
+    ev_store = state.get("evidence_store", {}) or {}
+
+    lines = [
+        "## 6. Research Evidence & Watchlist",
+        "",
+        f"- **Evidence Score:** {ev_score}",
+        f"- **Evidence Items:** {len(ev_store)}",
+        "",
+        "### Evidence Sources (link/title/date)",
+    ]
+    if ev_store:
+        for item in list(ev_store.values())[:10]:
+            lines.append(
+                f"- [{item.get('title','(제목 없음)')}]({item.get('url','')}) | {item.get('published_at','')}"
+            )
+    else:
+        lines.append("- (none)")
+
+    lines.extend(["", "### Desk Drivers / Watch / Data Quality"])
+    for desk_key, label in (
+        ("macro_analysis", "Macro"),
+        ("fundamental_analysis", "Fundamental"),
+        ("sentiment_analysis", "Sentiment"),
+    ):
+        desk = state.get(desk_key, {}) or {}
+        lines.append(f"- **{label} Key Drivers:** " + " | ".join(desk.get("key_drivers", [])[:3] or ["(none)"]))
+        lines.append(f"- **{label} What to Watch:** " + " | ".join(desk.get("what_to_watch", [])[:3] or ["(none)"]))
+        sn = desk.get("scenario_notes", {}) or {}
+        lines.append(
+            f"- **{label} Scenario Notes:** bull={sn.get('bull','')} / base={sn.get('base','')} / bear={sn.get('bear','')}"
+        )
+        dq = desk.get("data_quality", {}) or {}
+        lines.append(
+            f"- **{label} Data Quality:** missing_pct={dq.get('missing_pct', 'N/A')}, "
+            f"freshness_days={dq.get('freshness_days', 'N/A')}, warnings={dq.get('warnings', [])}"
+        )
+    if state.get("user_action_required"):
+        lines.extend(["", "### User Action Required"])
+        lines.append(f"- **Research Stop Reason:** {state.get('research_stop_reason', '')}")
+        for item in (state.get("user_action_items", []) or [])[:5]:
+            if not isinstance(item, dict):
+                continue
+            lines.append(
+                f"- [{item.get('code','unknown')}] {item.get('suggested_action','수동 점검 필요')} "
+                f"(desk={item.get('desk','')}, detail={item.get('detail','')})"
+            )
     return "\n".join(lines)
 
 

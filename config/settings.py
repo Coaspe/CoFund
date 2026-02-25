@@ -39,6 +39,9 @@ class Settings:
     # Rate limiting
     rate_limit_qps: float = 2.0
 
+    # HTTP log verbosity: all | compact | fail | off
+    http_log_level: str = "compact"
+
     @classmethod
     def from_env(cls) -> "Settings":
         return cls(
@@ -52,6 +55,7 @@ class Settings:
             cache_dir=os.environ.get("CACHE_DIR", ".cache"),
             cache_ttl_sec=int(os.environ.get("CACHE_TTL_SEC", "3600")),
             rate_limit_qps=float(os.environ.get("RATE_LIMIT_QPS", "2.0")),
+            http_log_level=os.environ.get("HTTP_LOG_LEVEL", "compact").strip().lower(),
         )
 
 

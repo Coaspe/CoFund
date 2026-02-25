@@ -41,7 +41,7 @@ except ImportError:
     HAS_LC = False
 
 from schemas.common import InvestmentState
-from llm.router import get_llm_with_cache, set_cache
+from llm.router import get_llm_with_cache, set_cache, force_real_llm_in_tests
 
 
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
@@ -59,6 +59,22 @@ _KR_TICKER_MAP = {
     "마이크로소프트": "MSFT", "테슬라": "TSLA", "엔비디아": "NVDA",
     "메타": "META", "넷플릭스": "NFLX",
 }
+
+
+def _env_flag(name: str, default: bool = False) -> bool:
+    raw = os.environ.get(name)
+    if raw is None:
+        return default
+    return str(raw).strip().lower() in {"1", "true", "yes", "on"}
+
+
+def _orch_trace_enabled() -> bool:
+    return _env_flag("ORCH_TRACE", False)
+
+
+def _orch_trace(message: str) -> None:
+    if _orch_trace_enabled():
+        print(f"   [ORCH TRACE] {message}", flush=True)
 
 
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
@@ -222,7 +238,7 @@ def classify_intent_rules(user_request: str) -> dict:
     # compare_tickers: ≥2 tickers or VS keywords
     compare_kws = ["vs", "비교", "대비", "or ", "대 ", "비해"]
     if len(tickers) >= 2 or any(kw in text for kw in compare_kws):
-        universe = tickers[:4] if len(tickers) >= 2 else ["AAPL", "MSFT"]
+        universe = tickers[:4] if len(tickers) >= 2 else ["SPY", "QQQ"]
         return {"intent": "compare_tickers", "universe": universe,
                 "horizon_days": 30,
                 "desk_tasks": _default_desk_tasks(30, "Moderate", "valuation")}
@@ -231,7 +247,8 @@ def classify_intent_rules(user_request: str) -> dict:
     heat_kws = ["과열", "너무 올랐", "오른", "고점", "거품", "overbought", "expensive", "stretched", "비싸"]
     if any(kw in text for kw in heat_kws):
         ticker = _extract_ticker(user_request)
-        return {"intent": "overheated_check", "universe": [ticker, "SPY"],
+        universe = [ticker, "SPY"] if ticker else ["SPY", "QQQ"]
+        return {"intent": "overheated_check", "universe": universe,
                 "horizon_days": 90,
                 "desk_tasks": _default_desk_tasks(90, "Conservative", "valuation")}
 
@@ -239,7 +256,8 @@ def classify_intent_rules(user_request: str) -> dict:
     event_kws = ["실적", "earnings", "이벤트", "발표", "fomc", "어닝", "앞두", "before"]
     if any(kw in text for kw in event_kws):
         ticker = _extract_ticker(user_request)
-        return {"intent": "event_risk", "universe": [ticker],
+        universe = [ticker] if ticker else ["SPY", "QQQ"]
+        return {"intent": "event_risk", "universe": universe,
                 "horizon_days": 14,
                 "desk_tasks": _default_desk_tasks(14, "Conservative", "event")}
 
@@ -250,9 +268,14 @@ def classify_intent_rules(user_request: str) -> dict:
                 "horizon_days": 30,
                 "desk_tasks": _default_desk_tasks(30, "Moderate")}
 
-    # default: single_ticker_entry
+    # default:
+    # ticker가 있으면 단일 종목 진입, 없으면 시장 전망으로 처리해 AAPL 기본 고정을 방지
     ticker = _extract_ticker(user_request)
-    return {"intent": "single_ticker_entry", "universe": [ticker],
+    if ticker:
+        return {"intent": "single_ticker_entry", "universe": [ticker],
+                "horizon_days": 30,
+                "desk_tasks": _default_desk_tasks(30, "Moderate")}
+    return {"intent": "market_outlook", "universe": ["SPY", "QQQ", "IWM"],
             "horizon_days": 30,
             "desk_tasks": _default_desk_tasks(30, "Moderate")}
 
@@ -290,6 +313,39 @@ def _validate_llm_plan(result: dict, user_request: str) -> bool:
     return "macro" in tasks and "quant" in tasks
 
 
+def _parse_json_object_maybe_fenced(text: str) -> dict:
+    """
+    LLM 출력이 ```json ... ``` 형태일 때도 dict로 복원한다.
+    """
+    s = (text or "").strip()
+    if s.startswith("```"):
+        lines = s.splitlines()
+        if lines and lines[0].strip().startswith("```"):
+            lines = lines[1:]
+        if lines and lines[-1].strip() == "```":
+            lines = lines[:-1]
+        s = "\n".join(lines).strip()
+
+    try:
+        obj = json.loads(s)
+        if isinstance(obj, dict):
+            return obj
+    except (json.JSONDecodeError, TypeError):
+        pass
+
+    decoder = json.JSONDecoder()
+    for i, ch in enumerate(s):
+        if ch not in "{[":
+            continue
+        try:
+            obj, _ = decoder.raw_decode(s[i:])
+        except json.JSONDecodeError:
+            continue
+        if isinstance(obj, dict):
+            return obj
+    raise json.JSONDecodeError("No JSON object found", s, 0)
+
+
 def _call_llm(
     user_request: str,
     iteration: int,
@@ -300,52 +356,72 @@ def _call_llm(
     실패/불일치 시 classify_intent_rules 결과로 fallback.
     캐시 키: (user_request + iteration + risk_feedback_hash).
     """
+    use_plan_cache = not force_real_llm_in_tests()
+    _orch_trace(
+        f"start iteration={iteration} use_plan_cache={use_plan_cache} "
+        f"has_risk_feedback={bool(risk_feedback)}"
+    )
+    _orch_trace(f"user_request={user_request}")
+
     # ── Plan cache check ──────────────────────────────────────────────
     cache_key = _plan_cache_key(user_request, iteration, risk_feedback)
-    if cache_key in _PLAN_CACHE:
+    if use_plan_cache and cache_key in _PLAN_CACHE:
+        _orch_trace(f"plan cache hit key={cache_key[:10]}")
         print("   [LLM] plan cache hit")
         return _PLAN_CACHE[cache_key]
 
     # ── Rules fallback always computed (for validation/fallback) ───────
     rules_plan = _mock_orchestrator_decision(user_request, iteration, risk_feedback)
+    _orch_trace(
+        "rules_plan intent="
+        + str(rules_plan.get("intent", "n/a"))
+        + " universe="
+        + str((rules_plan.get("investment_brief", {}) or {}).get("target_universe", []))
+    )
 
     if not HAS_LC:
         print("   [LLM] langchain 미설치 → rules fallback")
-        _PLAN_CACHE[cache_key] = rules_plan
+        if use_plan_cache:
+            _PLAN_CACHE[cache_key] = rules_plan
         return rules_plan
 
     human_msg = _build_orchestrator_human_msg(user_request, iteration, risk_feedback)
+    human_msg_preview = human_msg if len(human_msg) <= 800 else (human_msg[:800] + " ...<truncated>")
+    _orch_trace("human_msg:\n" + human_msg_preview)
 
     # llm_router cache (response-level)
     llm, cached = get_llm_with_cache("orchestrator", human_msg)
     if cached is not None:
-        _PLAN_CACHE[cache_key] = cached
+        _orch_trace("llm response cache hit")
+        if use_plan_cache:
+            _PLAN_CACHE[cache_key] = cached
         return cached
     if llm is None:
+        _orch_trace("no llm available -> rules fallback")
         print("   [LLM] API 키 없음 → rules fallback")
-        _PLAN_CACHE[cache_key] = rules_plan
+        if use_plan_cache:
+            _PLAN_CACHE[cache_key] = rules_plan
         return rules_plan
 
-    # ── LLM call ──────────────────────────────────────────────────────
+    # ── LLM call (raw JSON path; fenced JSON 허용) ─────────────────────
     try:
-        if HAS_PYDANTIC:
-            structured = llm.with_structured_output(OrchestratorOutput)
-            msgs = [
-                SystemMessage(content=ORCHESTRATOR_SYSTEM_PROMPT),
-                HumanMessage(content=human_msg),
-            ]
-            resp   = structured.invoke(msgs)
-            result = resp.model_dump()
-        else:
-            msgs = [
-                SystemMessage(content=ORCHESTRATOR_SYSTEM_PROMPT),
-                HumanMessage(content=human_msg),
-            ]
-            raw    = llm.invoke(msgs)
-            result = json.loads(raw.content)
+        msgs = [
+            SystemMessage(content=ORCHESTRATOR_SYSTEM_PROMPT),
+            HumanMessage(content=human_msg),
+        ]
+        _orch_trace("invoke llm with 2 messages (system+human)")
+        raw = llm.invoke(msgs)
+        result = _parse_json_object_maybe_fenced(getattr(raw, "content", ""))
+        _orch_trace(
+            "llm parsed action_type="
+            + str(result.get("action_type"))
+            + " universe="
+            + str((result.get("investment_brief", {}) or {}).get("target_universe", []))
+        )
 
         # ── Validate ──────────────────────────────────────────────────
         if not _validate_llm_plan(result, user_request):
+            _orch_trace("validate_llm_plan=false -> rules fallback")
             print("   [LLM] plan 검증 실패 → rules fallback")
             result = rules_plan
         else:
@@ -356,12 +432,16 @@ def _call_llm(
             print(f"   [LLM] ✅ plan 사용 (intent={result.get('intent')})")
 
         set_cache("orchestrator", human_msg, result)
-        _PLAN_CACHE[cache_key] = result
+        if use_plan_cache:
+            _PLAN_CACHE[cache_key] = result
+        _orch_trace("return llm plan")
         return result
 
     except Exception as exc:
+        _orch_trace(f"exception -> rules fallback: {exc}")
         print(f"   [LLM] ⚠️ 호출 실패 → rules fallback: {exc}")
-        _PLAN_CACHE[cache_key] = rules_plan
+        if use_plan_cache:
+            _PLAN_CACHE[cache_key] = rules_plan
         return rules_plan
 
 
@@ -380,7 +460,7 @@ def _extract_ticker(user_request: str) -> str:
     for m in matches:
         if m not in ("AI", "ETF", "PM", "CEO", "CIO", "IPO"):
             return m
-    return "AAPL"  # 기본값
+    return ""
 
 
 def _mock_orchestrator_decision(
@@ -390,7 +470,12 @@ def _mock_orchestrator_decision(
 ) -> dict:
     """iteration 기반 CIO 의사결정 Mock."""
 
-    ticker = _extract_ticker(user_request)
+    intent_info = classify_intent_rules(user_request)
+    intent = intent_info.get("intent", "single_ticker_entry")
+    universe = list(intent_info.get("universe", []) or [])
+    horizon_days = int(intent_info.get("horizon_days", 30))
+    desk_tasks = dict(intent_info.get("desk_tasks", {}) or _default_desk_tasks(horizon_days))
+    ticker = universe[0] if universe else _extract_ticker(user_request)
 
     # ── Fallback 모드 (iteration >= MAX_ITERATIONS) ───────────────────────
     if iteration >= MAX_ITERATIONS:
@@ -526,6 +611,20 @@ def _mock_orchestrator_decision(
         }
 
     # ── 초기 지시 모드 (iteration == 0) ────────────────────────────────────
+    if intent == "market_outlook":
+        return {
+            "current_iteration": iteration,
+            "action_type": "initial_delegation",
+            "investment_brief": {
+                "rationale": (
+                    f"사용자 요청 '{user_request}'은 단일 종목 매수 판단이 아니라 "
+                    f"시장/섹터 전망 점검으로 분류되어, 미국 지수 중심 유니버스를 우선 분석함."
+                ),
+                "target_universe": universe or ["SPY", "QQQ", "IWM"],
+            },
+            "desk_tasks": desk_tasks,
+        }
+
     return {
         "current_iteration": iteration,
         "action_type": "initial_delegation",
@@ -535,43 +634,9 @@ def _mock_orchestrator_decision(
                 f"롱 포지션 검토를 개시. 투자 기간 중기(1~6개월). "
                 f"4개 데스크에 종합 분석을 지시."
             ),
-            "target_universe": [ticker],
+            "target_universe": universe or [ticker],
         },
-        "desk_tasks": {
-            "macro": {
-                "horizon_days": 30,
-                "focus_areas": [
-                    "금리 인하 확률",
-                    "테크 섹터 베타 환경",
-                    "GDP/CPI 추세",
-                ],
-            },
-            "fundamental": {
-                "horizon_days": 90,
-                "focus_areas": [
-                    "부채비율 및 유동성",
-                    "현금흐름 안정성",
-                    "밸류에이션 적정성 (PER, PBR)",
-                ],
-            },
-            "sentiment": {
-                "horizon_days": 5,
-                "focus_areas": [
-                    "옵션 스큐(Skew)",
-                    "실적 발표 관련 뉴스 감성",
-                    "내부자 매매 동향",
-                ],
-            },
-            "quant": {
-                "horizon_days": 10,
-                "risk_budget": "Moderate",
-                "focus_areas": [
-                    "평균 회귀 Z-score",
-                    "CVaR 한도 내 최적 비중",
-                    "모멘텀 점수",
-                ],
-            },
-        },
+        "desk_tasks": desk_tasks,
     }
 
 
@@ -793,3 +858,180 @@ if __name__ == "__main__":
         print(f"   {status}  {label}")
 
     print(f"\n{'✅ 모든 검증 통과!' if all_pass else '❌ 일부 검증 실패 — 위 항목 확인 필요'}")
+
+
+# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+# Research Planner (V4) — research_router_node에서만 호출
+# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+_QUERY_TEMPLATES = {
+    "press_release_or_ir": "{ticker} investor relations earnings press release date",
+    "macro_headline_context": "{ticker} macro economy headline driver {query}",
+    "ownership_identity": "{ticker} insider trading institutional ownership SEC Form 4 13F",
+    "valuation_context": "{ticker} PE ratio valuation historical comparison peers",
+    "catalyst_event_detail": "{ticker} catalyst event upcoming {query}",
+    "sec_filing": "{ticker} SEC filing 10-K 10-Q annual report",
+}
+
+_ALLOWLIST_BY_KIND = {
+    "ownership_identity": ["sec.gov", "efts.sec.gov"],
+    "sec_filing": ["sec.gov", "efts.sec.gov"],
+    "press_release_or_ir": ["sec.gov", "prnewswire.com", "businesswire.com", "globenewswire.com"],
+    "macro_headline_context": [
+        "fred.stlouisfed.org", "nyfed.org", "bls.gov", "bea.gov", "eia.gov",
+        "federalreserve.gov", "treasury.gov",
+    ],
+}
+
+
+def _request_key(req: dict) -> tuple:
+    return (
+        req.get("desk", ""),
+        req.get("kind", ""),
+        req.get("ticker", ""),
+        req.get("series_id", ""),
+        req.get("query", ""),
+    )
+
+
+def _sanitize_research_request(req: dict) -> dict | None:
+    kind = str(req.get("kind", "")).strip()
+    if not kind:
+        return None
+    out = dict(req)
+    out["kind"] = kind
+    out["desk"] = str(out.get("desk", "orchestrator") or "orchestrator")
+    out["ticker"] = str(out.get("ticker", "")).upper().strip()
+    out["query"] = str(out.get("query", "")).strip()
+    out["priority"] = max(1, min(5, int(out.get("priority", 3))))
+    out["recency_days"] = max(1, min(365, int(out.get("recency_days", 30))))
+    out["max_items"] = max(1, min(20, int(out.get("max_items", 5))))
+    out["rationale"] = str(out.get("rationale", "")).strip()
+    hint = out.get("_allowlist_hint")
+    if hint and not isinstance(hint, list):
+        out["_allowlist_hint"] = []
+    return out
+
+
+def _enforce_research_budget(
+    requests: list[dict],
+    *,
+    max_web_queries_per_run: int,
+    max_web_queries_per_ticker: int,
+) -> list[dict]:
+    capped = []
+    ticker_count: dict[str, int] = {}
+    for req in sorted(requests, key=lambda r: r.get("priority", 5)):
+        if len(capped) >= max_web_queries_per_run:
+            break
+        t = (req.get("ticker", "") or "__GLOBAL__").upper()
+        if ticker_count.get(t, 0) >= max_web_queries_per_ticker:
+            continue
+        capped.append(req)
+        ticker_count[t] = ticker_count.get(t, 0) + 1
+    return capped
+
+
+def plan_additional_research(
+    evidence_requests: list,
+    desk_outputs: dict,
+    user_request: str,
+    *,
+    policy_state: dict | None = None,
+) -> list | None:
+    """
+    Orchestrator가 EvidenceRequest를 재정렬/보강.
+    LLM 사용 가능하면 LLM-first, 실패시 규칙 fallback.
+    iteration_count 변경 금지.
+    Returns: enriched requests list, or None (= use original).
+    """
+    # ── 먼저 규칙 기반으로 query template 보강 ──────────────────────────
+    enriched = []
+    max_per_run = int((policy_state or {}).get("max_web_queries_per_run", 6))
+    max_per_ticker = int((policy_state or {}).get("max_web_queries_per_ticker", 3))
+    for req in evidence_requests:
+        req = dict(req)  # copy
+        kind = req.get("kind", "web_search")
+        ticker = req.get("ticker", "")
+        query = req.get("query", "")
+
+        # query가 비어있으면 template으로 채움
+        if not query and kind in _QUERY_TEMPLATES:
+            req["query"] = _QUERY_TEMPLATES[kind].format(ticker=ticker, query="")
+
+        # allowlist 힌트 추가 (resolver가 사용)
+        if kind in _ALLOWLIST_BY_KIND:
+            req["_allowlist_hint"] = _ALLOWLIST_BY_KIND[kind]
+
+        sreq = _sanitize_research_request(req)
+        if sreq:
+            enriched.append(sreq)
+
+    # dedupe + 우선순위 정렬
+    deduped = []
+    seen = set()
+    for req in sorted(enriched, key=lambda r: r.get("priority", 5)):
+        k = _request_key(req)
+        if k in seen:
+            continue
+        seen.add(k)
+        deduped.append(req)
+    enriched = deduped
+
+    # ── LLM enrichment (optional) ────────────────────────────────────
+    try:
+        if HAS_LC and HAS_PYDANTIC:
+            from llm.router import get_llm_with_cache
+            human_msg = (
+                f"Given these evidence requests: {json.dumps(enriched[:5], ensure_ascii=False)}\n"
+                f"User request: {user_request}\n"
+                f"Add up to 2 additional high-priority requests if needed. "
+                f"Return JSON array of EvidenceRequest objects. "
+                f"Only use allowlisted domains."
+            )
+            llm, cached = get_llm_with_cache("orchestrator", human_msg)
+            if cached:
+                # Validate and merge
+                if isinstance(cached, list):
+                    for item in cached[:2]:
+                        if isinstance(item, dict):
+                            sitem = _sanitize_research_request(item)
+                            if sitem:
+                                enriched.append(sitem)
+            elif llm:
+                msgs = [
+                    SystemMessage(content="You are a research planner. Return JSON array only."),
+                    HumanMessage(content=human_msg),
+                ]
+                resp = llm.invoke(msgs)
+                try:
+                    extra = json.loads(resp.content)
+                    if isinstance(extra, list):
+                        for item in extra[:2]:
+                            if isinstance(item, dict):
+                                sitem = _sanitize_research_request(item)
+                                if sitem:
+                                    enriched.append(sitem)
+                except (json.JSONDecodeError, TypeError):
+                    pass  # LLM output 파싱 실패 → rules only
+    except Exception:
+        pass  # LLM 사용 불가 → rules fallback
+
+    # re-dedupe + budget cap (fallback if over-budget/invalid domains)
+    final_reqs = []
+    seen = set()
+    for req in sorted(enriched, key=lambda r: r.get("priority", 5)):
+        k = _request_key(req)
+        if k in seen:
+            continue
+        seen.add(k)
+        if req.get("kind") in _ALLOWLIST_BY_KIND:
+            req["_allowlist_hint"] = _ALLOWLIST_BY_KIND[req["kind"]]
+        final_reqs.append(req)
+
+    final_reqs = _enforce_research_budget(
+        final_reqs,
+        max_web_queries_per_run=max_per_run,
+        max_web_queries_per_ticker=max_per_ticker,
+    )
+    return final_reqs if final_reqs else None

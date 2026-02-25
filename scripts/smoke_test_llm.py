@@ -22,7 +22,7 @@ except ImportError:
 # 프로젝트 루트를 path에 추가
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
 
-from llm.router import get_llm, AGENT_LLM_CONFIG, _get_groq_key, _get_gemini_key
+from llm.router import get_llm, AGENT_LLM_CONFIG, _get_zai_key, _get_groq_key, _get_gemini_key
 
 
 def main():
@@ -33,9 +33,11 @@ def main():
 
     # 환경변수 상태
     print("\n📋 API Key Status:")
+    zai_ok = bool(_get_zai_key())
     groq_ok = bool(_get_groq_key())
     gemini_ok = bool(_get_gemini_key())
     openai_ok = bool(os.environ.get("OPENAI_API_KEY", ""))
+    print(f"   ZAI_API_KEY:     {'✅ SET' if zai_ok else '❌ NOT SET'}")
     print(f"   GROQ_API_KEY:    {'✅ SET' if groq_ok else '❌ NOT SET'}")
     print(f"   GOOGLE_API_KEY:  {'✅ SET' if gemini_ok else '❌ NOT SET'}")
     print(f"   OPENAI_API_KEY:  {'✅ SET' if openai_ok else '⚪ NOT SET (legacy)'}")
@@ -95,8 +97,9 @@ def main():
     print(f"   LLM active: {active_llm}/{total} agents")
     print(f"   Mock mode:  {total - active_llm}/{total} agents")
 
-    if not groq_ok and not gemini_ok:
+    if not zai_ok and not groq_ok and not gemini_ok:
         print(f"\n   💡 전체 Mock 모드로 실행됩니다.")
+        print(f"      Z.ai 사용: export ZAI_API_KEY='...'")
         print(f"      Groq 사용: export GROQ_API_KEY='gsk_...'")
         print(f"      Gemini 사용: export GOOGLE_API_KEY='AI...'")
 

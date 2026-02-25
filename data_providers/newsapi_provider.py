@@ -18,6 +18,7 @@ from config.settings import get_settings
 from data_providers.base import BaseProvider, ProviderError
 
 _NEWSAPI_BASE = "https://newsapi.org/v2"
+_NEWSAPI_MAX_RECENCY_DAYS = 30
 
 # Simple finance sentiment lexicon (positive / negative words)
 _POS_WORDS = {
@@ -56,6 +57,7 @@ class NewsAPIProvider(BaseProvider):
         if not self.has_key:
             return self._mock_sentiment(ticker, as_of)
 
+        days = max(1, min(int(days or 7), _NEWSAPI_MAX_RECENCY_DAYS))
         from_date = (datetime.now(timezone.utc) - timedelta(days=days)).strftime("%Y-%m-%d")
         url = f"{_NEWSAPI_BASE}/everything"
         params = {
@@ -75,8 +77,18 @@ class NewsAPIProvider(BaseProvider):
             articles = data.get("articles", [])
             total = data.get("totalResults", len(articles))
         except ProviderError as e:
-            limitations.append(f"NewsAPI error: {e}")
-            return self._mock_sentiment(ticker, as_of)
+            if "426" in str(e):
+                limitations.append("NewsAPI /everything unavailable (426): fallback to /top-headlines")
+                try:
+                    fallback = self._search_top_headlines(ticker=ticker, language=language)
+                    articles = fallback.get("articles", [])
+                    total = fallback.get("totalResults", len(articles))
+                except ProviderError as e2:
+                    limitations.append(f"NewsAPI fallback error: {e2}")
+                    return self._mock_sentiment(ticker, as_of)
+            else:
+                limitations.append(f"NewsAPI error: {e}")
+                return self._mock_sentiment(ticker, as_of)
 
         article_count = min(total, 100)
 
@@ -113,6 +125,16 @@ class NewsAPIProvider(BaseProvider):
             "limitations": limitations,
             "as_of": as_of,
         }
+
+    def _search_top_headlines(self, *, ticker: str, language: str = "en") -> dict:
+        url = f"{_NEWSAPI_BASE}/top-headlines"
+        params = {
+            "q": ticker,
+            "language": language,
+            "pageSize": 50,
+            "apiKey": self._api_key,
+        }
+        return self.get_json(url, params)
 
     def _extract_topics(self, titles: List[str], top_n: int = 8) -> List[str]:
         words: list = []

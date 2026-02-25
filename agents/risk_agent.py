@@ -350,17 +350,74 @@ def _call_llm(payload: dict) -> dict:
     # Step 1: Python deterministic decision (ALWAYS runs)
     decision = compute_risk_decision(payload)
 
+    decision["_llm_enrichment_status"] = "skipped_no_llm"
+    decision["_llm_enrichment_error"] = ""
+
     # Step 2: Optional LLM narrative enrichment
     llm = get_llm("risk_manager")
     if llm is not None and HAS_LC:
         try:
             decision = _enrich_risk_narrative_with_llm(llm, payload, decision)
+            decision["_llm_enrichment_status"] = "ok_full"
         except Exception as exc:
-            print(f"   [LLM] ⚠️ Narrative enrichment failed (decision unchanged): {exc}")
+            if _is_prompt_size_error(exc):
+                try:
+                    compact_payload = _compact_payload_for_enrichment(payload)
+                    decision = _enrich_risk_narrative_with_llm(llm, compact_payload, decision)
+                    decision["_llm_enrichment_status"] = "ok_compact_retry"
+                    decision["_llm_enrichment_error"] = str(exc)[:220]
+                    print("   [LLM] ⚠️ Narrative payload too large → compact retry succeeded")
+                except Exception as retry_exc:
+                    decision["_llm_enrichment_status"] = "failed_compact_retry"
+                    decision["_llm_enrichment_error"] = str(retry_exc)[:220]
+                    print(f"   [LLM] ⚠️ Narrative enrichment failed after compact retry: {retry_exc}")
+            else:
+                decision["_llm_enrichment_status"] = "failed_full"
+                decision["_llm_enrichment_error"] = str(exc)[:220]
+                print(f"   [LLM] ⚠️ Narrative enrichment failed (decision unchanged): {exc}")
     else:
         print("   [LLM] API 키 없음 → Python 규칙 기반 결정 (narrative 생략)")
 
     return decision
+
+
+def _is_prompt_size_error(exc: Exception) -> bool:
+    msg = str(exc).lower()
+    return (
+        "413" in msg
+        or "request too large" in msg
+        or "tokens per minute" in msg
+        or "tpm" in msg
+        or "max token" in msg
+    )
+
+
+def _compact_payload_for_enrichment(payload: dict) -> dict:
+    reports = payload.get("analyst_reports", {}) or {}
+    summary = payload.get("portfolio_risk_summary", {}) or {}
+    compact_reports = {}
+    for desk in ("macro", "fundamental", "sentiment", "quant"):
+        src = reports.get(desk, {}) or {}
+        compact_reports[desk] = {
+            "primary_decision": src.get("primary_decision"),
+            "confidence": src.get("confidence"),
+            "summary": str(src.get("summary", ""))[:240],
+            "key_drivers": list(src.get("key_drivers", []) or [])[:3],
+            "risk_flags": list(src.get("risk_flags", []) or [])[:3],
+        }
+    return {
+        "timestamp": payload.get("timestamp"),
+        "risk_limits": payload.get("risk_limits", {}),
+        "portfolio_risk_summary": {
+            "total_gross_exposure": summary.get("total_gross_exposure"),
+            "total_net_exposure": summary.get("total_net_exposure"),
+            "portfolio_cvar_1d": summary.get("portfolio_cvar_1d"),
+            "herfindahl_index": summary.get("herfindahl_index"),
+            "sector_exposure": summary.get("sector_exposure", {}),
+            "component_var_by_ticker": summary.get("component_var_by_ticker", {}),
+        },
+        "analyst_reports": compact_reports,
+    }
 
 
 def _enrich_risk_narrative_with_llm(llm, payload: dict, decision: dict) -> dict:
@@ -368,13 +425,25 @@ def _enrich_risk_narrative_with_llm(llm, payload: dict, decision: dict) -> dict:
     LLM enriches rationale_short and feedback.detail text ONLY.
     final_weight, decision, flags are IMMUTABLE from Python engine.
     """
+    compact_decision = {
+        "per_ticker_decisions": {
+            t: {
+                "final_weight": d.get("final_weight"),
+                "decision": d.get("decision"),
+                "flags": d.get("flags", []),
+                "rationale_short": d.get("rationale_short", ""),
+            }
+            for t, d in (decision.get("per_ticker_decisions", {}) or {}).items()
+        },
+        "orchestrator_feedback": decision.get("orchestrator_feedback", {}),
+    }
     prompt = (
         "Below is a risk payload and a Python-computed decision. "
         "Your job: generate ONLY a 1-2 sentence Korean rationale for each ticker decision, "
         "and a concise detail paragraph for orchestrator_feedback. "
         "DO NOT change final_weight, decision, or flags.\n\n"
         f"Payload:\n{json.dumps(payload, ensure_ascii=False, indent=1, default=str)}\n\n"
-        f"Decision:\n{json.dumps(decision, ensure_ascii=False, indent=1, default=str)}\n\n"
+        f"Decision:\n{json.dumps(compact_decision, ensure_ascii=False, indent=1, default=str)}\n\n"
         "Return JSON with: {per_ticker_rationales: {TICKER: str}, feedback_detail: str}"
     )
     msgs = [HumanMessage(content=prompt)]

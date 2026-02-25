@@ -15,11 +15,12 @@ Iron Rules Enforced:
 
 from __future__ import annotations
 
+import hashlib
 import uuid
 from datetime import datetime, timezone
 from typing import Annotated, Any, Dict, List, Literal, Optional, TypedDict
 
-from pydantic import BaseModel, Field, field_validator
+from pydantic import BaseModel, Field, field_validator, model_validator
 
 
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
@@ -27,17 +28,79 @@ from pydantic import BaseModel, Field, field_validator
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 
 class EvidenceItem(BaseModel):
-    """모든 수치적 주장의 추적 가능한 근거."""
+    """수치/웹 근거를 모두 포괄하는 통합 Evidence 스키마."""
+    # ── Web research fields (primary for evidence_store) ──────────────────
+    url: str = ""
+    title: str = ""
+    published_at: str = ""
+    snippet: str = ""
+    source: str = ""
+    retrieved_at: str = Field(default_factory=lambda: datetime.now(timezone.utc).isoformat())
+    hash: str = ""
+    kind: str = ""
+    desk: str = ""
+    ticker: str = ""
+    trust_tier: float = Field(default=0.4, ge=0.0, le=1.0)
+    resolver_path: str = ""
+    # ── Legacy metric evidence fields (backward compatible) ───────────────
     source_type: Literal["api", "file", "database", "model"] = "model"
-    source_name: str = Field(description='출처 (예: "FRED:T10Y2Y", "yfinance", "mock")')
-    as_of: str = Field(description="ISO 8601 UTC timestamp")
-    metric: str = Field(description='측정 항목 (예: "gdp_growth", "z_score")')
-    value: Any = Field(description="값 (숫자/문자열/부울)")
+    source_name: str = Field(default="", description='출처 (예: "FRED:T10Y2Y", "yfinance", "mock")')
+    as_of: str = Field(default="", description="ISO 8601 UTC timestamp")
+    metric: str = Field(default="", description='측정 항목 (예: "gdp_growth", "z_score")')
+    value: Any = Field(default=None, description="값 (숫자/문자열/부울)")
     quality_score: float = Field(
         ge=0.0, le=1.0,
         description="데이터 품질 (0=최저, 1=최고). mock=0.3, live_delayed=0.7, realtime=1.0",
     )
     note: Optional[str] = Field(default=None, description="짧은 주의사항")
+
+
+class EvidenceRequest(BaseModel):
+    """웹 리서치 요청 단위."""
+    desk: Literal["macro", "fundamental", "sentiment", "orchestrator"]
+    kind: str
+    ticker: Optional[str] = None
+    series_id: Optional[str] = None
+    query: Optional[str] = None
+    priority: int = Field(default=3, ge=1, le=5)
+    recency_days: int = Field(default=30, ge=1, le=365)
+    max_items: int = Field(default=5, ge=1, le=20)
+    rationale: str = ""
+
+    @field_validator("query")
+    @classmethod
+    def _strip_query(cls, v: str | None) -> str | None:
+        if v is None:
+            return None
+        q = v.strip()
+        return q or None
+
+    @field_validator("rationale")
+    @classmethod
+    def _strip_rationale(cls, v: str) -> str:
+        return (v or "").strip()
+
+    @field_validator("series_id")
+    @classmethod
+    def _strip_series_id(cls, v: str | None) -> str | None:
+        if v is None:
+            return None
+        s = v.strip()
+        return s or None
+
+    @field_validator("ticker")
+    @classmethod
+    def _strip_ticker(cls, v: str | None) -> str | None:
+        if v is None:
+            return None
+        t = v.strip().upper()
+        return t or None
+
+    @model_validator(mode="after")
+    def _validate_target_fields(self):
+        if not (self.ticker or self.series_id or self.query):
+            raise ValueError("EvidenceRequest requires one of ticker/series_id/query")
+        return self
 
 
 class RiskFlag(BaseModel):
@@ -51,6 +114,8 @@ class RiskFlag(BaseModel):
 class DataQuality(BaseModel):
     """에이전트 출력의 데이터 품질 메타데이터."""
     missing_pct: float = Field(default=0.0, ge=0.0, le=1.0, description="결측 필드 비율")
+    freshness_days: float = Field(default=999.0, ge=0.0, description="신선도(경과 일수)")
+    warnings: List[str] = Field(default_factory=list, description="경고 목록")
     delay_hrs: float = Field(default=0.0, ge=0.0, description="데이터 지연 시간(시간)")
     anomaly_flags: List[str] = Field(default_factory=list, description="이상 플래그 (예: lookahead_violation)")
     source_timestamps: Dict[str, str] = Field(default_factory=dict, description="소스별 타임스탬프")
@@ -80,10 +145,24 @@ def make_evidence(
     as_of: str | None = None,
 ) -> dict:
     """EvidenceItem을 dict로 빠르게 생성."""
+    ts = as_of or datetime.now(timezone.utc).isoformat()
+    hraw = f"{source_name}|{metric}|{ts}|{value}"
     return {
+        "url": "",
+        "title": metric,
+        "published_at": ts,
+        "snippet": "",
+        "source": source_name,
+        "retrieved_at": datetime.now(timezone.utc).isoformat(),
+        "hash": hashlib.sha256(hraw.encode("utf-8")).hexdigest()[:16],
+        "kind": "metric",
+        "desk": "",
+        "ticker": "",
+        "trust_tier": quality,
+        "resolver_path": "legacy_metric",
         "source_type": source_type,
         "source_name": source_name,
-        "as_of": as_of or datetime.now(timezone.utc).isoformat(),
+        "as_of": ts,
         "metric": metric,
         "value": value,
         "quality_score": quality,
@@ -274,6 +353,28 @@ def _merge_lists(a: list, b: list) -> list:
     return (a or []) + (b or [])
 
 
+def _request_key(req: dict) -> tuple:
+    return (
+        (req or {}).get("desk", ""),
+        (req or {}).get("kind", ""),
+        (req or {}).get("ticker", ""),
+        (req or {}).get("series_id", ""),
+        (req or {}).get("query", ""),
+    )
+
+
+def _merge_evidence_requests(a: list, b: list) -> list:
+    merged = []
+    seen = set()
+    for req in (a or []) + (b or []):
+        key = _request_key(req if isinstance(req, dict) else {})
+        if key in seen:
+            continue
+        seen.add(key)
+        merged.append(req)
+    return merged
+
+
 class InvestmentState(TypedDict, total=False):
     """LangGraph 공유 상태 (V3). 멀티 종목 + 포지션 추적 + 감사 지원."""
     # Run context
@@ -307,6 +408,24 @@ class InvestmentState(TypedDict, total=False):
     completed_tasks: Annotated[dict, _merge_dicts]
     errors: Annotated[list, _merge_lists]
     trace: Annotated[list, _merge_lists]
+    task_backlog: Annotated[list, _merge_lists]
+    react_log: Annotated[list, _merge_lists]
+    evidence_requests: Annotated[list, _merge_evidence_requests]
+    evidence_store: Annotated[dict, _merge_dicts]
+    evidence_score: int
+    research_round: int
+    max_research_rounds: int
+    last_research_delta: int
+    research_stop_reason: str
+    user_action_required: bool
+    user_action_items: Annotated[list, _merge_lists]
+    _run_research: bool
+    _research_plan: list
+    _swarm_candidates: list
+    _swarm_plan: list
+    _rerun_plan: dict
+    _executed_requests: list
+    _evidence_delta_kinds: dict
 
     # Audit
     audit: dict  # {paths, gate_trace, validations}
@@ -358,5 +477,28 @@ def create_initial_state(
         completed_tasks={},
         errors=[],
         trace=[],
-        audit={"paths": {}, "gate_trace": [], "validations": []},
+        task_backlog=[],
+        react_log=[],
+        evidence_requests=[],
+        evidence_store={},
+        evidence_score=0,
+        research_round=0,
+        max_research_rounds=2,
+        last_research_delta=0,
+        research_stop_reason="",
+        user_action_required=False,
+        user_action_items=[],
+        _run_research=False,
+        _research_plan=[],
+        _swarm_candidates=[],
+        _swarm_plan=[],
+        _rerun_plan={},
+        _executed_requests=[],
+        _evidence_delta_kinds={},
+        audit={
+            "paths": {},
+            "gate_trace": [],
+            "validations": [],
+            "research": {"web_queries_total": 0, "web_queries_by_ticker": {}},
+        },
     )

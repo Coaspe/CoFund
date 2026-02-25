@@ -291,6 +291,20 @@ class TestOrchIntent:
         assert r["intent"] == "event_risk"
         assert r["horizon_days"] == 14
 
+    def test_mock_market_outlook_avoids_aapl_default(self):
+        from agents.orchestrator_agent import _mock_orchestrator_decision
+        out = _mock_orchestrator_decision("미국 증시 전망 알려줘", 0)
+        universe = out.get("investment_brief", {}).get("target_universe", [])
+        assert "SPY" in universe
+        assert "AAPL" not in universe
+        assert "시장/섹터 전망" in out.get("investment_brief", {}).get("rationale", "")
+
+    def test_no_ticker_question_does_not_fall_back_to_aapl(self):
+        r = classify_intent_rules("요즘 투자 어떻게 하는 게 좋아?")
+        assert r["intent"] == "market_outlook"
+        assert "SPY" in r["universe"]
+        assert "AAPL" not in r["universe"]
+
     def test_desk_tasks_always_present(self):
         for req in ["AAPL 매수?", "시장 전망", "NVDA vs AMD", "너무 오른 것 같은데", "실적 앞두고"]:
             r = classify_intent_rules(req)
@@ -364,8 +378,19 @@ class TestOrchLlmFirstWithFallback:
         assert k1 != k3          # different iteration → different key
 
     def test_call_llm_returns_dict(self):
-        """_call_llm은 항상 dict를 반환 (LLM 없이도)."""
+        """테스트 실호출 모드에서는 키 없으면 RuntimeError, 키 있으면 dict 반환."""
         from agents.orchestrator_agent import _call_llm
+        from llm.router import (
+            force_real_llm_in_tests,
+            _get_zai_key,
+            _get_groq_key,
+            _get_gemini_key,
+        )
+        has_any_llm_key = bool(_get_zai_key() or _get_groq_key() or _get_gemini_key())
+        if force_real_llm_in_tests() and not has_any_llm_key:
+            with pytest.raises(RuntimeError):
+                _call_llm("AAPL 매수해도 돼?", 0)
+            return
         result = _call_llm("AAPL 매수해도 돼?", 0)
         assert isinstance(result, dict)
         assert "desk_tasks" in result or "action_type" in result

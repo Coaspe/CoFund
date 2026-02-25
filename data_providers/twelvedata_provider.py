@@ -14,7 +14,7 @@ import numpy as np
 
 from schemas.common import make_evidence
 from config.settings import get_settings
-from data_providers.base import BaseProvider, ProviderError
+from data_providers.base import BaseProvider, ProviderError, is_rate_limit_error
 
 _TD_BASE = "https://api.twelvedata.com"
 
@@ -101,6 +101,8 @@ class TwelveDataProvider(BaseProvider):
             return {"data": prices, "evidence": evidence, "data_ok": True,
                     "limitations": limitations, "as_of": as_of}
         except ProviderError as e:
+            if is_rate_limit_error(e):
+                print("   [API Router] twelvedata: rate limit으로 yfinance fallback 전환", flush=True)
             limitations.append(f"TwelveData error: {e}")
             # Fallback to yfinance
             try:

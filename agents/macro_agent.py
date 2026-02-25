@@ -8,8 +8,9 @@ LLM 없음. Python-only. deterministic.
 from __future__ import annotations
 
 from datetime import datetime, timezone
-from typing import Any
+from typing import Any, Optional
 
+from agents.autonomy_overlay import apply_llm_overlay_macro
 from engines.macro_engine import (
     compute_macro_features,
     compute_overlay_guidance,
@@ -53,8 +54,8 @@ def _build_key_drivers(axes: dict, ron: dict, features: dict, indicators: dict) 
 
 def _build_what_to_watch(axes: dict, indicators: dict) -> list[str]:
     items = []
-    hy  = indicators.get("hy_oas")
-    yc  = indicators.get("yield_curve_spread")
+    hy = indicators.get("hy_oas")
+    yc = indicators.get("yield_curve_spread")
     pmi = indicators.get("pmi")
     ffr = indicators.get("fed_funds_rate")
 
@@ -74,7 +75,6 @@ def _build_what_to_watch(axes: dict, indicators: dict) -> list[str]:
 
 
 def _build_scenario_notes(regime: str, ron: dict) -> dict:
-    risk_on_off = ron.get("risk_on_off", "neutral")
     tail = ron.get("tail_risk_warning", False)
 
     scenarios: dict[str, dict] = {
@@ -110,10 +110,239 @@ def _build_scenario_notes(regime: str, ron: dict) -> dict:
         },
     }
 
-    note = scenarios.get(regime, scenarios["expansion"])
+    note = dict(scenarios.get(regime, scenarios["expansion"]))
     if tail:
         note["bear"] = "⚠️ Tail Risk 活性化 — " + note["bear"]
     return note
+
+
+_MACRO_EVIDENCE_KINDS = {"macro_headline_context", "macro_release", "press_release_or_ir"}
+_PATCHABLE_FIELDS = {
+    "key_drivers",
+    "what_to_watch",
+    "scenario_notes",
+    "open_questions",
+    "decision_sensitivity",
+    "followups",
+    "react_trace",
+}
+
+
+def _request_key(req: dict) -> tuple:
+    return (
+        req.get("desk", ""),
+        req.get("kind", ""),
+        req.get("ticker", ""),
+        req.get("series_id", ""),
+        req.get("query", ""),
+    )
+
+
+def _merge_requests(base: list[dict], extra: list[dict]) -> list[dict]:
+    out: list[dict] = []
+    seen = set()
+    for req in (base or []) + (extra or []):
+        if not isinstance(req, dict):
+            continue
+        k = _request_key(req)
+        if k in seen:
+            continue
+        seen.add(k)
+        out.append(req)
+    return out
+
+
+def _build_evidence_digest(state: Optional[dict], ticker: str, max_items: int = 5) -> list[dict]:
+    store = (state or {}).get("evidence_store", {})
+    if not isinstance(store, dict):
+        return []
+    out: list[dict] = []
+    for item in store.values():
+        if not isinstance(item, dict):
+            continue
+        kind = str(item.get("kind", ""))
+        desk = str(item.get("desk", ""))
+        if kind and kind not in _MACRO_EVIDENCE_KINDS and desk not in ("macro", ""):
+            continue
+        item_ticker = str(item.get("ticker", "")).upper()
+        if item_ticker and item_ticker != ticker.upper():
+            continue
+        out.append(
+            {
+                "title": item.get("title", ""),
+                "url": item.get("url", ""),
+                "published_at": item.get("published_at", ""),
+                "trust_tier": item.get("trust_tier", 0.4),
+                "kind": kind,
+                "resolver_path": item.get("resolver_path", ""),
+            }
+        )
+    out.sort(key=lambda x: (x.get("published_at") or ""), reverse=True)
+    return out[:max_items]
+
+
+def _default_open_questions(ticker: str, focus_areas: list[str], regime: str) -> list[dict]:
+    out: list[dict] = []
+    for focus in focus_areas[:2]:
+        out.append(
+            {
+                "q": f"{focus}가 {ticker}의 매크로 레짐({regime})을 바꿀 촉매인지?",
+                "why": "결론 변경 가능성이 큰 매크로 불확실성 확인",
+                "kind": "macro_headline_context",
+                "priority": 2,
+                "recency_days": 7,
+            }
+        )
+    if not out:
+        out.append(
+            {
+                "q": f"{ticker} 관련 최근 매크로 헤드라인 중 레짐 전환 신호가 있는가?",
+                "why": "risk_on/off 판단의 최신 근거 보강",
+                "kind": "macro_headline_context",
+                "priority": 2,
+                "recency_days": 7,
+            }
+        )
+    return out[:5]
+
+
+def _default_decision_sensitivity(regime: str) -> list[dict]:
+    return [
+        {
+            "if": "HY OAS가 50bp 이상 추가 확대",
+            "then_change": "매크로 결론을 한 단계 보수적으로 조정",
+            "impact": "high",
+        },
+        {
+            "if": f"현재 레짐({regime})이 다음 주요 지표 발표 후 유지",
+            "then_change": "기존 결론 유지",
+            "impact": "medium",
+        },
+    ]
+
+
+def _default_followups() -> list[dict]:
+    return [
+        {
+            "type": "run_research",
+            "detail": "매크로 이벤트/공식 릴리즈 근거를 추가 수집",
+            "params": {"kind": "macro_headline_context"},
+        },
+        {
+            "type": "rerun_desk",
+            "detail": "새 근거 반영 후 매크로 데스크 재평가",
+            "params": {"desk": "macro"},
+        },
+    ]
+
+
+def _default_react_trace(has_evidence: bool) -> list[dict]:
+    return [
+        {"phase": "THOUGHT", "summary": "결론을 바꿀 거시 변수 공백을 점검"},
+        {"phase": "ACTION", "summary": "우선순위 질문과 리서치 요청을 구조화"},
+        {
+            "phase": "OBSERVATION",
+            "summary": "증거 반영 여부를 핵심 드라이버에 업데이트" if has_evidence else "신규 증거 대기 상태",
+        },
+        {"phase": "REFLECTION", "summary": "결론 민감도와 조건부 시나리오를 재확인"},
+    ]
+
+
+def _apply_overlay_patch(output: dict, patch: dict) -> None:
+    if not isinstance(patch, dict):
+        return
+    for key in _PATCHABLE_FIELDS:
+        if key in patch and patch[key]:
+            output[key] = patch[key]
+    if patch.get("evidence_requests"):
+        output["evidence_requests"] = _merge_requests(
+            output.get("evidence_requests", []),
+            patch.get("evidence_requests", []),
+        )
+        output["needs_more_data"] = bool(output.get("evidence_requests"))
+
+
+def _generate_evidence_requests(
+    ticker: str,
+    axes: dict,
+    ron: dict,
+    features: dict,
+    indicators: dict,
+    focus_areas: Optional[list[str]] = None,
+) -> list:
+    """매크로 evidence request 생성: regime flip/axes 급변 + driver 불명."""
+    reqs = []
+    risk_on_off = ron.get("risk_on_off", "neutral")
+    if risk_on_off == "risk_off" and not indicators.get("yield_curve_spread"):
+        reqs.append(
+            {
+                "desk": "macro",
+                "kind": "macro_headline_context",
+                "ticker": ticker,
+                "query": f"{ticker} macro headwind driver recession risk",
+                "priority": 2,
+                "recency_days": 7,
+                "max_items": 5,
+                "rationale": "risk_off but missing yield curve — need context",
+            }
+        )
+    if ron.get("tail_risk_warning") and not indicators.get("hy_oas"):
+        reqs.append(
+            {
+                "desk": "macro",
+                "kind": "macro_headline_context",
+                "ticker": ticker,
+                "query": "high yield credit spread stress financial conditions",
+                "priority": 1,
+                "recency_days": 3,
+                "max_items": 3,
+                "rationale": "tail_risk active but HY OAS missing",
+            }
+        )
+    g_score = axes.get("growth", {}).get("score", 0)
+    if abs(g_score) >= 2 and not indicators.get("pmi") and not indicators.get("gdp_growth"):
+        reqs.append(
+            {
+                "desk": "macro",
+                "kind": "macro_headline_context",
+                "ticker": ticker,
+                "query": "US PMI GDP growth contraction latest",
+                "priority": 2,
+                "recency_days": 7,
+                "max_items": 3,
+                "rationale": f"growth axis extreme ({g_score}) but PMI/GDP missing",
+            }
+        )
+    prev_regime = indicators.get("prev_macro_regime")
+    curr_regime = features.get("macro_regime")
+    if prev_regime and curr_regime and prev_regime != curr_regime and not indicators.get("regime_flip_driver"):
+        reqs.append(
+            {
+                "desk": "macro",
+                "kind": "macro_headline_context",
+                "ticker": ticker,
+                "query": f"{ticker} macro regime flip driver",
+                "priority": 1,
+                "recency_days": 7,
+                "max_items": 4,
+                "rationale": f"regime flip {prev_regime}->{curr_regime} with unknown driver",
+            }
+        )
+
+    for focus in (focus_areas or [])[:2]:
+        reqs.append(
+            {
+                "desk": "macro",
+                "kind": "macro_headline_context",
+                "ticker": ticker,
+                "query": f"{ticker} {focus} macro impact",
+                "priority": 3,
+                "recency_days": 14,
+                "max_items": 3,
+                "rationale": f"focus area follow-up: {focus}",
+            }
+        )
+    return reqs
 
 
 # ── Main pipeline ─────────────────────────────────────────────────────────────
@@ -126,61 +355,97 @@ def macro_analyst_run(
     as_of: str = "",
     horizon_days: int = 30,
     source_name: str = "mock",
+    focus_areas: Optional[list[str]] = None,
+    state: Optional[dict] = None,
 ) -> dict:
     """
     Macro Analyst v2: engine compute → 5축/risk_on_off → key_drivers/what_to_watch/scenario_notes.
-    LLM 없음. Python-only.
+    LLM overlay is optional and patch-only.
     """
     as_of = as_of or datetime.now(timezone.utc).isoformat()
+    focus_areas = [str(x).strip() for x in (focus_areas or []) if str(x).strip()]
 
     # ── Engine calls ─────────────────────────────────────────────────
     features = compute_macro_features(macro_indicators)
-    overlay  = compute_overlay_guidance(features)
-    axes     = compute_macro_axes(macro_indicators)
-    ron      = compute_risk_on_off(axes, macro_indicators)
+    overlay = compute_overlay_guidance(features)
+    axes = compute_macro_axes(macro_indicators)
+    ron = compute_risk_on_off(axes, macro_indicators)
 
-    regime       = features["macro_regime"]
-    # Enhanced tail_risk from ron (more precise than basic features)
-    tail_risk    = ron["tail_risk_warning"]
-    risk_on_off  = ron["risk_on_off"]
+    regime = features["macro_regime"]
+    tail_risk = ron["tail_risk_warning"]
+    risk_on_off = ron["risk_on_off"]
 
     # ── Evidence ──────────────────────────────────────────────────────
     q = 0.3 if source_name == "mock" else 0.7
     evidence = []
-    for key in ["yield_curve_spread", "hy_oas", "inflation_expectation", "cpi_yoy",
-                "core_cpi_yoy", "pmi", "fed_funds_rate", "gdp_growth",
-                "unemployment_rate", "financial_conditions_index"]:
+    for key in [
+        "yield_curve_spread",
+        "hy_oas",
+        "inflation_expectation",
+        "cpi_yoy",
+        "core_cpi_yoy",
+        "pmi",
+        "fed_funds_rate",
+        "gdp_growth",
+        "unemployment_rate",
+        "financial_conditions_index",
+    ]:
         val = macro_indicators.get(key)
         if val is not None:
             evidence.append(make_evidence(metric=key, value=val, source_name=source_name, quality=q, as_of=as_of))
     for bk in ["curve_state", "credit_stress_level", "inflation_state", "growth_state"]:
-        evidence.append(make_evidence(metric=bk, value=features[bk], source_name="macro_engine",
-                                      source_type="model", quality=0.9, as_of=as_of))
+        evidence.append(
+            make_evidence(
+                metric=bk,
+                value=features[bk],
+                source_name="macro_engine",
+                source_type="model",
+                quality=0.9,
+                as_of=as_of,
+            )
+        )
 
     # ── Risk flags ────────────────────────────────────────────────────
     risk_flags = []
     if tail_risk:
-        risk_flags.append(make_risk_flag("macro_tail_risk", ron.get("tail_risk_level", "high"),
-                                         "Credit stress or yield curve + FCI"))
+        risk_flags.append(
+            make_risk_flag(
+                "macro_tail_risk",
+                ron.get("tail_risk_level", "high"),
+                "Credit stress or yield curve + FCI",
+            )
+        )
     if regime in ("contraction", "stagflation"):
         risk_flags.append(make_risk_flag("macro_headwind", "high", f"Macro regime: {regime}"))
 
     # ── Primary decision ──────────────────────────────────────────────
     inflation_hot = axes.get("inflation", {}).get("score", 0) >= 2
-    rates_rising  = axes.get("rates",    {}).get("score", 0) <= -1
+    rates_rising = axes.get("rates", {}).get("score", 0) <= -1
 
     if risk_on_off == "risk_off" and tail_risk:
-        primary_decision = "bearish"; recommendation = "reject"; confidence = 0.80
+        primary_decision = "bearish"
+        recommendation = "reject"
+        confidence = 0.80
     elif risk_on_off == "risk_off":
-        primary_decision = "bearish"; recommendation = "allow_with_limits"; confidence = 0.65
+        primary_decision = "bearish"
+        recommendation = "allow_with_limits"
+        confidence = 0.65
     elif risk_on_off == "risk_on" and inflation_hot and rates_rising:
-        primary_decision = "neutral"; recommendation = "allow_with_limits"; confidence = 0.55
+        primary_decision = "neutral"
+        recommendation = "allow_with_limits"
+        confidence = 0.55
     elif risk_on_off == "risk_on":
-        primary_decision = "bullish"; recommendation = "allow"; confidence = 0.65
+        primary_decision = "bullish"
+        recommendation = "allow"
+        confidence = 0.65
     elif regime == "late_cycle":
-        primary_decision = "neutral"; recommendation = "allow_with_limits"; confidence = 0.50
+        primary_decision = "neutral"
+        recommendation = "allow_with_limits"
+        confidence = 0.50
     else:
-        primary_decision = "neutral"; recommendation = "allow_with_limits"; confidence = 0.55
+        primary_decision = "neutral"
+        recommendation = "allow_with_limits"
+        confidence = 0.55
 
     # ── Data quality ──────────────────────────────────────────────────
     keyed = {k for k in ["yield_curve_spread", "hy_oas", "gdp_growth", "pmi"] if macro_indicators.get(k) is not None}
@@ -195,49 +460,102 @@ def macro_analyst_run(
     if missing:
         limitations.append(f"누락 지표: {', '.join(missing)}")
 
-    # ── key_drivers / what_to_watch / scenario_notes ──────────────────
-    key_drivers    = _build_key_drivers(axes, ron, features, macro_indicators)
-    what_to_watch  = _build_what_to_watch(axes, macro_indicators)
-    scenario_notes = _build_scenario_notes(regime, ron)
+    ev_reqs = _generate_evidence_requests(ticker, axes, ron, features, macro_indicators, focus_areas)
 
+    # ── key_drivers / what_to_watch / scenario_notes ──────────────────
+    key_drivers = _build_key_drivers(axes, ron, features, macro_indicators)
+    what_to_watch = _build_what_to_watch(axes, macro_indicators)
+    scenario_notes = _build_scenario_notes(regime, ron)
+    evidence_digest = _build_evidence_digest(state, ticker)
+    if evidence_digest:
+        title = str(evidence_digest[0].get("title", "external evidence")).strip()[:90]
+        kinds = sorted({str(item.get("kind", "")).strip() for item in evidence_digest if item.get("kind")})
+        kind_label = ", ".join(kinds[:2]) if kinds else "macro_evidence"
+        resolver = str(evidence_digest[0].get("resolver_path", "")).strip() or "unknown"
+        key_drivers = (
+            key_drivers
+            + [
+                f"Evidence update: {title}",
+                f"Evidence coverage: {len(evidence_digest)} items ({kind_label})",
+            ]
+        )[:6]
+        what_to_watch = (
+            what_to_watch
+            + [
+                "신규 증거와 매크로 축 점수의 불일치 여부 재확인",
+                f"최신 근거 경로({resolver})의 후속 발표 추적",
+            ]
+        )[:5]
+
+    open_questions = _default_open_questions(ticker, focus_areas, regime)
+    decision_sensitivity = _default_decision_sensitivity(regime)
+    followups = _default_followups()
+    react_trace = _default_react_trace(bool(evidence_digest))
+
+    total_fields = 4
+    missing_pct = round(len(missing) / total_fields, 3)
     data_quality = {
-        "missing_fields":   missing,
-        "is_mock":          source_name == "mock",
-        "anomaly_flags":    ["tail_risk_active"] if tail_risk else [],
+        "missing_pct": missing_pct,
+        "freshness_days": 0.0,
+        "warnings": list(missing),
+        "missing_fields": missing,
+        "is_mock": source_name == "mock",
+        "anomaly_flags": ["tail_risk_active"] if tail_risk else [],
         "source_timestamps": {},
     }
 
-    return {
-        "agent_type":      "macro",
-        "run_id":          run_id,
-        "generated_at":    datetime.now(timezone.utc).isoformat(),
-        "as_of":           as_of,
-        "ticker":          ticker,
-        "horizon_days":    horizon_days,
+    output = {
+        "agent_type": "macro",
+        "run_id": run_id,
+        "generated_at": datetime.now(timezone.utc).isoformat(),
+        "as_of": as_of,
+        "ticker": ticker,
+        "horizon_days": horizon_days,
+        "focus_areas": focus_areas,
         "primary_decision": primary_decision,
-        "recommendation":  recommendation,
-        "confidence":      confidence if data_ok else min(confidence, 0.40),
+        "recommendation": recommendation,
+        "confidence": confidence if data_ok else min(confidence, 0.40),
         "signal_strength": abs(ron["risk_score"]) / 100.0,
-        "risk_flags":      risk_flags,
-        "evidence":        evidence,
-        "data_quality":    data_quality,
-        "limitations":     limitations,
-        "data_ok":         data_ok,
-        "summary":         f"리스크: {risk_on_off}. 레짐: {regime}. {overlay.get('equity_overlay_guidance', '')}",
-        "status":          "ok",
+        "risk_flags": risk_flags,
+        "evidence": evidence,
+        "data_quality": data_quality,
+        "limitations": limitations,
+        "data_ok": data_ok,
+        "summary": f"리스크: {risk_on_off}. 레짐: {regime}. {overlay.get('equity_overlay_guidance', '')}",
+        "status": "ok",
         # Structured outputs
-        "macro_axes":      axes,
-        "risk_on_off":     ron,
+        "macro_axes": axes,
+        "risk_on_off": ron,
         "overlay_guidance": overlay,
-        "key_drivers":     key_drivers,
-        "what_to_watch":   what_to_watch,
-        "scenario_notes":  scenario_notes,
+        "key_drivers": key_drivers,
+        "what_to_watch": what_to_watch,
+        "scenario_notes": scenario_notes,
+        "evidence_digest": evidence_digest,
+        "open_questions": open_questions,
+        "decision_sensitivity": decision_sensitivity,
+        "followups": followups,
+        "react_trace": react_trace,
+        # Evidence requests
+        "needs_more_data": bool(ev_reqs),
+        "evidence_requests": ev_reqs,
         # Backward compat
         "macro_regime_raw": regime,
-        "macro_regime":    map_macro_regime_to_canonical(regime),
+        "macro_regime": map_macro_regime_to_canonical(regime),
         "tail_risk_warning": tail_risk,
-        "indicators":      features,
-        "regime":          map_macro_regime_to_canonical(regime),
-        "gdp_growth":      macro_indicators.get("gdp_growth"),
-        "interest_rate":   macro_indicators.get("fed_funds_rate"),
+        "indicators": features,
+        "regime": map_macro_regime_to_canonical(regime),
+        "gdp_growth": macro_indicators.get("gdp_growth"),
+        "interest_rate": macro_indicators.get("fed_funds_rate"),
     }
+
+    patch = apply_llm_overlay_macro(output, state, focus_areas, evidence_digest)
+    _apply_overlay_patch(output, patch)
+
+    if not output.get("open_questions"):
+        output["open_questions"] = open_questions
+    if not output.get("decision_sensitivity"):
+        output["decision_sensitivity"] = decision_sensitivity
+    if not output.get("followups"):
+        output["followups"] = followups
+
+    return output
