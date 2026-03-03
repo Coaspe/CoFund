@@ -31,11 +31,14 @@ import argparse
 import hashlib
 import json
 import os
+import re
 import sys
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Literal
+from urllib.parse import parse_qsl, urlencode, urlparse, urlunparse
 
+import numpy as np
 from langgraph.graph import END, START, StateGraph
 
 from schemas.common import (
@@ -50,6 +53,7 @@ import telemetry
 from data_providers.data_hub import DataHub
 from data_providers.web_research_provider import WebResearchProvider
 from data_providers.sec_edgar_provider import SECEdgarProvider
+from data_providers.perplexity_search_provider import PerplexitySearchProvider
 
 # ── Agents ────────────────────────────────────────────────────────────────
 from agents.macro_agent import macro_analyst_run
@@ -134,6 +138,23 @@ _SWARM_KIND_TO_IMPACTED = {
 }
 _MAX_SWARM_CANDIDATES = 20
 _MAX_RERUN_DESKS = 2
+_ETF_LIKE_TICKERS = {
+    "SPY", "QQQ", "IWM", "DIA", "TLT", "SHY", "GLD", "SLV", "USO", "XLE", "XLF", "XLK",
+    "XLV", "XLY", "XLI", "XLB", "XLP", "XLU", "XLC", "VNQ", "HYG", "LQD", "EEM", "EWJ",
+}
+_INDEX_LIKE_TICKERS = {"SPX", "NDX", "DJI", "RUT", "VIX"}
+_URL_DROP_QUERY_KEYS = {
+    "utm_source", "utm_medium", "utm_campaign", "utm_term", "utm_content",
+    "gclid", "fbclid", "ref", "ref_src", "source",
+}
+_LANDING_PATH_PATTERNS = (
+    "/news",
+    "/press-releases",
+    "/pressreleases",
+    "/newsevents/pressreleases",
+    "/newsevents/pressreleases.htm",
+)
+_LANDING_TITLE_TOKENS = ("press releases", "newsroom", "news", "latest news")
 
 
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
@@ -156,6 +177,331 @@ def _short_text(value: Any, max_len: int = 140) -> str:
     if len(s) <= max_len:
         return s
     return s[: max_len - 3].rstrip() + "..."
+
+
+def _normalize_query_text(text: Any) -> str:
+    return " ".join(str(text or "").strip().lower().split())
+
+
+def _detect_output_language(user_request: str) -> str:
+    text = str(user_request or "")
+    if re.search(r"[가-힣]", text):
+        return "ko"
+    return "en"
+
+
+def _infer_intent_from_request(user_request: str, universe: list[str]) -> str:
+    text = _normalize_query_text(user_request)
+    if any(k in text for k in ("시장", "macro", "market outlook", "전망", "지정학", "event risk", "이벤트")):
+        return "market_outlook"
+    if any(k in text for k in ("헤지", "hedge")):
+        return "hedge_design"
+    if len(universe or []) >= 2:
+        return "relative_value"
+    return "single_name"
+
+
+def _infer_asset_type(ticker: str) -> str:
+    t = str(ticker or "").strip().upper()
+    if not t:
+        return "EQUITY"
+    if t in _ETF_LIKE_TICKERS:
+        return "ETF"
+    if t in _INDEX_LIKE_TICKERS or t.startswith("^"):
+        return "INDEX"
+    if t in {"WTI", "BRENT", "CL", "GC", "SI"}:
+        return "COMMODITY"
+    if t in {"TLT", "IEF", "SHY", "BND"}:
+        return "BOND"
+    return "EQUITY"
+
+
+def _build_asset_type_map(universe: list[str]) -> dict[str, str]:
+    out: dict[str, str] = {}
+    for raw in universe or []:
+        t = str(raw or "").strip().upper()
+        if not t:
+            continue
+        out[t] = _infer_asset_type(t)
+    return out
+
+
+def _extract_universe_from_directives(directives: dict) -> list[str]:
+    if not isinstance(directives, dict):
+        return []
+    brief = directives.get("investment_brief", {})
+    if not isinstance(brief, dict):
+        return []
+    raw = brief.get("target_universe", [])
+    if not isinstance(raw, list):
+        return []
+    out: list[str] = []
+    seen = set()
+    for item in raw:
+        t = str(item or "").strip().upper()
+        if not t:
+            continue
+        if t not in seen:
+            seen.add(t)
+            out.append(t)
+    return out
+
+
+def _canonicalize_url(url: str) -> str:
+    raw = str(url or "").strip()
+    if not raw:
+        return ""
+    try:
+        parsed = urlparse(raw)
+    except ValueError:
+        return raw
+    scheme = (parsed.scheme or "https").lower()
+    host = (parsed.hostname or "").lower()
+    if not host:
+        return raw
+    path = parsed.path or "/"
+    path = re.sub(r"/+", "/", path)
+    if path != "/":
+        path = path.rstrip("/")
+    pairs = []
+    for k, v in parse_qsl(parsed.query, keep_blank_values=False):
+        key_l = str(k or "").strip().lower()
+        if not key_l or key_l in _URL_DROP_QUERY_KEYS:
+            continue
+        pairs.append((k, v))
+    query = urlencode(sorted(pairs), doseq=True)
+    return urlunparse((scheme, host, path, "", query, ""))
+
+
+def _evidence_store_key_from_url(url: str) -> str:
+    canonical = _canonicalize_url(url)
+    if not canonical:
+        return ""
+    return hashlib.sha256(canonical.encode("utf-8")).hexdigest()[:16]
+
+
+def _query_tokens(query: str) -> set[str]:
+    stop = {
+        "the", "and", "for", "with", "from", "latest", "market", "context", "news",
+        "impact", "details", "detail", "price", "prices", "on", "of", "in", "to",
+        "최근", "관련", "영향", "상세", "시장", "뉴스", "컨텍스트",
+    }
+    toks = set(re.findall(r"[a-zA-Z0-9가-힣]{3,}", _normalize_query_text(query)))
+    return {t for t in toks if t not in stop}
+
+
+def _is_landing_page_candidate(url: str, title: str) -> bool:
+    try:
+        parsed = urlparse(url)
+    except ValueError:
+        return False
+    path = (parsed.path or "").lower().rstrip("/")
+    if not path:
+        return True
+    if path in ("/", "/news", "/press-releases", "/newsevents", "/newsevents/pressreleases"):
+        return True
+    if any(path.endswith(pat) for pat in _LANDING_PATH_PATTERNS):
+        return True
+    title_l = str(title or "").strip().lower()
+    return any(tok in title_l for tok in _LANDING_TITLE_TOKENS)
+
+
+def _item_matches_request(item: dict, req: dict) -> bool:
+    query = str(req.get("query", "")).strip()
+    if not query:
+        return True
+    q_tokens = _query_tokens(query)
+    if not q_tokens:
+        return True
+    hay = " ".join(
+        [
+            str(item.get("title", "")),
+            str(item.get("snippet", "")),
+            str(item.get("url", "")),
+        ]
+    ).lower()
+    return any(tok in hay for tok in q_tokens)
+
+
+def _sanitize_fundamental_requests_for_asset_type(
+    requests: list[dict],
+    *,
+    ticker: str,
+    asset_type: str,
+) -> list[dict]:
+    at = str(asset_type or "").upper()
+    if at not in {"ETF", "INDEX"}:
+        return list(requests or [])
+
+    cleaned: list[dict] = []
+    for req in requests or []:
+        if not isinstance(req, dict):
+            continue
+        kind = str(req.get("kind", "")).strip().lower()
+        query = _normalize_query_text(req.get("query", ""))
+        if kind in {"ownership_identity", "sec_filing"}:
+            continue
+        if "insider" in query or "form 4" in query or "institutional ownership" in query:
+            continue
+        cleaned.append(req)
+
+    if cleaned:
+        return _dedupe_requests(cleaned)
+
+    base = [
+        {
+            "desk": "fundamental",
+            "kind": "valuation_context",
+            "ticker": ticker,
+            "query": f"{ticker} ETF holdings top 10 sector weights index valuation forward PE",
+            "priority": 2,
+            "recency_days": 30,
+            "max_items": 5,
+            "rationale": "etf_index_mode_holdings_sector_valuation",
+        },
+        {
+            "desk": "fundamental",
+            "kind": "web_search",
+            "ticker": ticker,
+            "query": f"{ticker} ETF flow creation redemption tracking error liquidity expense ratio",
+            "priority": 2,
+            "recency_days": 30,
+            "max_items": 5,
+            "rationale": "etf_index_mode_flow_liquidity",
+        },
+    ]
+    return _dedupe_requests(base)
+
+
+def _decision_snapshot_for_desk(desk: str, payload: dict | None) -> dict:
+    out = payload if isinstance(payload, dict) else {}
+    d = str(desk or "").strip().lower()
+    if d == "macro":
+        return {
+            "primary_decision": out.get("primary_decision"),
+            "macro_regime": out.get("macro_regime"),
+        }
+    if d == "fundamental":
+        return {
+            "primary_decision": out.get("primary_decision"),
+            "recommendation": out.get("recommendation"),
+            "analysis_mode": out.get("analysis_mode"),
+        }
+    if d == "sentiment":
+        tilt = out.get("tilt_factor")
+        if tilt is not None:
+            try:
+                tilt = round(float(tilt), 6)
+            except (TypeError, ValueError):
+                pass
+        return {
+            "primary_decision": out.get("primary_decision"),
+            "sentiment_regime": out.get("sentiment_regime"),
+            "tilt_factor": tilt,
+        }
+    if d == "quant":
+        alloc = out.get("final_allocation_pct")
+        if alloc is not None:
+            try:
+                alloc = round(float(alloc), 6)
+            except (TypeError, ValueError):
+                pass
+        return {
+            "decision": out.get("decision"),
+            "final_allocation_pct": alloc,
+            "analysis_mode": out.get("analysis_mode"),
+        }
+    return {}
+
+
+def _decision_changed(prev: dict, curr: dict) -> bool:
+    if not prev:
+        return False
+    keys = set(prev.keys()) | set(curr.keys())
+    for k in keys:
+        if prev.get(k) != curr.get(k):
+            return True
+    return False
+
+
+def _collect_evidence_refs_for_desk(output: dict, state: dict, ticker: str, max_items: int = 3) -> list[dict]:
+    refs: list[dict] = []
+    seen = set()
+    digest = output.get("evidence_digest", []) if isinstance(output, dict) else []
+    if isinstance(digest, list):
+        for item in digest:
+            if not isinstance(item, dict):
+                continue
+            h = str(item.get("hash", "")).strip()
+            url = str(item.get("url", "") or item.get("canonical_url", "")).strip()
+            key = (h, url)
+            if key in seen:
+                continue
+            seen.add(key)
+            refs.append({"hash": h, "url": url})
+            if len(refs) >= max_items:
+                return refs
+
+    store = state.get("evidence_store", {}) if isinstance(state, dict) else {}
+    if isinstance(store, dict):
+        for item in store.values():
+            if not isinstance(item, dict):
+                continue
+            item_ticker = str(item.get("ticker", "")).strip().upper()
+            if item_ticker and item_ticker != str(ticker or "").strip().upper():
+                continue
+            h = str(item.get("hash", "")).strip()
+            url = str(item.get("url", "") or item.get("canonical_url", "")).strip()
+            key = (h, url)
+            if key in seen:
+                continue
+            seen.add(key)
+            refs.append({"hash": h, "url": url})
+            if len(refs) >= max_items:
+                break
+    return refs
+
+
+def _attach_decision_change_log(
+    *,
+    desk: str,
+    output: dict,
+    state: dict,
+    prev_output: dict | None,
+    rerun_reason: str,
+    ticker: str,
+) -> dict:
+    prev_snap = _decision_snapshot_for_desk(desk, prev_output)
+    curr_snap = _decision_snapshot_for_desk(desk, output)
+    was_rerun = "rerun selected" in str(rerun_reason or "").lower()
+    changed = _decision_changed(prev_snap, curr_snap)
+    evidence_refs = _collect_evidence_refs_for_desk(output, state, ticker)
+
+    if not prev_snap:
+        status = "initial_run_no_previous"
+        reason = "이전 실행 결과가 없어 기준 비교가 불가능합니다."
+    elif changed:
+        status = "changed_with_evidence"
+        reason = "신규 evidence 반영 후 핵심 판단 필드가 변경되었습니다."
+    else:
+        status = "unchanged_after_evidence_review" if was_rerun else "unchanged_without_rerun"
+        reason = (
+            "신규 evidence를 반영했지만 결론 민감도 기준에서 기존 판단을 유지했습니다."
+            if was_rerun
+            else "재실행 없이 기존 판단 체계를 유지했습니다."
+        )
+
+    output["decision_change_log"] = {
+        "desk": desk,
+        "was_rerun": was_rerun,
+        "status": status,
+        "changed": changed,
+        "reason": reason,
+        "previous_snapshot": prev_snap,
+        "current_snapshot": curr_snap,
+        "evidence_refs": evidence_refs,
+    }
+    return output
 
 
 def _graph_trace(message: str) -> None:
@@ -320,6 +666,7 @@ def _log(state: dict, node: str, phase: str, data: dict | None = None):
 def orchestrator_node(state: InvestmentState) -> dict:
     """① Orchestrator — CIO/PM."""
     _log(state, "orchestrator", "enter")
+    user_request = str(state.get("user_request", ""))
 
     if HAS_ORCHESTRATOR:
         result = _orch_node_impl(state)
@@ -335,6 +682,30 @@ def orchestrator_node(state: InvestmentState) -> dict:
             },
         }
 
+    directives = result.get("orchestrator_directives", {})
+    if not isinstance(directives, dict):
+        directives = {}
+    universe = _extract_universe_from_directives(directives)
+    if not universe and state.get("universe"):
+        universe = [str(t).strip().upper() for t in state.get("universe", []) if str(t).strip()]
+    target_ticker = str(result.get("target_ticker", "")).strip().upper()
+    if not universe and target_ticker:
+        universe = [target_ticker]
+    if universe:
+        target_ticker = universe[0]
+
+    output_language = str(state.get("output_language", "")).strip().lower() or _detect_output_language(user_request)
+    intent = str(directives.get("intent", "")).strip() or _infer_intent_from_request(user_request, universe)
+    execution_mode = "B_main_plus_hedge_lite" if len(universe) >= 2 else "single_main"
+    asset_type_by_ticker = _build_asset_type_map(universe)
+
+    result["target_ticker"] = target_ticker
+    result["universe"] = universe
+    result["asset_type_by_ticker"] = asset_type_by_ticker
+    result["intent"] = intent
+    result["output_language"] = output_language
+    result["analysis_execution_mode"] = execution_mode
+
     # Normalize analysis_tasks
     raw = result.get("analysis_tasks", [])
     normalized = list(dict.fromkeys(
@@ -349,12 +720,14 @@ def orchestrator_node(state: InvestmentState) -> dict:
     trace_entry = {
         "node": "orchestrator",
         "iteration": result.get("iteration_count", 0),
-        "action_type": result.get("orchestrator_directives", {}).get("action_type"),
+        "action_type": directives.get("action_type"),
         "analysis_tasks": result["analysis_tasks"],
+        "intent": intent,
+        "execution_mode": execution_mode,
+        "universe_size": len(universe),
     }
     result["trace"] = [trace_entry]
 
-    directives = result.get("orchestrator_directives", {}) if isinstance(result.get("orchestrator_directives"), dict) else {}
     brief = directives.get("investment_brief", {}) if isinstance(directives.get("investment_brief"), dict) else {}
     _ops_log(
         state,
@@ -362,6 +735,7 @@ def orchestrator_node(state: InvestmentState) -> dict:
         "dispatch plan",
         [
             f"action={trace_entry.get('action_type')} targets={_list_preview(brief.get('target_universe', []), max_items=7, max_len=160) or 'n/a'}",
+            f"intent={intent} mode={execution_mode} language={output_language}",
             f"tasks={','.join(result.get('analysis_tasks', []))}",
             f"rationale={_short_text(brief.get('rationale', ''), max_len=180) or 'n/a'}",
         ],
@@ -388,11 +762,11 @@ def _make_seed(state: dict) -> int:
 
 def _request_key(req: dict) -> tuple:
     return (
-        req.get("desk", ""),
-        req.get("kind", ""),
-        req.get("ticker", ""),
-        req.get("series_id", ""),
-        req.get("query", ""),
+        str(req.get("desk", "")).strip().lower(),
+        str(req.get("kind", "")).strip().lower(),
+        str(req.get("ticker", "")).strip().upper(),
+        str(req.get("series_id", "")).strip(),
+        _normalize_query_text(req.get("query", "")),
     )
 
 
@@ -490,16 +864,26 @@ def macro_analyst_node(state: InvestmentState) -> dict:
         state=state,
         source_name="mock" if mode == "mock" else "FRED",
     )
+    rerun_reason = _rerun_reason_for_desk(state, "macro")
+    prev_macro = state.get("macro_analysis", {}) if isinstance(state.get("macro_analysis"), dict) else {}
     output["limitations"] = _merge_limitations(
         output.get("limitations", []),
         meta.get("limitations", []) if isinstance(meta, dict) else [],
+    )
+    output = _attach_decision_change_log(
+        desk="macro",
+        output=output,
+        state=state,
+        prev_output=prev_macro,
+        rerun_reason=rerun_reason,
+        ticker=ticker,
     )
     if isinstance(meta, dict):
         output.setdefault("provider_meta", {})["macro"] = meta
 
     print(f"\n② MACRO ANALYST  (iter #{state.get('iteration_count', 1)})")
     print(f"   Regime: {output['macro_regime']}, GDP: {indicators.get('gdp_growth')}")
-    print(f"   Why called: {_rerun_reason_for_desk(state, 'macro')}")
+    print(f"   Why called: {rerun_reason}")
     print(f"   Basis: {_list_preview(output.get('key_drivers', []), max_items=2, max_len=160) or 'n/a'}")
 
     _ops_log(
@@ -507,8 +891,9 @@ def macro_analyst_node(state: InvestmentState) -> dict:
         "macro",
         "desk output",
         [
-            f"why={_rerun_reason_for_desk(state, 'macro')}",
+            f"why={rerun_reason}",
             f"regime={output.get('macro_regime')} confidence={output.get('confidence')}",
+            f"decision_change={output.get('decision_change_log', {}).get('status')}",
             f"key_drivers={_list_preview(output.get('key_drivers', []), max_items=3, max_len=180) or 'n/a'}",
             f"open_questions={len(output.get('open_questions', []))} evidence_requests={len(output.get('evidence_requests', []))}",
             _react_trace_preview(output),
@@ -533,6 +918,7 @@ def fundamental_analyst_node(state: InvestmentState) -> dict:
     seed = _make_seed(state) + 1
     as_of = state.get("as_of", "")
     ticker = state.get("target_ticker", "AAPL")
+    asset_type = str((state.get("asset_type_by_ticker", {}) or {}).get(ticker, "")).strip().upper() or _infer_asset_type(ticker)
     horizon_days, focus_areas, _ = _get_desk_task(state, "fundamental", 90)
 
     hub = DataHub(run_id=state.get("run_id", ""), as_of=as_of, mode=mode)
@@ -544,19 +930,36 @@ def fundamental_analyst_node(state: InvestmentState) -> dict:
         horizon_days=horizon_days,
         focus_areas=focus_areas,
         state=state,
+        asset_type=asset_type,
         source_name="mock" if mode == "mock" else "FMP/SEC",
+    )
+    rerun_reason = _rerun_reason_for_desk(state, "fundamental")
+    prev_funda = state.get("fundamental_analysis", {}) if isinstance(state.get("fundamental_analysis"), dict) else {}
+    output["asset_type"] = asset_type
+    output["evidence_requests"] = _sanitize_fundamental_requests_for_asset_type(
+        output.get("evidence_requests", []),
+        ticker=ticker,
+        asset_type=asset_type,
     )
     output["limitations"] = _merge_limitations(
         output.get("limitations", []),
         fmeta.get("limitations", []) if isinstance(fmeta, dict) else [],
         smeta.get("limitations", []) if isinstance(smeta, dict) else [],
     )
+    output = _attach_decision_change_log(
+        desk="fundamental",
+        output=output,
+        state=state,
+        prev_output=prev_funda,
+        rerun_reason=rerun_reason,
+        ticker=ticker,
+    )
     output.setdefault("provider_meta", {})["fundamentals"] = fmeta
     output.setdefault("provider_meta", {})["sec"] = smeta
 
     print(f"\n③ FUNDAMENTAL ANALYST  (iter #{state.get('iteration_count', 1)})")
     print(f"   Structural Risk: {output['structural_risk_flag']}, Decision: {output['primary_decision']}")
-    print(f"   Why called: {_rerun_reason_for_desk(state, 'fundamental')}")
+    print(f"   Why called: {rerun_reason}")
     print(f"   Basis: {_list_preview(output.get('key_drivers', []), max_items=2, max_len=160) or 'n/a'}")
 
     _ops_log(
@@ -564,8 +967,9 @@ def fundamental_analyst_node(state: InvestmentState) -> dict:
         "fundamental",
         "desk output",
         [
-            f"why={_rerun_reason_for_desk(state, 'fundamental')}",
+            f"why={rerun_reason}",
             f"decision={output.get('primary_decision')} structural_risk={output.get('structural_risk_flag')} confidence={output.get('confidence')}",
+            f"decision_change={output.get('decision_change_log', {}).get('status')}",
             f"key_drivers={_list_preview(output.get('key_drivers', []), max_items=3, max_len=180) or 'n/a'}",
             f"open_questions={len(output.get('open_questions', []))} evidence_requests={len(output.get('evidence_requests', []))}",
             _react_trace_preview(output),
@@ -602,16 +1006,26 @@ def sentiment_analyst_node(state: InvestmentState) -> dict:
         state=state,
         source_name="mock" if mode == "mock" else "NewsAPI",
     )
+    rerun_reason = _rerun_reason_for_desk(state, "sentiment")
+    prev_sentiment = state.get("sentiment_analysis", {}) if isinstance(state.get("sentiment_analysis"), dict) else {}
     output["limitations"] = _merge_limitations(
         output.get("limitations", []),
         meta.get("limitations", []) if isinstance(meta, dict) else [],
+    )
+    output = _attach_decision_change_log(
+        desk="sentiment",
+        output=output,
+        state=state,
+        prev_output=prev_sentiment,
+        rerun_reason=rerun_reason,
+        ticker=ticker,
     )
     if isinstance(meta, dict):
         output.setdefault("provider_meta", {})["sentiment"] = meta
 
     print(f"\n④ SENTIMENT ANALYST  (iter #{state.get('iteration_count', 1)})")
     print(f"   Regime: {output['sentiment_regime']}, Tilt: {output['tilt_factor']}")
-    print(f"   Why called: {_rerun_reason_for_desk(state, 'sentiment')}")
+    print(f"   Why called: {rerun_reason}")
     print(f"   Basis: {_list_preview(output.get('key_drivers', []), max_items=2, max_len=160) or 'n/a'}")
 
     _ops_log(
@@ -619,8 +1033,9 @@ def sentiment_analyst_node(state: InvestmentState) -> dict:
         "sentiment",
         "desk output",
         [
-            f"why={_rerun_reason_for_desk(state, 'sentiment')}",
+            f"why={rerun_reason}",
             f"regime={output.get('sentiment_regime')} tilt={output.get('tilt_factor')} confidence={output.get('confidence')}",
+            f"decision_change={output.get('decision_change_log', {}).get('status')}",
             f"key_drivers={_list_preview(output.get('key_drivers', []), max_items=3, max_len=180) or 'n/a'}",
             f"open_questions={len(output.get('open_questions', []))} evidence_requests={len(output.get('evidence_requests', []))}",
             _react_trace_preview(output),
@@ -635,6 +1050,383 @@ def sentiment_analyst_node(state: InvestmentState) -> dict:
     }
 
 
+def _quant_select_pair_ticker(*, ticker: str, intent: str, asset_type: str) -> str:
+    t = str(ticker or "").strip().upper()
+    it = str(intent or "").strip().lower()
+    at = str(asset_type or "").strip().upper()
+    if it in {"market_outlook", "event_risk", "hedge_design"}:
+        if t == "XLE":
+            return "SPY"
+        if t in {"SPY", "QQQ", "IWM"} or at in {"ETF", "INDEX"}:
+            return "XLE"
+        return "GLD"
+    if at in {"ETF", "INDEX"} and t != "SPY":
+        return "SPY"
+    return "MSFT"
+
+
+def _safe_pct_change(prices: Any, days: int) -> float | None:
+    if not hasattr(prices, "__len__") or len(prices) <= days:
+        return None
+    try:
+        prev = float(prices[-(days + 1)])
+        cur = float(prices[-1])
+    except (TypeError, ValueError, IndexError):
+        return None
+    if abs(prev) < 1e-12:
+        return None
+    return (cur / prev) - 1.0
+
+
+def _safe_ann_vol(prices: Any, window: int = 20) -> float | None:
+    if not hasattr(prices, "__len__") or len(prices) < window + 2:
+        return None
+    try:
+        p = np.asarray(prices, dtype=float)
+        rets = np.diff(np.log(p))
+        tail = rets[-window:]
+        if len(tail) == 0:
+            return None
+        return float(np.std(tail, ddof=0) * np.sqrt(252))
+    except Exception:
+        return None
+
+
+def _safe_corr(a: Any, b: Any, window: int = 60) -> float | None:
+    if not hasattr(a, "__len__") or not hasattr(b, "__len__"):
+        return None
+    n = min(len(a), len(b))
+    if n < window + 2:
+        return None
+    try:
+        aa = np.asarray(a, dtype=float)[-n:]
+        bb = np.asarray(b, dtype=float)[-n:]
+        ra = np.diff(np.log(aa))[-window:]
+        rb = np.diff(np.log(bb))[-window:]
+        if len(ra) == 0 or len(rb) == 0:
+            return None
+        corr = np.corrcoef(ra, rb)[0, 1]
+        if np.isnan(corr):
+            return None
+        return float(corr)
+    except Exception:
+        return None
+
+
+def _safe_beta_to_main(hedge_prices: Any, main_prices: Any, window: int = 60) -> float | None:
+    if not hasattr(hedge_prices, "__len__") or not hasattr(main_prices, "__len__"):
+        return None
+    n = min(len(hedge_prices), len(main_prices))
+    if n < window + 2:
+        return None
+    try:
+        hp = np.asarray(hedge_prices, dtype=float)[-n:]
+        mp = np.asarray(main_prices, dtype=float)[-n:]
+        rh = np.diff(np.log(hp))[-window:]
+        rm = np.diff(np.log(mp))[-window:]
+        if len(rh) == 0 or len(rm) == 0:
+            return None
+        var_main = float(np.var(rm, ddof=0))
+        if var_main < 1e-12:
+            return None
+        cov = float(np.cov(rh, rm, ddof=0)[0, 1])
+        return cov / var_main
+    except Exception:
+        return None
+
+
+def _safe_downside_capture(hedge_prices: Any, main_prices: Any, window: int = 60) -> float | None:
+    if not hasattr(hedge_prices, "__len__") or not hasattr(main_prices, "__len__"):
+        return None
+    n = min(len(hedge_prices), len(main_prices))
+    if n < window + 2:
+        return None
+    try:
+        hp = np.asarray(hedge_prices, dtype=float)[-n:]
+        mp = np.asarray(main_prices, dtype=float)[-n:]
+        rh = np.diff(np.log(hp))[-window:]
+        rm = np.diff(np.log(mp))[-window:]
+        if len(rh) == 0 or len(rm) == 0:
+            return None
+        mask = rm < 0
+        if int(np.sum(mask)) < 3:
+            return None
+        return float(np.mean(rh[mask]))
+    except Exception:
+        return None
+
+
+def _safe_tail_proxy(prices: Any, window: int = 60) -> float | None:
+    if not hasattr(prices, "__len__") or len(prices) < window + 2:
+        return None
+    try:
+        p = np.asarray(prices, dtype=float)
+        rets = np.diff(np.log(p))
+        tail = rets[-window:]
+        if len(tail) == 0:
+            return None
+        return float(np.percentile(tail, 5))
+    except Exception:
+        return None
+
+
+def _liquidity_proxy_score(ticker: str, asset_type_by_ticker: dict | None = None) -> float:
+    asset_type = str((asset_type_by_ticker or {}).get(ticker, "")).strip().upper() or _infer_asset_type(ticker)
+    if asset_type in {"ETF", "INDEX"}:
+        return 0.90
+    if asset_type in {"BOND", "COMMODITY"}:
+        return 0.80
+    if asset_type == "EQUITY":
+        return 0.60
+    return 0.50
+
+
+def _clip(x: float, lo: float = -1.0, hi: float = 1.0) -> float:
+    return float(max(lo, min(hi, x)))
+
+
+def _normalize_long_only_weights(weights: dict[str, float]) -> dict[str, float]:
+    cleaned = {str(k): max(0.0, float(v)) for k, v in (weights or {}).items() if v is not None}
+    s = float(sum(cleaned.values()))
+    if s <= 1e-12:
+        return {}
+    return {k: v / s for k, v in cleaned.items()}
+
+
+def hedge_lite_builder_node(state: InvestmentState) -> dict:
+    """B 모드에서 메인+헤지 후보를 경량 분석해 positions_proposed를 생성."""
+    analysis_mode = str(state.get("analysis_execution_mode", "")).strip()
+    universe = [str(t).strip().upper() for t in (state.get("universe", []) or []) if str(t).strip()]
+    if not analysis_mode.startswith("B_") or len(universe) < 2:
+        return {}
+
+    _log(state, "hedge_lite_builder", "enter")
+    as_of = state.get("as_of", "")
+    seed = _make_seed(state) + 17
+    mode = state.get("mode", "mock")
+    intent = str(state.get("intent", "")).strip().lower()
+    main = str(state.get("target_ticker", "")).strip().upper() or universe[0]
+    if main not in universe:
+        universe = [main] + [t for t in universe if t != main]
+    hedges = [t for t in universe if t != main]
+
+    hub = DataHub(run_id=state.get("run_id", ""), as_of=as_of, mode=mode)
+    main_prices, main_evidence, _ = hub.get_price_series(main, lookback_days=260, seed=seed)
+    market_prices, market_evidence, _ = hub.get_market_series("SPY", lookback_days=260, seed=seed + 1)
+
+    main_metrics = {
+        "ret_5d": _safe_pct_change(main_prices, 5),
+        "trend_20d": _safe_pct_change(main_prices, 20),
+        "vol_20d_ann": _safe_ann_vol(main_prices, window=20),
+        "vol_60d_ann": _safe_ann_vol(main_prices, window=60),
+        "corr_with_market_60d": _safe_corr(main_prices, market_prices, window=60),
+    }
+    v20 = main_metrics.get("vol_20d_ann")
+    v60 = main_metrics.get("vol_60d_ann")
+    main_metrics["vol_shift_20d_vs_60d"] = float(v20) / float(v60) if v20 is not None and v60 not in (None, 0) else None
+
+    hedge_rows: dict[str, dict] = {}
+    evidence = list(main_evidence) + list(market_evidence)
+    for i, hedge in enumerate(hedges):
+        hp, hp_ev, _ = hub.get_price_series(hedge, lookback_days=260, seed=seed + (i + 1) * 37)
+        evidence.extend(hp_ev)
+        row = {
+            "ticker": hedge,
+            "ret_5d": _safe_pct_change(hp, 5),
+            "trend_20d": _safe_pct_change(hp, 20),
+            "vol_20d_ann": _safe_ann_vol(hp, window=20),
+            "vol_60d_ann": _safe_ann_vol(hp, window=60),
+            "corr_with_main_60d": _safe_corr(hp, main_prices, window=60),
+            "corr_with_market_60d": _safe_corr(hp, market_prices, window=60),
+            "beta_to_main_60d": _safe_beta_to_main(hp, main_prices, window=60),
+            "downside_capture_60d": _safe_downside_capture(hp, main_prices, window=60),
+            "tail_proxy_5pct_60d": _safe_tail_proxy(hp, window=60),
+            "liquidity_proxy": _liquidity_proxy_score(hedge, state.get("asset_type_by_ticker", {})),
+        }
+        hv20 = row.get("vol_20d_ann")
+        hv60 = row.get("vol_60d_ann")
+        row["vol_shift_20d_vs_60d"] = float(hv20) / float(hv60) if hv20 is not None and hv60 not in (None, 0) else None
+
+        protect = _clip(-float(row["corr_with_main_60d"])) if row.get("corr_with_main_60d") is not None else 0.0
+        downside = _clip(float(row["downside_capture_60d"]) * 120.0) if row.get("downside_capture_60d") is not None else 0.0
+        stability = _clip(1.0 - abs(float(row["vol_shift_20d_vs_60d"]) - 1.0)) if row.get("vol_shift_20d_vs_60d") is not None else 0.0
+        trend = _clip(float(row["trend_20d"]) * 8.0) if row.get("trend_20d") is not None else 0.0
+        tail = _clip(-float(row["tail_proxy_5pct_60d"]) * 20.0) if row.get("tail_proxy_5pct_60d") is not None else 0.0
+        liquidity = _clip((float(row["liquidity_proxy"]) - 0.5) * 2.0)
+
+        score = (
+            0.35 * protect
+            + 0.20 * downside
+            + 0.20 * stability
+            + 0.10 * trend
+            + 0.10 * tail
+            + 0.05 * liquidity
+        )
+        row["score_components"] = {
+            "protect": round(protect, 6),
+            "downside": round(downside, 6),
+            "stability": round(stability, 6),
+            "trend": round(trend, 6),
+            "tail": round(tail, 6),
+            "liquidity": round(liquidity, 6),
+        }
+        row["score"] = round(float(score), 6)
+        row["status"] = "ok" if row.get("corr_with_main_60d") is not None and row.get("vol_20d_ann") is not None else "insufficient_data"
+        row["selected"] = False
+        hedge_rows[hedge] = row
+
+        for metric in ("ret_5d", "vol_shift_20d_vs_60d", "corr_with_main_60d", "beta_to_main_60d"):
+            mv = row.get(metric)
+            if mv is None:
+                continue
+            evidence.append(
+                make_evidence(
+                    metric=f"{hedge.lower()}_{metric}",
+                    value=mv,
+                    source_name="hedge_lite",
+                    source_type="model",
+                    quality=0.8,
+                    as_of=as_of,
+                )
+            )
+
+    valid = [t for t, row in hedge_rows.items() if row.get("status") == "ok"]
+    sorted_valid = sorted(valid, key=lambda t: float(hedge_rows[t].get("score", -999.0)), reverse=True)
+    top_k = min(2, len(sorted_valid))
+    selected = sorted_valid[:top_k]
+    for t in selected:
+        hedge_rows[t]["selected"] = True
+
+    hedge_budget = 0.15
+    main_vol_shift = main_metrics.get("vol_shift_20d_vs_60d")
+    if intent in {"event_risk", "hedge_design"} or (main_vol_shift is not None and float(main_vol_shift) > 1.2):
+        hedge_budget = 0.25
+    if not selected:
+        hedge_budget = 0.0
+
+    hedge_raw_weights: dict[str, float] = {}
+    for t in selected:
+        score = max(0.0, float(hedge_rows[t].get("score", 0.0)))
+        vol = hedge_rows[t].get("vol_20d_ann")
+        inv_vol = 1.0 / max(float(vol), 1e-6) if vol not in (None, 0) else 1.0
+        hedge_raw_weights[t] = (score if score > 0 else 0.25) * inv_vol
+    hedge_norm = _normalize_long_only_weights(hedge_raw_weights)
+    if selected and not hedge_norm:
+        hedge_norm = _normalize_long_only_weights({t: 1.0 for t in selected})
+
+    proposed_raw = {main: max(0.0, 1.0 - hedge_budget)}
+    for t in hedges:
+        proposed_raw.setdefault(t, 0.0)
+    for t, w in hedge_norm.items():
+        proposed_raw[t] = hedge_budget * float(w)
+
+    positions_proposed = _normalize_long_only_weights(proposed_raw)
+    if not positions_proposed:
+        positions_proposed = {main: 1.0}
+    for t in universe:
+        positions_proposed.setdefault(t, 0.0)
+    total = float(sum(float(v) for v in positions_proposed.values()))
+    if total > 1e-12:
+        positions_proposed = {t: float(v) / total for t, v in positions_proposed.items()}
+    residual = 1.0 - float(sum(float(v) for v in positions_proposed.values()))
+    if abs(residual) > 1e-12:
+        positions_proposed[main] = max(0.0, float(positions_proposed.get(main, 0.0)) + residual)
+        positions_proposed = _normalize_long_only_weights(positions_proposed) or {main: 1.0}
+    for t in universe:
+        positions_proposed.setdefault(t, 0.0)
+
+    status = "ok" if selected else "insufficient_data"
+    reason = "selected_top_scores" if selected else "no_hedge_with_minimum_data"
+    hedge_lite = {
+        "status": status,
+        "reason": reason,
+        "analysis_execution_mode": analysis_mode,
+        "main": main,
+        "universe": universe,
+        "hedges": hedge_rows,
+        "selected_hedges": selected,
+        "hedge_budget": hedge_budget,
+        "main_weight": positions_proposed.get(main, 0.0),
+        "main_metrics": main_metrics,
+        "weights_proposed": {t: positions_proposed.get(t, 0.0) for t in universe},
+        "intent": intent,
+        "timestamp": as_of,
+        "seed": seed,
+        "build_version": "hedge_lite_v1",
+        "evidence": evidence,
+    }
+
+    audit = dict(state.get("audit", {}) or {})
+    audit_paths = dict(audit.get("paths", {}) or {})
+    audit_paths["hedge_lite_builder"] = {
+        "status": status,
+        "reason": reason,
+        "seed": seed,
+        "selected_hedges": selected,
+        "timestamp": as_of,
+    }
+    audit["paths"] = audit_paths
+
+    _ops_log(
+        state,
+        "hedge_lite_builder",
+        "hedge lite output",
+        [
+            f"mode={analysis_mode} main={main} hedges={hedges}",
+            f"status={status} selected={selected}",
+            f"hedge_budget={hedge_budget:.2f} weights={positions_proposed}",
+        ],
+    )
+    _log(state, "hedge_lite_builder", "exit", {"status": status, "selected": selected})
+    return {
+        "hedge_lite": hedge_lite,
+        "positions_proposed": positions_proposed,
+        "audit": audit,
+    }
+
+
+def _event_regime_quant_decision(payload: dict) -> dict:
+    sig = dict(payload.get("event_regime_signals", {}) or {})
+    trend20 = sig.get("trend_20d")
+    trend5 = sig.get("event_return_5d")
+    vol_shift = sig.get("vol_shift_20d_vs_60d")
+    corr_market = sig.get("corr_with_market_60d")
+    rel = sig.get("pair_relative_strength_20d")
+    regime_prob = (
+        (payload.get("market_regime_context", {}) or {})
+        .get("state_probabilities", {})
+        .get("regime_2_high_vol", 0.0)
+    )
+
+    cot = [
+        f"[Event/Regime] 5d={trend5}, 20d={trend20}, vol_shift={vol_shift}, corr60={corr_market}, rel20={rel}",
+        f"[RegimeProb] regime_2_high_vol={regime_prob}",
+    ]
+
+    risk_off = (regime_prob or 0.0) > 0.5 or ((vol_shift or 0.0) > 1.25 and (trend5 or 0.0) < 0)
+    bullish = ((trend20 or 0.0) > 0.01 and (trend5 or 0.0) >= 0 and (rel or 0.0) >= -0.02 and not risk_off)
+    bearish = ((trend20 or 0.0) < -0.01 and (trend5 or 0.0) < 0 and (vol_shift or 0.0) > 1.1)
+
+    if bullish:
+        decision = "LONG"
+        alloc = 0.06
+        cot.append("[Decision] trend/relative strength 우호 + 고변동 리스크 제한적 → LONG")
+    elif bearish or risk_off:
+        decision = "HOLD"
+        alloc = 0.0
+        cot.append("[Decision] 이벤트/변동성 리스크 우세 → HOLD")
+    else:
+        decision = "HOLD"
+        alloc = 0.0
+        cot.append("[Decision] 신호 혼조 → HOLD")
+
+    return {
+        "cot_reasoning": " ".join(cot),
+        "decision": decision,
+        "final_allocation_pct": alloc,
+    }
+
+
 def quant_analyst_node(state: InvestmentState) -> dict:
     """⑤ Quant Analyst (wrapper: data_provider → quant_engine → mock decision)."""
     if state.get("completed_tasks", {}).get("quant", False):
@@ -645,36 +1437,75 @@ def quant_analyst_node(state: InvestmentState) -> dict:
     seed = _make_seed(state) + 3
     as_of = state.get("as_of", "")
     ticker = state.get("target_ticker", "AAPL")
+    intent = str(state.get("intent", "")).strip().lower() or "single_name"
+    asset_type = str((state.get("asset_type_by_ticker", {}) or {}).get(ticker, "")).strip().upper() or _infer_asset_type(ticker)
     horizon_days, focus_areas, risk_budget = _get_desk_task(state, "quant", 10)
+    pair_ticker = _quant_select_pair_ticker(ticker=ticker, intent=intent, asset_type=asset_type)
+    analysis_mode = "event_regime" if intent in {"market_outlook", "event_risk", "hedge_design"} else "statarb"
+    rerun_reason = _rerun_reason_for_desk(state, "quant")
+    prev_quant = state.get("technical_analysis", {}) if isinstance(state.get("technical_analysis"), dict) else {}
 
     # Data Provider → 가격 배열 (via DataHub)
     hub = DataHub(run_id=state.get("run_id", ""), as_of=as_of, mode=mode)
     prices, p_ev, _ = hub.get_price_series(ticker, seed=seed)
-    pair_prices, _, _ = hub.get_price_series("MSFT", seed=seed + 100)
+    pair_prices, _, _ = hub.get_price_series(pair_ticker, seed=seed + 100)
     market_prices, _, _ = hub.get_market_series("SPY", seed=seed + 200)
 
     # Engine → 순수 연산
     print(f"\n⑤ QUANT ANALYST  (iter #{state.get('iteration_count', 1)})")
-    print(f"   Computing quant payload for {ticker}...")
-    payload = generate_quant_payload(ticker, prices, pair_prices, market_prices)
+    print(f"   Computing quant payload for {ticker}... (mode={analysis_mode}, pair={pair_ticker})")
+    payload = generate_quant_payload(ticker, prices, pair_prices, market_prices, pair_ticker=pair_ticker)
 
-    # Mock LLM Decision
-    decision = mock_quant_decision(payload)
+    event_regime_signals = {
+        "event_return_5d": _safe_pct_change(prices, 5),
+        "trend_20d": _safe_pct_change(prices, 20),
+        "vol_20d_ann": _safe_ann_vol(prices, window=20),
+        "vol_60d_ann": _safe_ann_vol(prices, window=60),
+        "corr_with_market_60d": _safe_corr(prices, market_prices, window=60),
+        "pair_relative_strength_20d": None,
+    }
+    if event_regime_signals["trend_20d"] is not None:
+        pair_trend20 = _safe_pct_change(pair_prices, 20)
+        if pair_trend20 is not None:
+            event_regime_signals["pair_relative_strength_20d"] = (
+                float(event_regime_signals["trend_20d"]) - float(pair_trend20)
+            )
+    v20 = event_regime_signals["vol_20d_ann"]
+    v60 = event_regime_signals["vol_60d_ann"]
+    if v20 is not None and v60 not in (None, 0):
+        event_regime_signals["vol_shift_20d_vs_60d"] = float(v20) / float(v60)
+    else:
+        event_regime_signals["vol_shift_20d_vs_60d"] = None
+    payload["event_regime_signals"] = event_regime_signals
+
+    # Intent-aware decision mode:
+    # market_outlook/event_risk: event/regime/vol
+    # relative_value/single_name: statarb
+    if analysis_mode == "event_regime":
+        decision = _event_regime_quant_decision(payload)
+    else:
+        decision = mock_quant_decision(payload)
     z = ((payload.get("alpha_signals", {}).get("statistical_arbitrage", {})
           .get("execution", {})).get("current_z_score"))
     cvar = (payload.get("portfolio_risk_parameters", {}).get("asset_cvar_99_daily"))
 
     print(f"   Decision: {decision['decision']} | Alloc: {decision['final_allocation_pct']}")
-    print(f"   Why called: {_rerun_reason_for_desk(state, 'quant')}")
+    print(f"   Why called: {rerun_reason}")
 
     _ops_log(
         state,
         "quant",
         "desk output",
         [
-            f"why={_rerun_reason_for_desk(state, 'quant')}",
-            f"decision={decision.get('decision')} alloc={decision.get('final_allocation_pct')}",
-            f"z_score={z} cvar99={cvar}",
+            f"why={rerun_reason}",
+            f"decision={decision.get('decision')} alloc={decision.get('final_allocation_pct')} mode={analysis_mode}",
+            f"pair={pair_ticker} z_score={z} cvar99={cvar}",
+            (
+                "event_regime="
+                f"ret5={event_regime_signals.get('event_return_5d')} "
+                f"trend20={event_regime_signals.get('trend_20d')} "
+                f"vol_shift={event_regime_signals.get('vol_shift_20d_vs_60d')}"
+            ),
         ],
     )
 
@@ -684,6 +1515,11 @@ def quant_analyst_node(state: InvestmentState) -> dict:
         evidence.append(make_evidence(metric="z_score", value=z, source_name="quant_engine", source_type="model", quality=0.9, as_of=as_of))
     if cvar is not None:
         evidence.append(make_evidence(metric="asset_cvar_99_daily", value=cvar, source_name="quant_engine", source_type="model", quality=0.9, as_of=as_of))
+    for k in ("event_return_5d", "trend_20d", "vol_shift_20d_vs_60d"):
+        v = event_regime_signals.get(k)
+        if v is None:
+            continue
+        evidence.append(make_evidence(metric=k, value=v, source_name="quant_event_regime", source_type="model", quality=0.85, as_of=as_of))
 
     output = {
         "agent_type": "quant",
@@ -694,16 +1530,29 @@ def quant_analyst_node(state: InvestmentState) -> dict:
         "horizon_days": horizon_days,
         "focus_areas": focus_areas,
         "risk_budget": risk_budget,
+        "intent": intent,
+        "analysis_mode": analysis_mode,
+        "pair_ticker": pair_ticker,
+        "asset_type": asset_type,
         "decision": decision["decision"],
         "final_allocation_pct": decision["final_allocation_pct"],
         "z_score": z,
         "asset_cvar_99_daily": cvar,
+        "event_regime_signals": event_regime_signals,
         "quant_payload": payload,
         "llm_decision": decision,
         "evidence": evidence,
-        "summary": f"Quant: {decision['decision']} alloc={decision['final_allocation_pct']}, Z={z}",
+        "summary": (
+            f"Quant({analysis_mode}): {decision['decision']} alloc={decision['final_allocation_pct']}, "
+            f"Z={z}, ret5={event_regime_signals.get('event_return_5d')}"
+        ),
         "status": "ok",
         "data_ok": payload.get("_data_ok", True),
+        "quant_indicators": (
+            ["event_return_5d", "trend_20d", "vol_shift_20d_vs_60d", "corr_with_market_60d"]
+            if analysis_mode == "event_regime"
+            else ["adf_pvalue", "z_score", "asset_cvar_99_daily"]
+        ),
         "primary_decision": {
             "LONG": "bullish", "SHORT": "bearish",
             "HOLD": "hold", "CLEAR": "neutral",
@@ -713,6 +1562,20 @@ def quant_analyst_node(state: InvestmentState) -> dict:
         "risk_flags": [],
         "limitations": ["Mock data" if mode == "mock" else ""],
     }
+    output = _attach_decision_change_log(
+        desk="quant",
+        output=output,
+        state=state,
+        prev_output=prev_quant,
+        rerun_reason=rerun_reason,
+        ticker=ticker,
+    )
+    _ops_log(
+        state,
+        "quant",
+        "decision trace",
+        [f"decision_change={output.get('decision_change_log', {}).get('status')}"],
+    )
 
     _log(state, "quant", "exit", {"decision": decision["decision"]})
     return {"technical_analysis": output, "completed_tasks": {"quant": True}, "evidence_requests": []}
@@ -822,15 +1685,25 @@ def _stable_request_id(req: dict) -> str:
 
 
 def _request_sort_key(req: dict) -> tuple[int, str, str, str]:
+    source_rank = {
+        "open_questions": 0,
+        "desk_rule": 1,
+        "risk_feedback": 2,
+        "disagreement": 3,
+        "seed": 4,
+        "llm_extra": 5,
+    }
     try:
         priority = int(req.get("priority", 3))
     except (TypeError, ValueError):
         priority = 3
+    tag = str(req.get("source_tag", "")).strip().lower()
     return (
+        source_rank.get(tag, 9),
         max(1, min(5, priority)),
         str(req.get("kind", "")).strip().lower(),
         str(req.get("ticker", "")).strip().upper(),
-        str(req.get("query", "")).strip(),
+        _normalize_query_text(req.get("query", "")),
     )
 
 
@@ -1244,7 +2117,13 @@ def _derive_user_handoff(
     if not isinstance(issues, list):
         issues = []
 
-    hard_stop = reason in {"max_research_rounds", "run_budget_exhausted", "low_added_evidence_delta"}
+    hard_stop = reason in {
+        "max_research_rounds",
+        "run_budget_exhausted",
+        "low_added_evidence_delta",
+        "low_information_gain",
+        "unresolved_core_questions",
+    }
     if not hard_stop:
         return False, []
 
@@ -1280,7 +2159,8 @@ def _derive_user_handoff(
 
 def _baseline_seed_requests(state: dict) -> list[dict]:
     ticker = state.get("target_ticker", "") or "AAPL"
-    return [
+    asset_type = str((state.get("asset_type_by_ticker", {}) or {}).get(ticker, "")).strip().upper() or _infer_asset_type(ticker)
+    base = [
         {
             "desk": "fundamental",
             "kind": "press_release_or_ir",
@@ -1303,16 +2183,6 @@ def _baseline_seed_requests(state: dict) -> list[dict]:
         },
         {
             "desk": "fundamental",
-            "kind": "ownership_identity",
-            "ticker": ticker,
-            "query": f"{ticker} Form 4 13F 13D 13G ownership",
-            "priority": 2,
-            "recency_days": 90,
-            "max_items": 3,
-            "rationale": "baseline_seed_ownership",
-        },
-        {
-            "desk": "fundamental",
             "kind": "valuation_context",
             "ticker": ticker,
             "query": f"{ticker} valuation historical peers context",
@@ -1321,17 +2191,58 @@ def _baseline_seed_requests(state: dict) -> list[dict]:
             "max_items": 3,
             "rationale": "baseline_seed_valuation",
         },
-        {
-            "desk": "fundamental",
-            "kind": "sec_filing",
-            "ticker": ticker,
-            "query": f"{ticker} latest SEC 10-Q 10-K filing",
-            "priority": 5,
-            "recency_days": 365,
-            "max_items": 3,
-            "rationale": "baseline_seed_sec_filing",
-        },
     ]
+    if asset_type in {"ETF", "INDEX"}:
+        base.extend(
+            [
+                {
+                    "desk": "fundamental",
+                    "kind": "web_search",
+                    "ticker": ticker,
+                    "query": f"{ticker} holdings top 10 sector weights",
+                    "priority": 2,
+                    "recency_days": 30,
+                    "max_items": 3,
+                    "rationale": "baseline_seed_etf_holdings",
+                },
+                {
+                    "desk": "fundamental",
+                    "kind": "web_search",
+                    "ticker": ticker,
+                    "query": f"{ticker} etf flows creation redemption tracking error liquidity",
+                    "priority": 2,
+                    "recency_days": 30,
+                    "max_items": 3,
+                    "rationale": "baseline_seed_etf_flows",
+                },
+            ]
+        )
+    else:
+        base.extend(
+            [
+                {
+                    "desk": "fundamental",
+                    "kind": "ownership_identity",
+                    "ticker": ticker,
+                    "query": f"{ticker} Form 4 13F 13D 13G ownership",
+                    "priority": 2,
+                    "recency_days": 90,
+                    "max_items": 3,
+                    "rationale": "baseline_seed_ownership",
+                },
+                {
+                    "desk": "fundamental",
+                    "kind": "sec_filing",
+                    "ticker": ticker,
+                    "query": f"{ticker} latest SEC 10-Q 10-K filing",
+                    "priority": 5,
+                    "recency_days": 365,
+                    "max_items": 3,
+                    "rationale": "baseline_seed_sec_filing",
+                },
+            ]
+        )
+    return base
 
 
 def research_router_node(state: InvestmentState) -> dict:
@@ -1568,11 +2479,66 @@ def _allowlist_for_kind(kind: str) -> list[str]:
     return list(WebResearchProvider.ALLOWLIST_EARNINGS + WebResearchProvider.ALLOWLIST_FILINGS + WebResearchProvider.ALLOWLIST_MACRO)
 
 
+def _reindex_store_by_canonical(store: dict) -> tuple[dict[str, dict], set[str]]:
+    out: dict[str, dict] = {}
+    seen_canonical: set[str] = set()
+    for item in (store or {}).values():
+        if not isinstance(item, dict):
+            continue
+        canonical = _canonicalize_url(str(item.get("url", "")))
+        if not canonical or canonical in seen_canonical:
+            continue
+        key = _evidence_store_key_from_url(canonical)
+        if not key:
+            continue
+        row = dict(item)
+        row["canonical_url"] = canonical
+        row["url"] = canonical
+        row["hash"] = key
+        out[key] = row
+        seen_canonical.add(canonical)
+    return out, seen_canonical
+
+
+def _quality_filter_items_for_request(req: dict, items: list[dict]) -> tuple[list[dict], dict]:
+    accepted: list[dict] = []
+    rejected_landing = 0
+    rejected_mismatch = 0
+    for item in items or []:
+        if not isinstance(item, dict):
+            continue
+        canonical = _canonicalize_url(str(item.get("url", "")))
+        if not canonical:
+            continue
+        row = dict(item)
+        row["canonical_url"] = canonical
+        row["url"] = canonical
+        row["hash"] = _evidence_store_key_from_url(canonical)
+        match = _item_matches_request(row, req)
+        landing = _is_landing_page_candidate(canonical, str(row.get("title", "")))
+        published = str(row.get("published_at", "")).strip()
+        snippet = str(row.get("snippet", "")).strip()
+        has_min_doc = bool(published) and len(snippet) >= 40
+        if landing and (not match or not has_min_doc):
+            rejected_landing += 1
+            continue
+        if not match:
+            rejected_mismatch += 1
+            continue
+        accepted.append(row)
+    return accepted, {
+        "rejected_landing": rejected_landing,
+        "rejected_mismatch": rejected_mismatch,
+        "accepted": len(accepted),
+    }
+
+
 def _resolve_request_with_priority(
     req: dict,
     *,
     sec: SECEdgarProvider,
     web: WebResearchProvider,
+    perplexity: PerplexitySearchProvider | None,
     as_of: str,
 ) -> tuple[list[dict], str]:
     kind = str(req.get("kind", "web_search"))
@@ -1591,7 +2557,16 @@ def _resolve_request_with_priority(
             kind=kind, ticker=ticker, query=query, recency_days=recency_days, max_items=max_items,
             allowlist=allowlist, desk=desk, resolver_path="web_fallback_ownership",
         )
-        return items, "web_fallback_ownership"
+        if items:
+            return items, "web_fallback_ownership"
+        if perplexity is not None:
+            items = perplexity.collect_evidence(
+                kind=kind, ticker=ticker, query=query, recency_days=recency_days, max_items=max_items,
+                allowlist=allowlist, desk=desk, resolver_path="perplexity_fallback_ownership",
+            )
+            if items:
+                return items, "perplexity_fallback_ownership"
+        return [], "web_fallback_ownership"
 
     if kind == "press_release_or_ir":
         sec_out = sec.get_8k_exhibits(ticker, as_of=as_of)
@@ -1610,9 +2585,33 @@ def _resolve_request_with_priority(
             kind=kind, ticker=ticker, query=query, recency_days=recency_days, max_items=max_items,
             allowlist=allowlist, desk=desk, resolver_path="newsapi",
         )
-        return items, "newsapi"
+        if items:
+            return items, "newsapi"
+        if perplexity is not None:
+            items = perplexity.collect_evidence(
+                kind=kind, ticker=ticker, query=query, recency_days=recency_days, max_items=max_items,
+                allowlist=allowlist, desk=desk, resolver_path="perplexity_fallback_ir",
+            )
+            if items:
+                return items, "perplexity_fallback_ir"
+        return [], "newsapi"
 
     if kind == "macro_headline_context":
+        query_l = _normalize_query_text(query)
+        event_like = any(
+            tok in query_l
+            for tok in (
+                "iran", "hormuz", "airstrike", "attack", "geopolitical", "wti", "brent", "oil", "war", "conflict",
+                "지정학", "호르무즈", "공습", "원유", "유가",
+            )
+        )
+        if event_like:
+            items = web.collect_evidence(
+                kind=kind, ticker=ticker, query=query, recency_days=recency_days, max_items=max_items,
+                allowlist=allowlist, desk=desk, resolver_path="event_news_priority",
+            )
+            if items:
+                return items, "event_news_priority"
         official_urls = [
             "https://www.federalreserve.gov/newsevents/pressreleases.htm",
             "https://home.treasury.gov/news/press-releases",
@@ -1630,13 +2629,31 @@ def _resolve_request_with_priority(
             kind=kind, ticker=ticker, query=query, recency_days=recency_days, max_items=max_items,
             allowlist=allowlist, desk=desk, resolver_path="newsapi_supplement",
         )
-        return items, "newsapi_supplement"
+        if items:
+            return items, "newsapi_supplement"
+        if perplexity is not None:
+            items = perplexity.collect_evidence(
+                kind=kind, ticker=ticker, query=query, recency_days=recency_days, max_items=max_items,
+                allowlist=allowlist, desk=desk, resolver_path="perplexity_fallback_macro",
+            )
+            if items:
+                return items, "perplexity_fallback_macro"
+        return [], "newsapi_supplement"
 
     items = web.collect_evidence(
         kind=kind, ticker=ticker, query=query, recency_days=recency_days, max_items=max_items,
         allowlist=allowlist, desk=desk, resolver_path="default_web",
     )
-    return items, "default_web"
+    if items:
+        return items, "default_web"
+    if perplexity is not None:
+        items = perplexity.collect_evidence(
+            kind=kind, ticker=ticker, query=query, recency_days=recency_days, max_items=max_items,
+            allowlist=allowlist, desk=desk, resolver_path="perplexity_fallback_default",
+        )
+        if items:
+            return items, "perplexity_fallback_default"
+    return [], "default_web"
 
 
 def research_executor_node(state: InvestmentState) -> dict:
@@ -1658,16 +2675,20 @@ def research_executor_node(state: InvestmentState) -> dict:
 
     as_of = state.get("as_of", "")
     mode = state.get("mode", "mock")
-    store = dict(state.get("evidence_store", {}))
+    store, existing_canonical = _reindex_store_by_canonical(dict(state.get("evidence_store", {})))
     before = set(store.keys())
+    before_buckets = _covered_buckets_from_store(store)
 
     sec = SECEdgarProvider()
     web = WebResearchProvider(mode=mode)
+    perplexity = PerplexitySearchProvider(mode=mode)
 
     queries_executed = 0
     executed_requests: list[dict] = []
     new_hashes: set[str] = set()
+    new_canonical: set[str] = set()
     evidence_delta_kinds: dict[str, int] = {}
+    resolved_requests = 0
     if _graph_trace_enabled():
         request_preview = [
             f"{str(req.get('desk', ''))}:{str(req.get('kind', ''))}:{_short_text(req.get('query', ''), 90)}"
@@ -1676,8 +2697,17 @@ def research_executor_node(state: InvestmentState) -> dict:
         _graph_trace(f"research_executor start: requests={len(plan)}, preview={request_preview}")
 
     for req in sorted(plan, key=lambda r: r.get("priority", 5)):
-        items, resolver_path = _resolve_request_with_priority(req, sec=sec, web=web, as_of=as_of)
+        items, resolver_path = _resolve_request_with_priority(
+            req,
+            sec=sec,
+            web=web,
+            perplexity=perplexity,
+            as_of=as_of,
+        )
         queries_executed += 1
+        accepted_items, quality_meta = _quality_filter_items_for_request(req, items)
+        if accepted_items:
+            resolved_requests += 1
 
         req_copy = dict(req)
         req_copy["resolver_path"] = resolver_path
@@ -1702,24 +2732,36 @@ def research_executor_node(state: InvestmentState) -> dict:
                 "ticker": str(req_copy.get("ticker", "")).strip().upper(),
                 "priority": max(1, min(5, req_priority)),
                 "resolver_path": resolver_path,
-                "n_items": int(len(items)),
+                "n_items_raw": int(len(items)),
+                "n_items": int(len(accepted_items)),
+                "rejected_landing": int(quality_meta.get("rejected_landing", 0)),
+                "rejected_mismatch": int(quality_meta.get("rejected_mismatch", 0)),
                 "impacted_desks": list(req_copy.get("impacted_desks", [])),
             }
         )
 
-        for item in items:
-            h = str(item.get("hash", "")).strip()
+        for item in accepted_items:
+            canonical = str(item.get("canonical_url", "")).strip()
+            h = str(item.get("hash", "")).strip() or _evidence_store_key_from_url(canonical)
             if not h:
+                continue
+            if canonical and canonical in existing_canonical:
                 continue
             is_new = h not in before and h not in new_hashes
             item["resolver_path"] = item.get("resolver_path") or resolver_path
             store[h] = item
             if is_new:
                 new_hashes.add(h)
+                if canonical:
+                    existing_canonical.add(canonical)
+                    new_canonical.add(canonical)
                 kind = str(item.get("kind", req_copy.get("kind", "web_search"))).strip().lower() or "web_search"
                 evidence_delta_kinds[kind] = int(evidence_delta_kinds.get(kind, 0)) + 1
 
-    delta = len(set(store.keys()) - before)
+    delta = len(new_canonical)
+    after_buckets = _covered_buckets_from_store(store)
+    bucket_delta = len(set(after_buckets) - set(before_buckets))
+    resolved_request_ratio = (resolved_requests / queries_executed) if queries_executed > 0 else 0.0
     score_block = compute_evidence_score(store, as_of)
     research_round = int(state.get("research_round", 0)) + 1
 
@@ -1762,13 +2804,16 @@ def research_executor_node(state: InvestmentState) -> dict:
     stop_reason = ""
     if score_block["score"] >= 75:
         stop_reason = "evidence_score_enough"
-    elif delta < 2:
-        stop_reason = "low_added_evidence_delta"
+    elif delta <= 0 and bucket_delta <= 0:
+        stop_reason = "low_information_gain"
+    elif resolved_request_ratio <= 0.0:
+        stop_reason = "unresolved_core_questions"
 
     print(f"\n🔎 RESEARCH EXECUTOR  (iter #{state.get('iteration_count', 1)})")
     print(
         "   Executed: "
-        f"{queries_executed} requests | delta={delta} | evidence_score={score_block['score']} | round={research_round}"
+        f"{queries_executed} requests | delta={delta} | bucket_delta={bucket_delta} | "
+        f"resolved={resolved_requests}/{queries_executed} | evidence_score={score_block['score']} | round={research_round}"
     )
     print(
         "   Kinds: "
@@ -1785,6 +2830,7 @@ def research_executor_node(state: InvestmentState) -> dict:
         "execution result",
         [
             f"executed_requests={queries_executed} delta={delta} research_round={research_round}",
+            f"bucket_delta={bucket_delta} resolved_request_ratio={resolved_request_ratio:.2f}",
             f"executed_kinds={rerun_plan.get('executed_kinds', [])}",
             f"rerun_selected={sorted(rerun_desks)} k={_MAX_RERUN_DESKS}",
             f"rerun_reasons={rerun_plan.get('reasons', {})}",
@@ -1796,6 +2842,7 @@ def research_executor_node(state: InvestmentState) -> dict:
         _graph_trace(
             "research_executor result: "
             f"round={research_round}, executed={queries_executed}, delta={delta}, "
+            f"bucket_delta={bucket_delta}, resolved_ratio={resolved_request_ratio:.2f}, "
             f"score={score_block['score']}, rerun_desks={sorted(rerun_desks)}, "
             f"rerun_reasons={rerun_plan.get('reasons', {})}, executed_kinds={rerun_plan.get('executed_kinds', [])}"
         )
@@ -1809,6 +2856,8 @@ def research_executor_node(state: InvestmentState) -> dict:
             "research_round": research_round,
             "queries_executed": queries_executed,
             "last_research_delta": delta,
+            "bucket_delta": bucket_delta,
+            "resolved_request_ratio": round(resolved_request_ratio, 4),
             "evidence_score": score_block["score"],
             "rerun_desks": sorted(rerun_desks),
             "stop_reason": stop_reason,
@@ -1821,6 +2870,12 @@ def research_executor_node(state: InvestmentState) -> dict:
         "last_research_delta": delta,
         "research_round": research_round,
         "research_stop_reason": stop_reason,
+        "_research_info_gain": {
+            "unique_canonical_delta": delta,
+            "bucket_delta": bucket_delta,
+            "resolved_requests": resolved_requests,
+            "resolved_request_ratio": round(resolved_request_ratio, 4),
+        },
         "completed_tasks": ct,
         "audit": audit,
         "_run_research": False,
@@ -1833,6 +2888,8 @@ def research_executor_node(state: InvestmentState) -> dict:
             "research_round": research_round,
             "queries_executed": queries_executed,
             "last_research_delta": delta,
+            "bucket_delta": bucket_delta,
+            "resolved_request_ratio": round(resolved_request_ratio, 4),
             "evidence_score": score_block["score"],
             "rerun_desks": sorted(rerun_desks),
         }],
@@ -2022,9 +3079,10 @@ def risk_router(state: InvestmentState) -> Literal["orchestrator", "report_write
 def build_investment_graph() -> StateGraph:
     """
     V4 Graph:
-      START → orchestrator → [4 desks parallel] → barrier → research_router
+      START → orchestrator → [4 desks parallel] → barrier → hedge_lite_builder → research_router
         research_router -> risk_manager
-        research_router -> research_executor -> [4 desks(parallel,research)] -> research_barrier -> research_router
+        research_router -> research_executor -> [4 desks(parallel,research)] -> research_barrier
+                         -> hedge_lite_builder -> research_router
       risk_manager -> router -> orchestrator/report_writer
     """
     g = StateGraph(InvestmentState)
@@ -2035,6 +3093,7 @@ def build_investment_graph() -> StateGraph:
     g.add_node("sentiment_analyst", sentiment_analyst_node)
     g.add_node("quant_analyst", quant_analyst_node)
     g.add_node("barrier", barrier_node)
+    g.add_node("hedge_lite_builder", hedge_lite_builder_node)
     g.add_node("research_router", research_router_node)
     g.add_node("research_executor", research_executor_node)
     g.add_node("research_barrier", research_barrier_node)
@@ -2055,7 +3114,8 @@ def build_investment_graph() -> StateGraph:
     for desk in ["macro_analyst", "fundamental_analyst", "sentiment_analyst", "quant_analyst"]:
         g.add_edge(desk, "barrier")
 
-    g.add_edge("barrier", "research_router")
+    g.add_edge("barrier", "hedge_lite_builder")
+    g.add_edge("hedge_lite_builder", "research_router")
 
     g.add_conditional_edges("research_router", research_router, {
         "research_executor": "research_executor",
@@ -2066,7 +3126,7 @@ def build_investment_graph() -> StateGraph:
         g.add_edge("research_executor", desk)
         g.add_edge(desk, "research_barrier")
 
-    g.add_edge("research_barrier", "research_router")
+    g.add_edge("research_barrier", "hedge_lite_builder")
 
     g.add_conditional_edges("risk_manager", risk_router, {
         "orchestrator": "orchestrator",

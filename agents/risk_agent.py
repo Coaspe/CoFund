@@ -501,15 +501,33 @@ def compute_risk_decision(payload: dict) -> dict:
     # ── Bug fix #2: signed weight ─────────────────────────────────────────
     signed_weight = compute_signed_weight(quant_decision, raw_alloc)
 
-    tickers_in_play = list(summary.get("component_var_by_ticker", {}).keys())
-    target = reports.get("_target_ticker", tickers_in_play[0] if tickers_in_play else "AAPL")
-    if not tickers_in_play:
-        tickers_in_play = [target]
+    # Optional: orchestrator/allocator proposed weights (B mode)
+    raw_proposed = payload.get("positions_proposed", {})
+    proposed_weights: dict[str, float] = {}
+    if isinstance(raw_proposed, dict):
+        for t, w in raw_proposed.items():
+            try:
+                wt = float(w)
+            except (TypeError, ValueError):
+                continue
+            if np.isnan(wt) or np.isinf(wt):
+                continue
+            proposed_weights[str(t).strip().upper()] = wt
 
-    ticker_weights: dict[str, float] = {}
-    for t in tickers_in_play:
-        w = signed_weight if t == target else summary.get("component_var_by_ticker", {}).get(t, 0.0)
-        ticker_weights[t] = w
+    tickers_in_play = list(summary.get("component_var_by_ticker", {}).keys())
+    target = str(reports.get("_target_ticker", tickers_in_play[0] if tickers_in_play else "AAPL")).strip().upper()
+    if proposed_weights:
+        tickers_in_play = list(proposed_weights.keys())
+        if target not in tickers_in_play:
+            target = tickers_in_play[0]
+        ticker_weights = {t: float(proposed_weights.get(t, 0.0)) for t in tickers_in_play}
+    else:
+        if not tickers_in_play:
+            tickers_in_play = [target]
+        ticker_weights: dict[str, float] = {}
+        for t in tickers_in_play:
+            w = signed_weight if t == target else summary.get("component_var_by_ticker", {}).get(t, 0.0)
+            ticker_weights[t] = w
 
     ticker_flags: dict[str, list[str]] = {t: [] for t in tickers_in_play}
     ticker_decisions: dict[str, str] = {t: "approve" for t in tickers_in_play}
@@ -707,7 +725,7 @@ def risk_manager_node(state: InvestmentState) -> dict:
         {"risk_assessment": dict}
     """
     iteration = state.get("iteration_count", 1)
-    ticker = state.get("target_ticker", "AAPL")
+    ticker = str(state.get("target_ticker", "AAPL")).strip().upper()
 
     print(f"\n{'=' * 60}")
     print(f"⑥ RISK MANAGER  (iteration #{iteration})")
@@ -724,14 +742,64 @@ def risk_manager_node(state: InvestmentState) -> dict:
     raw_alloc = first_not_none(quant, ["final_allocation_pct", "final_weight"], default=0.0)
     signed_weight = compute_signed_weight(quant_decision, raw_alloc)
 
-    positions = {
-        ticker: {
-            "weight": signed_weight,
-            "sector": funda.get("sector", "Technology"),
-            "avg_daily_volume_usd": funda.get("avg_daily_volume_usd", 5_000_000_000),
-            "position_notional_usd": funda.get("position_notional_usd", 50_000_000),
+    raw_proposed = state.get("positions_proposed", {})
+    positions_proposed: dict[str, float] = {}
+    if isinstance(raw_proposed, dict):
+        for t, w in raw_proposed.items():
+            try:
+                wt = float(w)
+            except (TypeError, ValueError):
+                continue
+            if np.isnan(wt) or np.isinf(wt):
+                continue
+            positions_proposed[str(t).strip().upper()] = wt
+
+    if positions_proposed:
+        total = float(sum(max(0.0, abs(v)) for v in positions_proposed.values()))
+        if total > 1e-12:
+            positions_proposed = {t: float(v) / total for t, v in positions_proposed.items()}
+
+    def _sector_for_ticker(t: str) -> str:
+        tt = str(t).strip().upper()
+        if tt == str(ticker).strip().upper():
+            return str(funda.get("sector", "Unknown"))
+        if tt in {"GLD", "SLV"}:
+            return "Commodities"
+        if tt in {"TLT", "IEF", "SHY", "BND"}:
+            return "Fixed Income"
+        if tt in {"XLE"}:
+            return "Energy"
+        if tt in {"QQQ", "XLK"}:
+            return "Technology"
+        if tt in {"SPY", "DIA", "IWM"}:
+            return "Broad Market"
+        return "Unknown"
+
+    def _adv_for_ticker(t: str) -> float:
+        tt = str(t).strip().upper()
+        if tt in {"SPY", "QQQ", "GLD", "TLT", "XLE", "IWM", "DIA"}:
+            return 8_000_000_000.0
+        return 2_000_000_000.0
+
+    if positions_proposed:
+        positions = {
+            t: {
+                "weight": float(w),
+                "sector": _sector_for_ticker(t),
+                "avg_daily_volume_usd": _adv_for_ticker(t),
+                "position_notional_usd": abs(float(w)) * 50_000_000,
+            }
+            for t, w in positions_proposed.items()
         }
-    }
+    else:
+        positions = {
+            ticker: {
+                "weight": signed_weight,
+                "sector": funda.get("sector", "Technology"),
+                "avg_daily_volume_usd": funda.get("avg_daily_volume_usd", 5_000_000_000),
+                "position_notional_usd": funda.get("position_notional_usd", 50_000_000),
+            }
+        }
 
     # ── Check for stale desks ─────────────────────────────────────────────
     stale_desks = []
@@ -756,6 +824,8 @@ def risk_manager_node(state: InvestmentState) -> dict:
 
     print("   [도구 호출] aggregate_risk_payload...")
     payload = aggregate_risk_payload(risk_summary, analyst_reports)
+    if positions_proposed:
+        payload["positions_proposed"] = positions_proposed
 
     print("   [LLM] 5-Gate CRO 의사결정 요청 중...")
     decision = _call_llm(payload)
@@ -769,6 +839,23 @@ def risk_manager_node(state: InvestmentState) -> dict:
         decision.setdefault("orchestrator_feedback", {})["required"] = True
         decision["orchestrator_feedback"].setdefault("reasons", []).append("stale_desk_data")
 
+    if positions_proposed:
+        per = decision.get("per_ticker_decisions", {}) or {}
+        for t, proposed_w in positions_proposed.items():
+            if t not in per:
+                per[t] = {
+                    "final_weight": 0.0,
+                    "decision": "approve",
+                    "flags": [],
+                    "rationale_short": "초기 제안 누락으로 보수적으로 0 비중 처리.",
+                }
+            if abs(float(proposed_w)) <= 1e-12:
+                per[t].setdefault("flags", []).append("proposed_zero_weight")
+                rationale = str(per[t].get("rationale_short", "")).strip()
+                if "0 비중" not in rationale:
+                    per[t]["rationale_short"] = (rationale + " 제안 비중이 0이라 유지.") if rationale else "제안 비중이 0이라 0 비중 유지."
+        decision["per_ticker_decisions"] = per
+
     # 피드백 루프용 grade 결정
     fb = decision.get("orchestrator_feedback", {})
     grade = "High" if fb.get("required", False) else "Low"
@@ -777,6 +864,10 @@ def risk_manager_node(state: InvestmentState) -> dict:
         "grade": grade,
         "risk_decision": decision,
         "risk_payload": payload,
+    }
+    positions_final = {
+        t: float((d or {}).get("final_weight", 0.0))
+        for t, d in (decision.get("per_ticker_decisions", {}) or {}).items()
     }
 
     print(f"   [결과] 리스크 등급: {grade}")
@@ -789,7 +880,7 @@ def risk_manager_node(state: InvestmentState) -> dict:
         print(f"   [결과] {t}: {d.get('decision')} → {d.get('final_weight')}")
     print(f"   [CoT] {fb.get('detail', '')[:120]}...")
 
-    return {"risk_assessment": risk_assessment}
+    return {"risk_assessment": risk_assessment, "positions_final": positions_final}
 
 
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━

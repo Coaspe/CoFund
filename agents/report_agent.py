@@ -19,6 +19,7 @@ from __future__ import annotations
 
 import json
 import os
+import re
 import warnings
 from datetime import datetime
 from typing import Any, Dict, List, Optional
@@ -576,6 +577,182 @@ def _fmt_research_appendix(state: dict) -> str:
     return "\n".join(lines)
 
 
+def _output_language(state: dict) -> str:
+    lang = str(state.get("output_language", "")).strip().lower()
+    if lang in {"ko", "en"}:
+        return lang
+    text = str(state.get("user_request", ""))
+    return "ko" if re.search(r"[가-힣]", text) else "en"
+
+
+def _has_cvar_breach_flag(flags: list[Any]) -> bool:
+    for f in flags or []:
+        s = str(f).strip().lower()
+        if "cvar" in s and ("breach" in s or "limit" in s or "exceed" in s):
+            return True
+    return False
+
+
+def _build_fidelity_report(state: dict) -> str:
+    lang = _output_language(state)
+    ticker = str(state.get("target_ticker", "N/A"))
+    ts = datetime.utcnow().strftime("%Y-%m-%d %H:%M UTC")
+    iteration = int(state.get("iteration_count", 0))
+    intent = str(state.get("intent", ""))
+    analysis_mode = str(state.get("analysis_execution_mode", "")).strip()
+    universe = [str(t).strip().upper() for t in (state.get("universe", []) or []) if str(t).strip()]
+    if not universe:
+        universe = list((_safe_get(state.get("orchestrator_directives", {}), "investment_brief", "target_universe", default=[])) or [])
+    hedge_lite = state.get("hedge_lite", {}) if isinstance(state.get("hedge_lite"), dict) else {}
+    hedge_rows = hedge_lite.get("hedges", {}) if isinstance(hedge_lite.get("hedges"), dict) else {}
+    analyzed = [ticker] if ticker and ticker != "N/A" else []
+    if str(analysis_mode).startswith("B_") and hedge_rows:
+        analyzed.extend([str(t).strip().upper() for t in hedge_rows.keys()])
+    analyzed = [t for t in dict.fromkeys(analyzed) if t]
+    unanalyzed = [t for t in universe if t not in set(analyzed)]
+
+    macro = state.get("macro_analysis", {}) or {}
+    funda = state.get("fundamental_analysis", {}) or {}
+    senti = state.get("sentiment_analysis", {}) or {}
+    quant = state.get("technical_analysis", {}) or {}
+    risk = state.get("risk_assessment", {}) or {}
+    risk_decision = risk.get("risk_decision", risk) if isinstance(risk, dict) else {}
+    per_ticker = risk_decision.get("per_ticker_decisions", {}) if isinstance(risk_decision, dict) else {}
+    ticker_dec = per_ticker.get(ticker, {}) if isinstance(per_ticker, dict) else {}
+
+    quant_decision = str(quant.get("decision", quant.get("llm_decision", {}).get("decision", "HOLD")))
+    quant_alloc = quant.get("final_allocation_pct", quant.get("llm_decision", {}).get("final_allocation_pct", 0.0))
+    quant_reason = str(quant.get("llm_decision", {}).get("cot_reasoning", "")).strip()
+
+    risk_flags = list(ticker_dec.get("flags", [])) if isinstance(ticker_dec, dict) else []
+    risk_grade = str(risk.get("grade", "N/A"))
+    risk_decision_label = str(ticker_dec.get("decision", "n/a"))
+    risk_weight = ticker_dec.get("final_weight", quant_alloc)
+    risk_rationale = str(ticker_dec.get("rationale_short", "")).strip()
+    positions_final = state.get("positions_final", {}) if isinstance(state.get("positions_final"), dict) else {}
+    positions_proposed = state.get("positions_proposed", {}) if isinstance(state.get("positions_proposed"), dict) else {}
+
+    cvar_limit = (
+        ((risk.get("risk_payload", {}) or {}).get("risk_limits", {}) or {}).get("max_portfolio_cvar_1d")
+        or ((quant.get("quant_payload", {}) or {}).get("portfolio_risk_parameters", {}) or {}).get("max_portfolio_cvar_limit")
+    )
+    portfolio_cvar = ((risk.get("risk_payload", {}) or {}).get("portfolio_risk_summary", {}) or {}).get("portfolio_cvar_1d")
+    cvar_breach = _has_cvar_breach_flag(risk_flags)
+    cvar_line = (
+        f"- 포트폴리오 CVaR 한도 이슈: **있음** (flags={risk_flags})"
+        if cvar_breach
+        else "- 포트폴리오 CVaR 한도 이슈: **없음** (risk flags 기준)"
+    )
+
+    mode_note = ""
+    if unanalyzed:
+        mode_note = (
+            "\n- 분석 미실행 유니버스: " + ", ".join(unanalyzed) +
+            " (state 근거 없음, 가정으로만 취급)"
+        )
+
+    def _build_hedge_lite_summary_ko() -> str:
+        if not str(analysis_mode).startswith("B_"):
+            return ""
+        rows = hedge_rows if isinstance(hedge_rows, dict) else {}
+        if not rows:
+            return "\n## Hedge Lite Summary\n- 헤지 후보 lite 분석 미실행(가정)\n"
+
+        lines = ["", "## Hedge Lite Summary"]
+        lines.append(
+            f"- 빌드 상태: {hedge_lite.get('status', 'unknown')} / reason={hedge_lite.get('reason', '')} / seed={hedge_lite.get('seed', 'n/a')}"
+        )
+        selected = hedge_lite.get("selected_hedges", []) or []
+        lines.append(f"- 선택 헤지: {selected if selected else '없음'}")
+        for ht in [t for t in universe if t != ticker]:
+            row = rows.get(ht)
+            if not isinstance(row, dict):
+                lines.append(f"- {ht}: 분석 미실행(가정)")
+                continue
+            status = str(row.get("status", "unknown"))
+            w = positions_final.get(ht, positions_proposed.get(ht, 0.0))
+            if status != "ok":
+                lines.append(f"- {ht}: 헤지 후보 lite 분석 실패(데이터 부족), weight={_fmt_pct(w)}")
+                continue
+            lines.append(
+                f"- {ht}: score={row.get('score')}, corr_main60={row.get('corr_with_main_60d')}, "
+                f"vol_shift={row.get('vol_shift_20d_vs_60d')}, ret5d={row.get('ret_5d')}, weight={_fmt_pct(w)}"
+            )
+        return "\n".join(lines) + "\n"
+
+    def _build_hedge_lite_summary_en() -> str:
+        if not str(analysis_mode).startswith("B_"):
+            return ""
+        rows = hedge_rows if isinstance(hedge_rows, dict) else {}
+        if not rows:
+            return "\n## Hedge Lite Summary\n- Hedge lite analysis not executed (assumption only).\n"
+
+        lines = ["", "## Hedge Lite Summary"]
+        lines.append(
+            f"- Build status: {hedge_lite.get('status', 'unknown')} / reason={hedge_lite.get('reason', '')} / seed={hedge_lite.get('seed', 'n/a')}"
+        )
+        selected = hedge_lite.get("selected_hedges", []) or []
+        lines.append(f"- Selected hedges: {selected if selected else 'none'}")
+        for ht in [t for t in universe if t != ticker]:
+            row = rows.get(ht)
+            if not isinstance(row, dict):
+                lines.append(f"- {ht}: analysis not executed (assumption only).")
+                continue
+            status = str(row.get("status", "unknown"))
+            w = positions_final.get(ht, positions_proposed.get(ht, 0.0))
+            if status != "ok":
+                lines.append(f"- {ht}: hedge lite failed (insufficient data), weight={_fmt_pct(w)}")
+                continue
+            lines.append(
+                f"- {ht}: score={row.get('score')}, corr_main60={row.get('corr_with_main_60d')}, "
+                f"vol_shift={row.get('vol_shift_20d_vs_60d')}, ret5d={row.get('ret_5d')}, weight={_fmt_pct(w)}"
+            )
+        return "\n".join(lines) + "\n"
+
+    if lang == "en":
+        return (
+            f"# IC Memo ({ticker})\n\n"
+            f"- Timestamp: {ts}\n"
+            f"- Iteration: {iteration}\n"
+            f"- Intent: {intent}\n"
+            f"- Universe: {universe}\n"
+            f"- Quant decision: {quant_decision} / alloc={quant_alloc}\n"
+            f"- Risk decision: {risk_decision_label} / weight={risk_weight} / grade={risk_grade}\n"
+            f"- CVaR breach claim allowed: {cvar_breach}\n"
+            f"{mode_note}\n\n"
+            f"## Evidence-backed reason fields\n"
+            f"- quant.llm_decision.cot_reasoning: {quant_reason or '(empty)'}\n"
+            f"- risk_decision.per_ticker_decisions[{ticker}].flags: {risk_flags}\n"
+            f"- risk_decision.per_ticker_decisions[{ticker}].rationale_short: {risk_rationale or '(empty)'}\n"
+            f"- portfolio_cvar_1d(state): {portfolio_cvar} / limit(state): {cvar_limit}\n"
+            f"{_build_hedge_lite_summary_en()}"
+        )
+
+    return (
+        f"# 투자위원회 메모 ({ticker})\n\n"
+        f"- 작성시각: {ts}\n"
+        f"- 반복횟수: {iteration}\n"
+        f"- 의도(intent): {intent or 'n/a'}\n"
+        f"- 분석 유니버스(state.universe): {universe}\n"
+        f"- Quant 결정(state): {quant_decision} / 비중={_fmt_pct(quant_alloc)}\n"
+        f"- Risk 결정(state): {risk_decision_label} / 최종비중={_fmt_pct(risk_weight)} / 등급={risk_grade}\n"
+        f"{cvar_line}\n"
+        f"- portfolio_cvar_1d(state): {_fmt_pct(portfolio_cvar)} / limit(state): {_fmt_pct(cvar_limit)}"
+        f"{mode_note}\n\n"
+        f"## 결론 근거(필드 인용)\n"
+        f"- `technical_analysis.llm_decision.cot_reasoning`: {quant_reason or '(없음)'}\n"
+        f"- `risk_assessment.risk_decision.per_ticker_decisions[{ticker}].flags`: {risk_flags}\n"
+        f"- `risk_assessment.risk_decision.per_ticker_decisions[{ticker}].rationale_short`: {risk_rationale or '(없음)'}\n"
+        f"- `fundamental_analysis.analysis_mode`: {funda.get('analysis_mode', 'n/a')} / `asset_type`: {funda.get('asset_type', 'n/a')}\n"
+        f"- `sentiment_analysis.data_quality.warnings`: {senti.get('data_quality', {}).get('warnings', [])}\n"
+        f"- `research_stop_reason`: {state.get('research_stop_reason', '')}\n\n"
+        f"{_build_hedge_lite_summary_ko()}"
+        f"## 감사 메모\n"
+        f"- 본 보고서는 state 값만 사용해 생성되며, state에 없는 인과는 추가하지 않음.\n"
+        f"- CVaR 한도 초과 문구는 `cvar_limit_breach` 계열 플래그가 있을 때만 허용.\n"
+    )
+
+
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 # LangGraph 노드 함수
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
@@ -601,9 +778,8 @@ def report_writer_node(state: InvestmentState) -> dict:
 
     scenario = _determine_scenario(state)
     print(f"   [시나리오] {scenario}")
-
-    print("   [LLM] IC 메모 생성 요청 중...")
-    report = _call_llm(state)
+    print("   [Report] state-fidelity 모드로 보고서 생성")
+    report = _build_fidelity_report(state)
 
     line_count = report.count("\n") + 1
     print(f"   [결과] IC 메모 생성 완료 ({line_count} lines)")

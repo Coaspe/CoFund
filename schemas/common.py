@@ -353,13 +353,17 @@ def _merge_lists(a: list, b: list) -> list:
     return (a or []) + (b or [])
 
 
+def _normalize_query_text(text: Any) -> str:
+    return " ".join(str(text or "").strip().lower().split())
+
+
 def _request_key(req: dict) -> tuple:
     return (
-        (req or {}).get("desk", ""),
-        (req or {}).get("kind", ""),
-        (req or {}).get("ticker", ""),
-        (req or {}).get("series_id", ""),
-        (req or {}).get("query", ""),
+        str((req or {}).get("desk", "")).strip().lower(),
+        str((req or {}).get("kind", "")).strip().lower(),
+        str((req or {}).get("ticker", "")).strip().upper(),
+        str((req or {}).get("series_id", "")).strip(),
+        _normalize_query_text((req or {}).get("query", "")),
     )
 
 
@@ -381,10 +385,15 @@ class InvestmentState(TypedDict, total=False):
     run_id: str
     as_of: str
     mode: str
+    intent: str  # market_outlook | single_name | hedge_design | relative_value ...
+    output_language: str  # ko | en
+    analysis_execution_mode: str  # single_main | B_main_plus_hedge_lite
     run_context: dict  # {run_id, as_of, mode, seed, git_commit, config_hash}
 
     # Universe & positions
     universe: List[str]          # 분석 대상 티커 목록
+    asset_type_by_ticker: dict   # {ticker -> ETF|EQUITY|INDEX|...}
+    hedge_lite: dict             # B 모드 hedge lite 분석 산출물
     positions_proposed: dict     # Allocator 출력: {ticker -> weight}
     positions_final: dict        # Risk 최종 확정: {ticker -> weight}
 
@@ -453,6 +462,9 @@ def create_initial_state(
         run_id=run_id,
         as_of=as_of,
         mode=mode,
+        intent="single_name",
+        output_language="ko",
+        analysis_execution_mode="single_main",
         run_context={
             "run_id": run_id,
             "as_of": as_of,
@@ -460,6 +472,8 @@ def create_initial_state(
             "seed": seed,
         },
         universe=universe or [],
+        asset_type_by_ticker={},
+        hedge_lite={},
         positions_proposed={},
         positions_final={},
         user_request=user_request,
