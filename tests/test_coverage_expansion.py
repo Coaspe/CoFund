@@ -382,11 +382,14 @@ class TestOrchLlmFirstWithFallback:
         from agents.orchestrator_agent import _call_llm
         from llm.router import (
             force_real_llm_in_tests,
+            _get_cerebras_key,
             _get_zai_key,
             _get_groq_key,
             _get_gemini_key,
         )
-        has_any_llm_key = bool(_get_zai_key() or _get_groq_key() or _get_gemini_key())
+        has_any_llm_key = bool(
+            _get_cerebras_key() or _get_zai_key() or _get_groq_key() or _get_gemini_key()
+        )
         if force_real_llm_in_tests() and not has_any_llm_key:
             with pytest.raises(RuntimeError):
                 _call_llm("AAPL 매수해도 돼?", 0)

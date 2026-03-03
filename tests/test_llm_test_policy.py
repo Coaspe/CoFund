@@ -152,3 +152,38 @@ def test_llm_router_trace_logs_provider_attempt(monkeypatch, capfd):
     out = capfd.readouterr().out
     assert "[LLM TRACE] orchestrator: invoke 시도 -> zai:glm-4.7-flash" in out
     assert "[LLM TRACE] orchestrator: invoke 성공 <- zai:glm-4.7-flash" in out
+
+
+def test_llm_router_logs_provider_label_on_api_call(capfd):
+    from llm import router
+
+    class _Backend:
+        def invoke(self, *args, **kwargs):
+            return {"ok": True}
+
+    proxy = router._BoundedLLMProxy("orchestrator", [("zai:glm-4.7-flash", _Backend())])
+    proxy.invoke("ping")
+    out = capfd.readouterr().out
+    assert "[LLM Router] orchestrator: API 호출 (zai:glm-4.7-flash)" in out
+
+
+def test_global_llm_env_override_zai_glm(monkeypatch):
+    from llm import router
+
+    monkeypatch.setenv("LLM_PROVIDER", "ZAI")
+    monkeypatch.setenv("LLM_MODEL_NAME", "glm-4.7-flash")
+    cfg = dict(router.AGENT_LLM_CONFIG["orchestrator"])
+    chain = router._build_provider_chain(cfg)
+    assert chain[0]["provider"] == "zai"
+    assert router._resolved_model(chain[0]) == "glm-4.7-flash"
+
+
+def test_global_llm_env_override_cerabras_typo_supported(monkeypatch):
+    from llm import router
+
+    monkeypatch.setenv("LLM_PROVIDER", "cerabras")
+    monkeypatch.setenv("LLM_MODEL_NAME", "gpt-oss-120b")
+    cfg = dict(router.AGENT_LLM_CONFIG["orchestrator"])
+    chain = router._build_provider_chain(cfg)
+    assert chain[0]["provider"] == "cerebras"
+    assert router._resolved_model(chain[0]) == "gpt-oss-120b"

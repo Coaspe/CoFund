@@ -1,12 +1,12 @@
 """
-llm/router.py — Multi-Provider LLM Router (Z.ai primary, bounded concurrency)
-===============================================================================
-모든 LLM 요청은 기본적으로 Z.ai(GLM-4.7-flash)를 사용합니다.
-기존 Groq/Gemini는 fallback 체인으로 유지합니다.
+llm/router.py — Multi-Provider LLM Router (bounded concurrency)
+================================================================
+전역 환경변수로 기본 LLM provider/model을 제어합니다.
 
 핵심 정책:
-  - Primary provider: Z.ai (OpenAI-compatible endpoint)
-  - Fallback provider(s): 기존 Groq/Gemini
+  - Global default: LLM_PROVIDER + LLM_MODEL_NAME
+  - Current default fallback: cerebras + gpt-oss-120b
+  - Agent-level override: <AGENT>_MODEL (기존 동작 유지)
   - Global concurrent LLM invokes: 기본 1개 (초과 시 대기 + 콘솔 로그)
   - Rate limit 감지 시 콘솔 로그 + fallback 시도
   - pytest 실행 중에는 기본적으로 캐시를 비활성화하여 실호출을 강제
@@ -82,6 +82,30 @@ def _safe_float_env(name: str, default: float) -> float:
         return default
 
 
+def _normalize_provider_name(provider: str) -> str:
+    p = str(provider or "").strip().lower()
+    aliases = {
+        "z.ai": "zai",
+        "zhipu": "zai",
+        "cerabras": "cerebras",  # common typo support
+    }
+    return aliases.get(p, p)
+
+
+def _global_llm_provider() -> str:
+    raw = os.environ.get("LLM_PROVIDER", "").strip()
+    if not raw:
+        return ""
+    return _normalize_provider_name(raw)
+
+
+def _global_llm_model() -> str:
+    return (
+        os.environ.get("LLM_MODEL_NAME", "").strip()
+        or os.environ.get("LLM_MODEL", "").strip()
+    )
+
+
 def _llm_min_request_interval_sec() -> float:
     """
     Global minimum interval between any LLM API requests.
@@ -115,8 +139,8 @@ _LLM_LAST_REQUEST_TS = 0.0
 
 AGENT_LLM_CONFIG: dict[str, dict[str, Any]] = {
     "orchestrator": {
-        "provider": "zai",
-        "model": "glm-4.7-flash",
+        "provider": "cerebras",
+        "model": "gpt-oss-120b",
         "temperature": 0,
         "max_tokens": 5000,
         "structured": True,
@@ -128,8 +152,8 @@ AGENT_LLM_CONFIG: dict[str, dict[str, Any]] = {
         ],
     },
     "macro": {
-        "provider": "zai",
-        "model": "glm-4.7-flash",
+        "provider": "cerebras",
+        "model": "gpt-oss-120b",
         "temperature": 0,
         "max_tokens": 5000,
         "structured": True,
@@ -141,8 +165,8 @@ AGENT_LLM_CONFIG: dict[str, dict[str, Any]] = {
         ],
     },
     "fundamental": {
-        "provider": "zai",
-        "model": "glm-4.7-flash",
+        "provider": "cerebras",
+        "model": "gpt-oss-120b",
         "temperature": 0,
         "max_tokens": 5000,
         "structured": True,
@@ -154,8 +178,8 @@ AGENT_LLM_CONFIG: dict[str, dict[str, Any]] = {
         ],
     },
     "sentiment": {
-        "provider": "zai",
-        "model": "glm-4.7-flash",
+        "provider": "cerebras",
+        "model": "gpt-oss-120b",
         "temperature": 0,
         "max_tokens": 5000,
         "structured": True,
@@ -167,8 +191,8 @@ AGENT_LLM_CONFIG: dict[str, dict[str, Any]] = {
         ],
     },
     "quant": {
-        "provider": "zai",
-        "model": "glm-4.7-flash",
+        "provider": "cerebras",
+        "model": "gpt-oss-120b",
         "temperature": 0,
         "max_tokens": 5000,
         "structured": False,
@@ -179,8 +203,8 @@ AGENT_LLM_CONFIG: dict[str, dict[str, Any]] = {
         ],
     },
     "risk_manager": {
-        "provider": "zai",
-        "model": "glm-4.7-flash",
+        "provider": "cerebras",
+        "model": "gpt-oss-120b",
         "temperature": 0,
         "max_tokens": 5000,
         "structured": True,
@@ -192,8 +216,8 @@ AGENT_LLM_CONFIG: dict[str, dict[str, Any]] = {
         ],
     },
     "report_writer": {
-        "provider": "zai",
-        "model": "glm-4.7-flash",
+        "provider": "cerebras",
+        "model": "gpt-oss-120b",
         "temperature": 0.3,
         "max_tokens": 5000,
         "structured": False,
@@ -231,6 +255,13 @@ def _get_zai_key() -> str:
     )
 
 
+def _get_cerebras_key() -> str:
+    return (
+        os.environ.get("CEREBRAS_API_KEY", "")
+        or os.environ.get("CERABRAS_API_KEY", "")  # common typo support
+    )
+
+
 def _get_groq_key() -> str:
     return os.environ.get("GROQ_API_KEY", "")
 
@@ -247,7 +278,35 @@ def _resolved_model(config: dict[str, Any]) -> str:
         override = os.environ.get(env_key, "").strip()
         if override:
             return override
+    global_override = _global_llm_model()
+    if global_override:
+        return global_override
     return str(config.get("model", "")).strip()
+
+
+def _create_cerebras_llm(config: dict[str, Any]):
+    key = _get_cerebras_key()
+    if not key:
+        return None
+    try:
+        from langchain_openai import ChatOpenAI  # type: ignore
+
+        model = _resolved_model(config) or "gpt-oss-120b"
+        base_url = os.environ.get("CEREBRAS_BASE_URL", "").strip() or "https://api.cerebras.ai/v1"
+        return ChatOpenAI(
+            model=model,
+            temperature=config.get("temperature", 0),
+            max_tokens=config.get("max_tokens", 5000),
+            api_key=key,
+            base_url=base_url,
+            request_timeout=_LLM_REQUEST_TIMEOUT_SEC,
+        )
+    except ImportError:
+        print("   [LLM Router] ⚠️ langchain-openai 미설치", flush=True)
+        return None
+    except Exception as exc:
+        print(f"   [LLM Router] ⚠️ Cerebras 생성 실패: {exc}", flush=True)
+        return None
 
 
 def _create_zai_llm(config: dict[str, Any]):
@@ -322,6 +381,7 @@ def _create_gemini_llm(config: dict[str, Any]):
 
 
 _PROVIDER_FACTORY = {
+    "cerebras": _create_cerebras_llm,
     "zai": _create_zai_llm,
     "groq": _create_groq_llm,
     "gemini": _create_gemini_llm,
@@ -344,7 +404,9 @@ def _is_rate_limit_error(exc: Exception) -> bool:
 
 
 def _provider_label(config: dict[str, Any]) -> str:
-    return f"{config.get('provider', 'unknown')}:{config.get('model', '')}"
+    provider = _normalize_provider_name(str(config.get("provider", "unknown")))
+    model = _resolved_model(config) or str(config.get("model", ""))
+    return f"{provider}:{model}"
 
 
 def _apply_llm_request_interval_guard(agent_name: str, label: str) -> None:
@@ -476,6 +538,10 @@ class _BoundedLLMProxy:
                     if _llm_trace_enabled():
                         for line in _invoke_payload_trace_lines(args, kwargs):
                             _llm_trace(self._agent_name, line)
+                    print(
+                        f"   [LLM Router] {self._agent_name}: API 호출 ({label})",
+                        flush=True,
+                    )
                     try:
                         out = method(*args, **kwargs)
                         record_api_request(label, success=True, category="llm")
@@ -550,6 +616,9 @@ def _build_provider_chain(config: dict[str, Any]) -> list[dict[str, Any]]:
     chain: list[dict[str, Any]] = []
     primary = dict(config)
     primary.pop("fallback_chain", None)
+    provider_override = _global_llm_provider()
+    if provider_override:
+        primary["provider"] = provider_override
     chain.append(primary)
     # TEMP: fallback chain 비활성화 (GLM 단일 경로 강제)
     # for fb in config.get("fallback_chain", []) or []:
@@ -567,7 +636,7 @@ def _build_provider_chain(config: dict[str, Any]) -> list[dict[str, Any]]:
 def get_llm(agent_name: str):
     """
     에이전트별 LLM ChatModel proxy를 반환.
-    - Primary: Z.ai
+    - Primary: AGENT_LLM_CONFIG + (optional) global env override
     - Fallback: AGENT_LLM_CONFIG[fallback_chain]
     """
     config = AGENT_LLM_CONFIG.get(agent_name)
@@ -580,7 +649,7 @@ def get_llm(agent_name: str):
 
     backends: list[tuple[str, Any]] = []
     for candidate in _build_provider_chain(config):
-        provider = str(candidate.get("provider", "zai")).strip().lower()
+        provider = _normalize_provider_name(str(candidate.get("provider", "zai")))
         factory = _PROVIDER_FACTORY.get(provider)
         if factory is None:
             print(f"   [LLM Router] ⚠️ 알 수 없는 provider: {provider}", flush=True)
