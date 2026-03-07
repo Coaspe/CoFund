@@ -53,6 +53,8 @@ import telemetry
 from data_providers.data_hub import DataHub
 from data_providers.web_research_provider import WebResearchProvider
 from data_providers.sec_edgar_provider import SECEdgarProvider
+from data_providers.tavily_search_provider import TavilySearchProvider
+from data_providers.exa_search_provider import ExaSearchProvider
 from data_providers.perplexity_search_provider import PerplexitySearchProvider
 
 # ── Agents ────────────────────────────────────────────────────────────────
@@ -2538,8 +2540,10 @@ def _resolve_request_with_priority(
     *,
     sec: SECEdgarProvider,
     web: WebResearchProvider,
-    perplexity: PerplexitySearchProvider | None,
-    as_of: str,
+    tavily: TavilySearchProvider | None = None,
+    exa: ExaSearchProvider | None = None,
+    perplexity: PerplexitySearchProvider | None = None,
+    as_of: str = "",
 ) -> tuple[list[dict], str]:
     kind = str(req.get("kind", "web_search"))
     ticker = str(req.get("ticker", "")).upper()
@@ -2559,6 +2563,20 @@ def _resolve_request_with_priority(
         )
         if items:
             return items, "web_fallback_ownership"
+        if tavily is not None:
+            items = tavily.collect_evidence(
+                kind=kind, ticker=ticker, query=query, recency_days=recency_days, max_items=max_items,
+                allowlist=allowlist, desk=desk, resolver_path="tavily_fallback_ownership",
+            )
+            if items:
+                return items, "tavily_fallback_ownership"
+        if exa is not None:
+            items = exa.collect_evidence(
+                kind=kind, ticker=ticker, query=query, recency_days=recency_days, max_items=max_items,
+                allowlist=allowlist, desk=desk, resolver_path="exa_fallback_ownership",
+            )
+            if items:
+                return items, "exa_fallback_ownership"
         if perplexity is not None:
             items = perplexity.collect_evidence(
                 kind=kind, ticker=ticker, query=query, recency_days=recency_days, max_items=max_items,
@@ -2587,6 +2605,20 @@ def _resolve_request_with_priority(
         )
         if items:
             return items, "newsapi"
+        if tavily is not None:
+            items = tavily.collect_evidence(
+                kind=kind, ticker=ticker, query=query, recency_days=recency_days, max_items=max_items,
+                allowlist=allowlist, desk=desk, resolver_path="tavily_fallback_ir",
+            )
+            if items:
+                return items, "tavily_fallback_ir"
+        if exa is not None:
+            items = exa.collect_evidence(
+                kind=kind, ticker=ticker, query=query, recency_days=recency_days, max_items=max_items,
+                allowlist=allowlist, desk=desk, resolver_path="exa_fallback_ir",
+            )
+            if items:
+                return items, "exa_fallback_ir"
         if perplexity is not None:
             items = perplexity.collect_evidence(
                 kind=kind, ticker=ticker, query=query, recency_days=recency_days, max_items=max_items,
@@ -2631,6 +2663,20 @@ def _resolve_request_with_priority(
         )
         if items:
             return items, "newsapi_supplement"
+        if tavily is not None:
+            items = tavily.collect_evidence(
+                kind=kind, ticker=ticker, query=query, recency_days=recency_days, max_items=max_items,
+                allowlist=allowlist, desk=desk, resolver_path="tavily_fallback_macro",
+            )
+            if items:
+                return items, "tavily_fallback_macro"
+        if exa is not None:
+            items = exa.collect_evidence(
+                kind=kind, ticker=ticker, query=query, recency_days=recency_days, max_items=max_items,
+                allowlist=allowlist, desk=desk, resolver_path="exa_fallback_macro",
+            )
+            if items:
+                return items, "exa_fallback_macro"
         if perplexity is not None:
             items = perplexity.collect_evidence(
                 kind=kind, ticker=ticker, query=query, recency_days=recency_days, max_items=max_items,
@@ -2646,6 +2692,20 @@ def _resolve_request_with_priority(
     )
     if items:
         return items, "default_web"
+    if tavily is not None:
+        items = tavily.collect_evidence(
+            kind=kind, ticker=ticker, query=query, recency_days=recency_days, max_items=max_items,
+            allowlist=allowlist, desk=desk, resolver_path="tavily_fallback_default",
+        )
+        if items:
+            return items, "tavily_fallback_default"
+    if exa is not None:
+        items = exa.collect_evidence(
+            kind=kind, ticker=ticker, query=query, recency_days=recency_days, max_items=max_items,
+            allowlist=allowlist, desk=desk, resolver_path="exa_fallback_default",
+        )
+        if items:
+            return items, "exa_fallback_default"
     if perplexity is not None:
         items = perplexity.collect_evidence(
             kind=kind, ticker=ticker, query=query, recency_days=recency_days, max_items=max_items,
@@ -2681,6 +2741,8 @@ def research_executor_node(state: InvestmentState) -> dict:
 
     sec = SECEdgarProvider()
     web = WebResearchProvider(mode=mode)
+    tavily = TavilySearchProvider(mode=mode)
+    exa = ExaSearchProvider(mode=mode)
     perplexity = PerplexitySearchProvider(mode=mode)
 
     queries_executed = 0
@@ -2701,6 +2763,8 @@ def research_executor_node(state: InvestmentState) -> dict:
             req,
             sec=sec,
             web=web,
+            tavily=tavily,
+            exa=exa,
             perplexity=perplexity,
             as_of=as_of,
         )

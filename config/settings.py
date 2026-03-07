@@ -28,6 +28,12 @@ class Settings:
     alphavantage_api_key: str = ""
     twelvedata_api_key: str = ""
     sec_user_agent: str = ""
+    tavily_api_key: str = ""
+    tavily_search_depth: str = "basic"
+    exa_api_key: str = ""
+    exa_search_type: str = "auto"
+    perplexity_api_key: str = ""
+    perplexity_model: str = "sonar"
 
     # HTTP
     http_timeout_sec: int = 20
@@ -51,6 +57,12 @@ class Settings:
             alphavantage_api_key=os.environ.get("ALPHAVANTAGE_API_KEY", ""),
             twelvedata_api_key=os.environ.get("TWELVEDATA_API_KEY", ""),
             sec_user_agent=os.environ.get("SEC_USER_AGENT", ""),
+            tavily_api_key=os.environ.get("TAVILY_API_KEY", ""),
+            tavily_search_depth=os.environ.get("TAVILY_SEARCH_DEPTH", "basic"),
+            exa_api_key=os.environ.get("EXA_API_KEY", ""),
+            exa_search_type=os.environ.get("EXA_SEARCH_TYPE", "auto"),
+            perplexity_api_key=os.environ.get("PERPLEXITY_API_KEY", ""),
+            perplexity_model=os.environ.get("PERPLEXITY_MODEL", "sonar"),
             http_timeout_sec=int(os.environ.get("HTTP_TIMEOUT_SEC", "20")),
             cache_dir=os.environ.get("CACHE_DIR", ".cache"),
             cache_ttl_sec=int(os.environ.get("CACHE_TTL_SEC", "3600")),

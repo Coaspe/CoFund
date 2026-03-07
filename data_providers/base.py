@@ -58,6 +58,12 @@ def _configured_data_api_providers() -> set[str]:
         providers.add("twelvedata")
     if cfg.sec_user_agent:
         providers.add("sec_edgar")
+    if cfg.tavily_api_key:
+        providers.add("tavily_search")
+    if cfg.exa_api_key:
+        providers.add("exa_search")
+    if cfg.perplexity_api_key:
+        providers.add("perplexity_search")
     return providers
 
 

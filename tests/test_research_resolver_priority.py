@@ -46,6 +46,21 @@ class _WebStub:
         return []
 
 
+class _SearchStub:
+    def __init__(self):
+        self.calls = []
+        self._next = []
+
+    def queue(self, *returns):
+        self._next = list(returns)
+
+    def collect_evidence(self, **kwargs):
+        self.calls.append(kwargs.get("resolver_path"))
+        if self._next:
+            return self._next.pop(0)
+        return []
+
+
 def test_ownership_identity_sec_first_then_web_fallback():
     req = {"kind": "ownership_identity", "desk": "fundamental", "ticker": "AAPL", "query": "q", "max_items": 3}
     sec = _SecStub(ownership_ok=True)
@@ -88,3 +103,58 @@ def test_macro_headline_context_official_then_newsapi():
     items, path = investment_team._resolve_request_with_priority(req, sec=sec, web=web, as_of="2026-01-01T00:00:00+00:00")
     assert path == "newsapi_supplement"
     assert web.calls == ["official_release", "newsapi_supplement"]
+
+
+def test_default_web_then_tavily_then_perplexity():
+    req = {"kind": "valuation_context", "desk": "fundamental", "ticker": "AAPL", "query": "AAPL valuation", "max_items": 3}
+    sec = _SecStub()
+    web = _WebStub()
+    tavily = _SearchStub()
+    exa = _SearchStub()
+    perplexity = _SearchStub()
+
+    web.queue([])
+    tavily.queue([{"hash": "tavily-hit"}])
+    items, path = investment_team._resolve_request_with_priority(
+        req,
+        sec=sec,
+        web=web,
+        tavily=tavily,
+        exa=exa,
+        perplexity=perplexity,
+        as_of="2026-01-01T00:00:00+00:00",
+    )
+    assert path == "tavily_fallback_default"
+    assert items == [{"hash": "tavily-hit"}]
+    assert web.calls == ["default_web"]
+    assert tavily.calls == ["tavily_fallback_default"]
+    assert exa.calls == []
+    assert perplexity.calls == []
+
+
+def test_default_web_then_exa_then_perplexity_when_tavily_empty():
+    req = {"kind": "valuation_context", "desk": "fundamental", "ticker": "AAPL", "query": "AAPL valuation", "max_items": 3}
+    sec = _SecStub()
+    web = _WebStub()
+    tavily = _SearchStub()
+    exa = _SearchStub()
+    perplexity = _SearchStub()
+
+    web.queue([])
+    tavily.queue([])
+    exa.queue([{"hash": "exa-hit"}])
+    items, path = investment_team._resolve_request_with_priority(
+        req,
+        sec=sec,
+        web=web,
+        tavily=tavily,
+        exa=exa,
+        perplexity=perplexity,
+        as_of="2026-01-01T00:00:00+00:00",
+    )
+    assert path == "exa_fallback_default"
+    assert items == [{"hash": "exa-hit"}]
+    assert web.calls == ["default_web"]
+    assert tavily.calls == ["tavily_fallback_default"]
+    assert exa.calls == ["exa_fallback_default"]
+    assert perplexity.calls == []
