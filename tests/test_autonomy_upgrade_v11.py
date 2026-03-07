@@ -11,6 +11,7 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
+import agents.macro_agent as macro_agent
 from agents.fundamental_agent import fundamental_analyst_run
 from agents.macro_agent import macro_analyst_run
 from agents.sentiment_agent import sentiment_analyst_run
@@ -122,7 +123,8 @@ def test_research_router_converts_open_questions_to_requests():
     assert any("금리" in q for q in queries)
 
 
-def test_evidence_digest_is_consumed_on_desk_run():
+def test_evidence_digest_is_consumed_on_desk_run(monkeypatch):
+    monkeypatch.setattr(macro_agent, "apply_llm_overlay_macro", lambda *args, **kwargs: {})
     state = {
         "evidence_store": {
             "h1": {
