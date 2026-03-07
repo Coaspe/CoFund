@@ -6,6 +6,7 @@ llm/router.py — Multi-Provider LLM Router (bounded concurrency)
 핵심 정책:
   - Global default: LLM_PROVIDER + LLM_MODEL_NAME
   - Current default fallback: cerebras + gpt-oss-120b
+  - Cerebras rate-limit fallback: qwen-3-235B-A22B-2507
   - Agent-level override: <AGENT>_MODEL (기존 동작 유지)
   - Global concurrent LLM invokes: 기본 1개 (초과 시 대기 + 콘솔 로그)
   - Rate limit 감지 시 콘솔 로그 + fallback 시도
@@ -133,6 +134,7 @@ _LLM_TRACE_PREVIEW_CHARS = max(80, _safe_int_env("LLM_TRACE_PREVIEW_CHARS", 260)
 _LLM_MIN_REQUEST_INTERVAL_SEC = max(0.0, _llm_min_request_interval_sec())
 _LLM_REQUEST_GUARD_LOCK = threading.Lock()
 _LLM_LAST_REQUEST_TS = 0.0
+_CEREBRAS_RL_FALLBACK_MODEL = "qwen-3-235B-A22B-2507"
 
 
 # ── Agent config ──────────────────────────────────────────────────────────────
@@ -273,6 +275,9 @@ def _get_gemini_key() -> str:
 # ── Provider constructors ─────────────────────────────────────────────────────
 
 def _resolved_model(config: dict[str, Any]) -> str:
+    forced = str(config.get("_forced_model", "")).strip()
+    if forced:
+        return forced
     env_key = str(config.get("env_model_key", "")).strip()
     if env_key:
         override = os.environ.get(env_key, "").strip()
@@ -620,6 +625,14 @@ def _build_provider_chain(config: dict[str, Any]) -> list[dict[str, Any]]:
     if provider_override:
         primary["provider"] = provider_override
     chain.append(primary)
+    primary_provider = _normalize_provider_name(str(primary.get("provider", "")))
+    primary_model = _resolved_model(primary).lower()
+    if primary_provider == "cerebras" and primary_model == "gpt-oss-120b":
+        # Cerebras gpt-oss-120b가 rate limit일 때 사용할 동일 provider 모델 fallback
+        rl_fallback = dict(primary)
+        rl_fallback["model"] = _CEREBRAS_RL_FALLBACK_MODEL
+        rl_fallback["_forced_model"] = _CEREBRAS_RL_FALLBACK_MODEL
+        chain.append(rl_fallback)
     # TEMP: fallback chain 비활성화 (GLM 단일 경로 강제)
     # for fb in config.get("fallback_chain", []) or []:
     #     if not isinstance(fb, dict):

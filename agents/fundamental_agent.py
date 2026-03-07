@@ -132,12 +132,13 @@ _PATCHABLE_FIELDS = {
 
 
 def _request_key(req: dict) -> tuple:
+    query = " ".join(str(req.get("query", "")).strip().lower().split())
     return (
-        req.get("desk", ""),
-        req.get("kind", ""),
-        req.get("ticker", ""),
-        req.get("series_id", ""),
-        req.get("query", ""),
+        str(req.get("desk", "")).strip().lower(),
+        str(req.get("kind", "")).strip().lower(),
+        str(req.get("ticker", "")).strip().upper(),
+        str(req.get("series_id", "")).strip(),
+        query,
     )
 
 
@@ -293,9 +294,49 @@ def _generate_evidence_requests(
     vs: dict,
     fs: dict,
     financials: dict,
+    asset_type: str = "EQUITY",
     focus_areas: Optional[list[str]] = None,
 ) -> list:
     """펀더멘탈 evidence request 생성."""
+    at = str(asset_type or "EQUITY").upper()
+    if at in {"ETF", "INDEX"}:
+        reqs = [
+            {
+                "desk": "fundamental",
+                "kind": "valuation_context",
+                "ticker": ticker,
+                "query": f"{ticker} holdings top 10 sector weights factor exposures index forward PE",
+                "priority": 1,
+                "recency_days": 30,
+                "max_items": 5,
+                "rationale": f"{at.lower()} mode: holdings/sector/valuation aggregate",
+            },
+            {
+                "desk": "fundamental",
+                "kind": "web_search",
+                "ticker": ticker,
+                "query": f"{ticker} ETF flow creation redemption tracking error expense ratio liquidity",
+                "priority": 2,
+                "recency_days": 30,
+                "max_items": 5,
+                "rationale": f"{at.lower()} mode: flow/liquidity diagnostics",
+            },
+        ]
+        for focus in (focus_areas or [])[:2]:
+            reqs.append(
+                {
+                    "desk": "fundamental",
+                    "kind": "valuation_context",
+                    "ticker": ticker,
+                    "query": f"{ticker} {focus} sector breadth valuation",
+                    "priority": 3,
+                    "recency_days": 120,
+                    "max_items": 3,
+                    "rationale": f"{at.lower()} focus follow-up: {focus}",
+                }
+            )
+        return reqs
+
     reqs = []
     stretch = vs.get("stretch_level", "low")
     if stretch in ("high", "unknown") and vs.get("confidence_down"):
@@ -414,6 +455,7 @@ def fundamental_analyst_run(
     peers: Optional[list] = None,
     focus_areas: Optional[list[str]] = None,
     state: Optional[dict] = None,
+    asset_type: str = "EQUITY",
 ) -> dict:
     """
     Fundamental Analyst v2: structural risk + factor_scores + valuation_stretch
@@ -421,6 +463,7 @@ def fundamental_analyst_run(
     """
     as_of = as_of or datetime.now(timezone.utc).isoformat()
     focus_areas = [str(x).strip() for x in (focus_areas or []) if str(x).strip()]
+    asset_type = str(asset_type or "EQUITY").upper()
 
     sr = compute_structural_risk(financials, sec_data)
     fs = compute_factor_scores(financials, history, peers)
@@ -512,6 +555,14 @@ def fundamental_analyst_run(
         confidence = 0.60
         notes = "핵심 구조적 리스크 없음. 재무 건전성 양호."
 
+    if asset_type in {"ETF", "INDEX"}:
+        primary_decision = "neutral"
+        recommendation = "allow_with_limits"
+        confidence = min(confidence, 0.55)
+        notes = (
+            f"{asset_type} 모드: 기업 단일 재무 대신 holdings/sector/flow/aggregate valuation 중심으로 평가."
+        )
+
     avg_score = (quality_score + growth_score + fs.get("cashflow_score", 0.5)) / 3
     if stretch_flag:
         avg_score *= 0.7
@@ -534,7 +585,15 @@ def fundamental_analyst_run(
     if stretch_level == "unknown":
         limitations.append("Valuation data 부족 — stretch 판단 불가")
 
-    ev_reqs = _generate_evidence_requests(ticker, sr, vs, fs, financials, focus_areas)
+    ev_reqs = _generate_evidence_requests(
+        ticker,
+        sr,
+        vs,
+        fs,
+        financials,
+        asset_type=asset_type,
+        focus_areas=focus_areas,
+    )
 
     key_drivers = _build_key_drivers(sr, vs, fs)
     what_to_watch = _build_what_to_watch(sr, vs, financials)
@@ -583,6 +642,8 @@ def fundamental_analyst_run(
         "generated_at": datetime.now(timezone.utc).isoformat(),
         "as_of": as_of,
         "ticker": ticker,
+        "asset_type": asset_type,
+        "analysis_mode": "etf_index" if asset_type in {"ETF", "INDEX"} else "equity",
         "horizon_days": horizon_days,
         "focus_areas": focus_areas,
         "primary_decision": primary_decision,
@@ -620,12 +681,22 @@ def fundamental_analyst_run(
         "notes_for_risk_manager": notes,
         "needs_more_data": bool(ev_reqs),
         "evidence_requests": ev_reqs,
+        "etf_index_block": {
+            "holdings_top10_weight_pct": financials.get("holdings_top10_weight_pct"),
+            "sector_weights": financials.get("sector_weights", {}),
+            "factor_exposures": financials.get("factor_exposures", {}),
+            "index_forward_pe": financials.get("index_forward_pe"),
+            "net_flow_1m": financials.get("net_flow_1m"),
+            "tracking_error": financials.get("tracking_error"),
+            "expense_ratio": financials.get("expense_ratio"),
+            "liquidity_score": financials.get("liquidity_score"),
+        },
         # Backward compat
-        "sector": financials.get("sector", "Unknown"),
-        "revenue_growth": financials.get("revenue_growth"),
-        "roe": financials.get("roe"),
+        "sector": financials.get("sector", "ETF/Index Basket" if asset_type in {"ETF", "INDEX"} else "Unknown"),
+        "revenue_growth": None if asset_type in {"ETF", "INDEX"} else financials.get("revenue_growth"),
+        "roe": None if asset_type in {"ETF", "INDEX"} else financials.get("roe"),
         "debt_to_equity": financials.get("debt_to_equity"),
-        "pe_ratio": financials.get("pe_ratio"),
+        "pe_ratio": None if asset_type in {"ETF", "INDEX"} else financials.get("pe_ratio"),
     }
 
     patch = apply_llm_overlay_fundamental(output, state, focus_areas, evidence_digest)

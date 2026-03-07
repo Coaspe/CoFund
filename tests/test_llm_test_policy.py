@@ -187,3 +187,15 @@ def test_global_llm_env_override_cerabras_typo_supported(monkeypatch):
     chain = router._build_provider_chain(cfg)
     assert chain[0]["provider"] == "cerebras"
     assert router._resolved_model(chain[0]) == "gpt-oss-120b"
+
+
+def test_cerebras_gpt_oss_has_qwen_rate_limit_fallback(monkeypatch):
+    from llm import router
+
+    monkeypatch.setenv("LLM_PROVIDER", "cerebras")
+    monkeypatch.setenv("LLM_MODEL_NAME", "gpt-oss-120b")
+    cfg = dict(router.AGENT_LLM_CONFIG["orchestrator"])
+    chain = router._build_provider_chain(cfg)
+    assert len(chain) >= 2
+    assert chain[1]["provider"] == "cerebras"
+    assert router._resolved_model(chain[1]) == "qwen-3-235B-A22B-2507"

@@ -122,12 +122,13 @@ _PATCHABLE_FIELDS = {
 
 
 def _request_key(req: dict) -> tuple:
+    query = " ".join(str(req.get("query", "")).strip().lower().split())
     return (
-        req.get("desk", ""),
-        req.get("kind", ""),
-        req.get("ticker", ""),
-        req.get("series_id", ""),
-        req.get("query", ""),
+        str(req.get("desk", "")).strip().lower(),
+        str(req.get("kind", "")).strip().lower(),
+        str(req.get("ticker", "")).strip().upper(),
+        str(req.get("series_id", "")).strip(),
+        query,
     )
 
 
@@ -275,6 +276,7 @@ def _generate_evidence_requests(
     catalyst: dict,
     news_info: dict,
     vol_info: dict,
+    no_articles: bool = False,
     focus_areas: Optional[list[str]] = None,
 ) -> list:
     """센티먼트 evidence request 생성."""
@@ -323,6 +325,31 @@ def _generate_evidence_requests(
                 "rationale": "vol_regime=crisis but source=default_fallback",
             }
         )
+    if no_articles:
+        reqs.extend(
+            [
+                {
+                    "desk": "sentiment",
+                    "kind": "macro_headline_context",
+                    "ticker": ticker,
+                    "query": "VIX VVIX SKEW put call ratio options implied volatility skew regime",
+                    "priority": 1,
+                    "recency_days": 7,
+                    "max_items": 4,
+                    "rationale": "no_articles_provided -> fallback to vol/options regime data",
+                },
+                {
+                    "desk": "sentiment",
+                    "kind": "web_search",
+                    "ticker": ticker,
+                    "query": f"{ticker} ETF flow creation redemption options put call skew",
+                    "priority": 2,
+                    "recency_days": 14,
+                    "max_items": 4,
+                    "rationale": "no_articles_provided -> fallback to flow/options data",
+                },
+            ]
+        )
 
     for focus in (focus_areas or [])[:2]:
         reqs.append(
@@ -338,7 +365,15 @@ def _generate_evidence_requests(
             }
         )
 
-    return reqs
+    deduped = []
+    seen = set()
+    for req in reqs:
+        key = _request_key(req)
+        if key in seen:
+            continue
+        seen.add(key)
+        deduped.append(req)
+    return deduped
 
 
 # ── Main pipeline ─────────────────────────────────────────────────────────────
@@ -387,6 +422,7 @@ def sentiment_analyst_run(
         }
     )
     news_volume_z = news_info.get("news_volume_z")
+    no_articles = bool(news_info.get("effective_article_count", 0) == 0 or "no_articles_provided" in (news_info.get("data_quality", {}).get("warnings", []) or []))
 
     velocity = compute_sentiment_velocity(score_series or [])
 
@@ -462,6 +498,8 @@ def sentiment_analyst_run(
 
     data_ok = bool([e for e in evidence if e.get("source_name") != "sentiment_engine"])
     warnings = list(news_info.get("data_quality", {}).get("warnings", []))
+    if no_articles:
+        warnings.append("fallback_to_vol_flow_options")
     if vol_info.get("warnings"):
         warnings.extend(vol_info["warnings"])
 
@@ -472,7 +510,15 @@ def sentiment_analyst_run(
     if not articles:
         limitations.append("뉴스 기사 미제공 — news_volume_z 계산 불가")
 
-    ev_reqs = _generate_evidence_requests(ticker, features, catalyst, news_info, vol_info, focus_areas)
+    ev_reqs = _generate_evidence_requests(
+        ticker,
+        features,
+        catalyst,
+        news_info,
+        vol_info,
+        no_articles=no_articles,
+        focus_areas=focus_areas,
+    )
 
     features["_velocity"] = velocity
     key_drivers = _build_key_drivers(features, news_info, catalyst, vol_info)
@@ -513,6 +559,7 @@ def sentiment_analyst_run(
         "missing_fields": missing_fields,
         "anomaly_flags": warnings,
         "is_mock": source_name == "mock",
+        "risk_from_missing_data": no_articles,
         "source_timestamps": {},
     }
 
@@ -526,7 +573,7 @@ def sentiment_analyst_run(
         "focus_areas": focus_areas,
         "primary_decision": primary_decision,
         "recommendation": "allow_with_limits",
-        "confidence": 0.45 if data_ok else 0.30,
+        "confidence": (0.20 if no_articles else (0.45 if data_ok else 0.30)),
         "signal_strength": abs(tilt - 1.0) / 0.3,
         "risk_flags": risk_flags,
         "evidence": evidence,
