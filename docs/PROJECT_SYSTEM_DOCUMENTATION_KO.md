@@ -1,41 +1,51 @@
-# AI Investment Team 프로젝트 상세 문서 (온보딩/LLM 자문용)
+# AI Investment Team 프로젝트 상세 문서 (비개발자 친화판)
 
-작성 기준일: 2026-02-23  
+작성 기준일: 2026-02-25  
 대상 저장소: `ai-investment-team`  
-목적: 처음 보는 사람/다른 LLM이 **프로그램 목적, 동작 방식, 에이전트 판단 기준, 파일 책임**을 빠르게 이해하도록 돕는 기준 문서
+문서 목적: 코드를 모르는 사람도 "이 시스템이 왜, 언제, 어떤 기준으로 움직이는지" 이해할 수 있도록 설명한다.
 
 ---
 
-## 1) 프로젝트 목적과 범위
+## 0) 이 문서 읽는 법
 
-이 프로젝트는 단일 종목(혹은 오케스트레이터가 제시한 유니버스) 투자 아이디어를 다음 방식으로 검토하는 **멀티 에이전트 의사결정 파이프라인**입니다.
+이 문서는 모든 섹션을 같은 방식으로 설명한다.
 
-1. 데이터 수집(`data_providers`)  
-2. 수치 계산(`engines`)  
-3. 에이전트 해석(`agents`)  
-4. 리스크 게이트(`agents/risk_agent.py` 또는 `risk/engine.py`)  
-5. 최종 보고서 작성(`agents/report_agent.py`)
+- `기술 설명`: 코드/변수 기준으로 정확하게 설명
+- `쉽게 말해`: 비개발자 관점으로 번역
+- `실무 예시`: 실제 로그나 운영에서 어떻게 보이는지
 
-핵심 목표:
-- 정량/정성 분석을 분리하고
-- 리스크 게이트를 강제하며
-- 실행 로그(`runs/{run_id}`)를 남기는 것
-
-명시적 비목표:
-- 실제 주문 실행(브로커 API) 없음
+핵심 원칙:
+- 이 시스템은 **분석/판단** 시스템이다.
+- 실제 주문을 내리는 코드(브로커 API)는 없다.
 
 ---
 
-## 2) 실행 진입점과 전체 제어 흐름
+## 1) 5분 요약
 
-메인 진입점:
+이 프로젝트는 "한 명의 PM(Orchestrator) + 4개 분석 데스크 + 리스크 위원회" 구조로 돌아가는 자동 투자 검토 파이프라인이다.
+
+- Orchestrator: 이번 라운드에 누가 무엇을 볼지 지시
+- Macro/Fundamental/Sentiment/Quant: 각자 전문 관점으로 분석
+- Research Router/Executor: 근거가 부족하면 자동으로 추가 조사
+- Risk Manager: 5개 게이트로 최종 리스크 심사
+- Report Writer: 투자심의 메모 작성
+
+쉽게 말해:
+- 사람으로 치면 "팀장 -> 실무자 보고 -> 심사위원회 -> 최종 보고서" 흐름이다.
+- 데이터가 약하면 자동으로 "자료 더 찾아와"를 수행한다.
+
+---
+
+## 2) 전체 흐름
+
+### 2.1 메인 실행 경로
+
+실행 진입점:
 - `investment_team.py`
 
 실행 예:
 - `python investment_team.py --mode mock --seed 42`
 - `python investment_team.py --mode live --seed 42`
-
-실행 그래프(LangGraph):
 
 ```mermaid
 flowchart LR
@@ -48,550 +58,531 @@ flowchart LR
     D --> G
     E --> G
     F --> G
-    G --> H["risk_manager"]
-    H -->|High & feedback required & iteration < 3| B
-    H -->|otherwise| I["report_writer"]
+    G --> R["research_router"]
+    R -->|"run_research=true"| X["research_executor"]
+    X --> RC["rerun selected desks"]
+    RC --> RB["research_barrier"]
+    RB --> R
+    R -->|"run_research=false"| H["risk_manager"]
+    H -->|"High + feedback + iter<3"| B
+    H -->|"otherwise"| I["report_writer"]
     I --> J["END"]
 ```
 
-리서치 확장 경로(정책 트리거 기반):
+기술 설명:
+- 최대 오케스트레이터 반복: `MAX_ITERATIONS = 3`
+- 리서치 라운드 기본 상한: `max_research_rounds = 2`
 
-```mermaid
-flowchart LR
-    G["barrier"] --> R["research_router"]
-    R -->|run_research=true| X["research_executor"]
-    X --> RC["research desk rerun (선택 desk만)"]
-    RC --> RB["research_barrier (carry-forward)"]
-    RB --> R
-    R -->|run_research=false| H["risk_manager"]
-```
+쉽게 말해:
+- 한 번에 결론 안 나면 최대 3번까지 전략을 수정해본다.
+- 근거 수집도 무한 반복하지 않고 기본 2라운드에서 끊는다.
 
-핵심 루프 조건:
-- `risk_assessment.grade == "High"` 이고
-- `orchestrator_feedback.required == True` 이고
-- `iteration_count < 3` 일 때만 오케스트레이터로 재진입
-
-실제 관찰된 기본 패턴(mock):
-1. 초기 위임
-2. 리스크 반려 시 scale/hedge
-3. 재반려 시 pivot
-4. 반복 한도 도달 후 보고서로 종료
+실무 예시:
+1. 초기 위임(initial delegation)
+2. 리스크 반려 -> scale down / hedge / pivot
+3. 필요 시 추가 조사
+4. 반복 한도 도달 혹은 승인 시 최종 보고서
 
 ---
 
-## 3) 상태 모델 (`schemas/common.py`)
+## 3) 핵심 용어 사전 (비개발자 버전)
 
-공유 상태 타입:
-- `InvestmentState` (TypedDict)
+아래는 로그/상태 파일에서 자주 보이는 필드를 실제 의미로 풀어쓴 표다.
 
-중요 필드:
-- `run_id`, `as_of`, `mode`
-- `target_ticker`, `analysis_tasks`, `iteration_count`
-- `macro_analysis`, `fundamental_analysis`, `sentiment_analysis`, `technical_analysis`
-- `risk_assessment`, `final_report`
-- `completed_tasks` (dict merge reducer)
-- `trace`, `errors` (list append reducer)
-- `research_round`, `max_research_rounds`
-- `evidence_requests`(append+dedupe), `evidence_store`, `evidence_score`
-- `last_research_delta`, `research_stop_reason`
-
-유틸리티:
-- `create_initial_state()`
-- `make_evidence()`, `make_risk_flag()`
-- `first_not_none()`, `compute_signed_weight()`, `compute_disagreement_score()`
-
-중요 포인트:
-- `completed_tasks`는 병렬 노드 fan-in 시 병합됨
-- `barrier_node`가 실행 누락 데스크를 `status="skipped"`로 표준화함
-- `research_router_node`만 `plan_additional_research(...)`를 호출하며, research loop는 `iteration_count`를 증가시키지 않음
-- `last_research_delta`는 `research_executor` 1회 종료 시점에만 갱신됨(신규 unique hash 개수)
-
-### 3.1 Research Policy 고정 규칙
-
-- `evidence_score = coverage(0~40) + freshness(0~25) + source_trust(0~25) - contradiction_penalty(0~15)`
-- coverage: `earnings/macro/ownership/valuation` 버킷 충족당 +10
-- freshness: 증거 age-day 기반 점수 평균
-- source trust: 도메인 tier 평균(`official 1.0 / wire 0.8 / news 0.6 / other 0.4`)을 25점으로 스케일
-- contradiction penalty: 동일 `(ticker,kind)` 그룹 내 상반 신호 공존 시 그룹당 5점, 최대 15점
-- 조기 종료:
-  - `evidence_score >= 75`
-  - `last_research_delta < 2`
-  - `research_round >= max_research_rounds`
-  - query budget 초과
-
-### 3.2 Resolver 우선순위
-
-- `ownership_identity`: `SECEdgarProvider(Form4/13F/13D/13G)` 우선, 실패 시 web fallback
-- `press_release_or_ir`: SEC 8-K 우선 → IR domain → NewsAPI
-- `macro_headline_context`: 공식 기관 릴리즈 우선 → NewsAPI 보조
-
-### 3.3 Web Fetch 보안 정책
-
-- HTTPS only
-- redirect 최종 도메인 allowlist 재검사
-- private/loopback/link-local/reserved IP 차단
-- timeout/size limit 강제
-- allowlist 밖 fetch 금지
-- fetch 대상: NewsAPI allowlist 통과 URL 또는 구조화 provider의 공식 URL만 허용
-
-### 3.4 Autonomy Upgrade v1.1 (Explicit ReAct)
-
-핵심 철학:
-- 엔진(`engines/*`)은 계산만 담당
-- LLM overlay는 해석/질문 생성/추가 리서치 계획만 담당
-
-추가된 자율성 구성:
-- `orchestrator_directives.desk_tasks`의 `horizon_days/focus_areas`를 desk 실행 시 실제 반영
-- desk 출력에 `open_questions / decision_sensitivity / followups` 표준 필드 추가
-- desk가 `evidence_store`를 읽어 `evidence_digest` 생성 및 서사(`key_drivers`, `what_to_watch`) 갱신
-- `research_router`가 requests가 빈약하면 baseline seed(earnings/macro/ownership/valuation)를 자동 삽입
-- desk의 `open_questions`를 `evidence_requests`로 변환해 research loop로 이관
-
-Explicit ReAct phase 적용 방식(출력은 구조화 필드만):
-1. THOUGHT: 내부 gap scan (출력 직접 노출 금지)
-2. ACTION: `open_questions`, `evidence_requests`, `followups` 생성
-3. OBSERVATION: `evidence_digest` 기반 narrative 갱신
-4. REFLECTION: `decision_sensitivity` 갱신, 조건부 결론 강도 명시
-
-안전/호환성:
-- LLM 실패/미설정 시 deterministic fallback 유지
-- LLM overlay 출력은 JSON patch only, 허용 필드만 반영
-- 기존 출력 키는 유지하고 새 키만 추가
-- Sentiment `tilt_factor`는 overlay 이후에도 `[0.7, 1.3]` 재검증
+| 기술 용어 | 실제 의미 | 왜 중요한가 |
+|---|---|---|
+| `open_questions` | 현재 결론을 바꿀 수 있는 "미해결 핵심 질문" 목록 | 다음 조사 우선순위를 정함 |
+| `evidence_requests` | open question을 풀기 위해 실제로 보낼 조사 요청 목록 | 리서치 실행 입력값 |
+| `evidence_digest` | 이미 모인 근거를 desk가 읽기 쉬운 요약으로 정리한 것 | rerun 시 출력이 실제로 바뀌게 하는 재료 |
+| `decision_sensitivity` | 어떤 조건이 바뀌면 현재 결론이 바뀌는지 | 결론의 취약점/민감도 파악 |
+| `followups` | 다음 라운드에서 할 후속 액션 제안 | 자동 self-heal 실행 후보 |
+| `needs_more_data` | 지금 데이터로는 확신하기 어렵다는 신호 | 리서치 트리거 강화 |
+| `primary_decision` | 방향성 결론(예: bullish/neutral/bearish) | 의사결정의 중심 축 |
+| `recommendation` | 실행 권고 강도(allow/allow_with_limits/reject) | 리스크 승인과 직접 연결 |
+| `tilt_factor` | 감성 데스크가 제안하는 전술적 가감 계수 | 포지션 강도 조절 |
+| `research_need_score` | "추가 조사가 얼마나 필요한지" 점수 | 리서치 실행 여부 핵심 기준 |
+| `impact_score` | 빠진 정보가 결과에 미칠 영향도 | 중요 정보 누락 감지 |
+| `uncertainty_score` | 현재 결론의 불확실성 정도 | 애매한 상황 감지 |
+| `last_research_delta` | 직전 리서치로 새로 얻은 근거 개수 | 더 조사할 가치가 남았는지 판단 |
+| `_executed_requests` | 이번 리서치에서 실제 실행된 요청 감사 로그 | 무엇을 실제로 했는지 추적 |
+| `_rerun_plan` | 어떤 desk를 왜 rerun할지 계획 | rerun 선택의 근거 추적 |
+| `_swarm_candidates` | 조사 후보군(원본+보강 포함) | planner 입력의 감사 흔적 |
+| `_swarm_plan` | planner가 정리한 최종 후보 계획 | allowlist/budget 적용 전후 분석 |
 
 ---
 
-## 4) 에이전트별 동작 방식 (가장 중요)
+## 4) 상태 모델(InvestmentState) 쉽게 이해하기
 
-## 4.1 Orchestrator (`agents/orchestrator_agent.py`)
+### 4.1 상태를 한 문장으로
 
-역할:
-- 사용자 요청을 해석해 4개 데스크 태스크를 발행
-- 리스크 피드백을 받아 전략 수정
+`InvestmentState`는 "현재 회의가 어디까지 진행됐고, 누가 어떤 근거로 어떤 판단을 했는지"를 담는 단일 공유 보드다.
 
-판단 모드:
-1. `iteration == 0`: `initial_delegation`
-2. `iteration >= 1`: `scale_down` 또는 `add_hedge` 또는 `pivot_strategy`
-3. `iteration >= 3`: `fallback_abort`
+### 4.2 자주 보는 상태 필드
 
-의사결정 기준:
-- 구조적 반려 사유(`structural_risk`, `going_concern`, `accounting_fraud`)가 있으면 pivot 우선
-- 집중도 사유면 hedge 쪽으로 기울고, 그 외는 scale_down
-- 2회차 재시도는 pivot 강제
+- `run_id`, `as_of`, `mode`: 이번 실행의 신분증
+- `macro_analysis/fundamental_analysis/...`: 데스크별 결과 본문
+- `evidence_store`: 모인 근거 원문 저장소
+- `evidence_score`: 근거 품질 종합 점수
+- `research_round`: 추가 조사 몇 라운드째인지
+- `completed_tasks`: 이번 라운드에서 끝난 desk
+- `trace/events`: 왜 이런 경로를 탔는지 감사 정보
 
-인텐트 규칙 분류(`classify_intent_rules`):
-- `single_ticker_entry`
-- `overheated_check`
-- `compare_tickers`
-- `market_outlook`
-- `event_risk`
+### 4.3 seed 동작
 
-LLM 전략:
-- LLM 우선 시도 + 규칙 fallback
-- `plan_cache`와 `llm_router` 캐시 사용
-- LLM 실패/검증실패 시 항상 규칙 기반 플랜으로 복귀
+기술 설명:
+- CLI `--seed`는 `create_initial_state(..., seed=...)`로 전달된다.
+- 현재 `_make_seed`는 `state.get("seed")`를 우선 참조한다.
+- top-level `seed`가 없으면 `run_id` 해시 기반 시드를 사용한다.
 
-출력 핵심:
-- `target_ticker`
-- `iteration_count + 1`
-- `orchestrator_directives`(action_type, investment_brief, desk_tasks)
+쉽게 말해:
+- 같은 seed를 줘도 상태에 seed가 어떻게 들어오느냐에 따라 재현성이 달라질 수 있다.
 
 ---
 
-## 4.2 Macro Analyst (`agents/macro_agent.py` + `engines/macro_engine.py`)
+## 5) Research Loop(자동 추가 조사) 상세
 
-역할:
-- 매크로 지표를 레짐/리스크온오프로 변환
+## 5.1 왜 리서치 루프가 필요한가
 
-주요 계산:
-- `compute_macro_features()`: curve/credit/inflation/growth/policy 버킷
-- `compute_macro_axes()`: growth/inflation/rates/credit/liquidity 5축 점수(-3~+3)
-- `compute_risk_on_off()`: 가중 합으로 risk_score(-100~100), risk_on/off 판정
-- `compute_overlay_guidance()`: 레짐별 오버레이 제안
+초기 분석만으로는 근거가 비거나(coverage 부족), desk끼리 결론이 충돌할 수 있다. 이때 자동으로 근거를 더 모아 결론 신뢰도를 올린다.
 
-핵심 임계값 예시:
-- HY OAS > 600 => credit crisis
-- curve inverted + growth below trend => contraction
-- risk_score >= 30 => risk_on, <= -20 => risk_off
+## 5.2 research_router가 하는 일
 
-최종 판단:
-- `risk_on_off`, tail risk 여부, inflation/rates 조합으로
-  - `primary_decision` (bullish/neutral/bearish)
-  - `recommendation` (allow/allow_with_limits/reject) 결정
+입력 소스(우선순위):
+1. 기존 `raw_requests`(desk가 직접 낸 요청)
+2. `open_questions`를 요청 형태로 변환한 것
+3. coverage 버킷 결손(또는 후보가 비었을 때) baseline seed
+4. 런타임 복구 플래너(recovery)가 추가한 요청
+5. desk 간 결론 충돌(disagreement) 보정 요청
 
-출력 강화:
-- `key_drivers`, `what_to_watch`, `scenario_notes` 생성
+버킷(coverage):
+- earnings (실적/가이던스/IR 발표 근거)
+- macro (금리·물가·성장 같은 거시 근거)
+- ownership (누가 얼마나 샀는지/팔았는지 보유자 근거)
+- valuation (현재 가격이 비싼지 싼지 평가 근거)
 
----
+기술 설명:
+- planner 후보는 dedupe 후 안정 정렬(stable + deterministic tie-breaker)
+- 후보가 하나라도 있으면 planner(`plan_additional_research`)를 호출
+- 호출 결과가 `None`이면 후보 그대로 사용
 
-## 4.3 Fundamental Analyst (`agents/fundamental_agent.py` + `engines/fundamental_engine.py`)
+쉽게 말해:
+- "처음부터 요청이 하나도 없어도" 시스템이 스스로 조사 계획을 만든다.
+- 필요하면 "복구용 요청"과 "의견충돌 해소 요청"도 자동으로 섞어서 후보를 만든다.
 
-역할:
-- 재무 건전성/구조 리스크/밸류 스트레치 평가
+용어 짧은 해설:
+- `raw_requests`: 각 desk가 \"추가로 찾아달라\"고 제출한 원본 요청
+- `plan_additional_research`: 후보 요청을 우선순위/예산 기준으로 정리하는 planner 단계
+- `dedupe`: 같은 요청을 중복 실행하지 않도록 하나만 남기는 정리
 
-핵심 계산:
-- `compute_structural_risk()`
-  - Hard flag: `going_concern`, `material_weakness`, `restatement`, `regulatory_action`, `default_risk`
-  - Hard flag 하나라도 있으면 `structural_risk_flag=True`
-- `compute_factor_scores()`
-  - value/quality/growth/leverage/cashflow (0~1)
-- `compute_valuation_stretch()`
-  - history/peer 우선
-  - 없으면 absolute 임계치 fallback
+## 5.3 리서치 실행 트리거 기준
 
-중요 판단 규칙:
-- `structural_risk_flag=True` => `recommendation="reject"`, `primary_decision="avoid"`
-- stretch 높고 성장 약하면 bearish + 제한
-- 성장 특례(`revenue_growth>20` & stretch medium)면 neutral + 제한
+`should_run_web_research(...)`는 아래 중 하나라도 참이면 조사 실행 후보로 본다.
 
-리스크팀 연계:
-- `hard_red_flags`, `soft_flags`, `notes_for_risk_manager`를 명시적으로 전달
+- `research_need_score >= 4`
+- `disagreement_score > 0.5`
+- 고영향 결손 필드 존재
+- 사용자가 직접 조사성 질문을 함
 
----
+여기서:
+- `research_need_score = impact_score + uncertainty_score`
 
-## 4.4 Sentiment Analyst (`agents/sentiment_agent.py` + `engines/sentiment_engine.py`)
+쉽게 말해:
+- "영향이 큰데 불확실하다" 또는 "팀 의견이 많이 갈린다"면 자동으로 근거 수집을 더 한다.
 
-역할:
-- 뉴스/포지셔닝/변동성 정보를 **전술적 틸트**로 변환
+점수 용어 해설:
+- `impact_score`: \"이 정보가 빠지면 결론이 얼마나 크게 흔들리는가\" 점수
+- `uncertainty_score`: \"현재 결론이 얼마나 애매한가\" 점수
+- `disagreement_score`: Macro/Fundamental/Sentiment/Quant 결론이 서로 얼마나 엇갈리는지 점수
 
-핵심 원칙:
-- R5: sentiment는 단독 방향성 의사결정 금지
-- 틸트 하드캡: `[0.7, 1.3]`
-- 추천은 항상 `allow_with_limits` 중심
+## 5.4 리서치 중단 기준
 
-주요 계산:
-- `compute_sentiment_features()`: pcr, vix, skew, crowding, base_tilt
-- `dedupe_and_weight_news()`: 제목 중복 제거 + 시간감쇠 + `news_volume_z`
-- `compute_sentiment_velocity()`: 3d/7d 속도와 급반전 감지
-- `detect_catalyst_risk()`: 이벤트 타입/위험도
-- `infer_vol_regime()`: quant > macro > vix > fallback 우선순위
+아래 중 하나면 중단:
+- `research_round >= max_research_rounds`
+- `evidence_score >= 75`
+- `(research_round > 0) and (last_research_delta < 2)`
+- run budget 소진
 
-틸트 보정:
-1. base tilt 계산
-2. catalyst high면 tilt=1.0으로 중립화
-3. vol crisis면 tilt 최대 0.9
-4. 최종 hardcap [0.7, 1.3]
+예산(기본):
+- run 전체: `MAX_WEB_QUERIES_PER_RUN = 6`
+- ticker별: `MAX_WEB_QUERIES_PER_TICKER = 3`
 
----
+쉽게 말해:
+- "충분히 모였거나", "새로 얻는 게 거의 없거나", "예산을 다 쓰면" 그만 찾고 심사로 넘어간다.
 
-## 4.5 Quant Analyst
+## 5.5 research_executor가 하는 일
 
-현재 런타임 경로:
-- `investment_team.py`의 `quant_analyst_node`가
-  - `DataHub`로 가격 시계열 획득
-  - `engines/quant_engine.py`의 `generate_quant_payload()`
-  - `mock_quant_decision()`으로 결정
+- allow된 요청을 실제로 실행
+- `evidence_store` 갱신
+- `_executed_requests`에 감사 기록 저장
+- rerun할 desk를 top-K로 선택
 
-`engines/quant_engine.py` 결정 로직(4단계):
-1. 고변동 상태확률(`regime_2_high_vol`)로 방어모드 여부
-2. 통계 유의성(ADF, Newey-West)
-3. Z-score 타이밍
-   - `> +2`: SHORT
-   - `< -2`: LONG
-   - `|z| < 0.5`: CLEAR
-   - 그 외 HOLD
-4. Kelly * fractional + CVaR 한도 적용
+`_executed_requests` 최소 기록 필드:
+- `desk`, `kind`, `ticker`, `priority`, `resolver_path`, `n_items`
 
-참고:
-- `agents/quant_agent.py`는 독립 실행/실험용 확장판이며,
-  메인 파이프라인은 `engines/quant_engine.py` 경로를 사용
+쉽게 말해:
+- "무엇을 실제로 찾았고, 어디서 찾았고, 몇 건 찾았는지" 나중에 추적 가능하다.
 
----
+필드 해설:
+- `kind`: 요청 종류(예: `macro_headline_context`, `ownership_identity`)
+- `resolver_path`: 어떤 경로로 찾았는지(예: `sec_8k`, `official_release`, `newsapi`)
+- `n_items`: 해당 요청으로 실제 확보한 근거 건수
 
-## 4.6 Risk Manager (`agents/risk_agent.py`)
+## 5.6 rerun desk 선택 기준(top-K)
 
-역할:
-- 4개 데스크 출력을 받아 리스크 한도 관점에서 재판정
+K 기본값:
+- `_MAX_RERUN_DESKS = 2`
 
-핵심 흐름:
-1. 포트폴리오 리스크 요약 계산(`calculate_portfolio_risk_summary`)
-2. payload 조립(`aggregate_risk_payload`)
-3. 결정 엔진(`compute_risk_decision`) 실행
-4. 선택적으로 LLM이 **서술만 보강** (수치/결정 변경 금지)
+점수식:
+- `score = 1.0*evidence_relevance + 0.6*open_question_match + 0.2*risk_relevance`
 
-`compute_risk_decision` 게이트 순서:
-1. Gate1 하드한도(CVaR, leverage)
-2. Gate2 집중도(HHI, 섹터, component VaR)
-3. Gate3 구조 리스크(fundamental hard flags)
-4. Gate4 레짐 정합성(risk-off에서 공격적 LONG 감축)
-5. Gate5 모델 이상(quant 비중 이상치)
+요소 의미:
+- `evidence_relevance`: 실행된 근거가 그 desk에 직접 영향 준 횟수
+- `open_question_match`: 그 desk가 던진 질문 kind와 실행 kind가 맞아떨어진 횟수
+- `risk_relevance`: 리스크 중요 kind 보너스
 
-추가 하드닝:
-- R6 불일치 점수(`compute_disagreement_score`) > 0.5면 자동 감축 + 피드백
-- 증거 부족(`evidence` 없음/`data_ok=False`) 시 보수 플래그
-- SHORT는 Gate4에서 헤지로 인정해 불필요 감축 방지
+동률 처리:
+- 점수 동률이면 desk 이름 사전순
 
-출력:
-- `per_ticker_decisions`
-- `portfolio_actions`
-- `orchestrator_feedback`
-- `grade` (feedback required면 High)
+쉽게 말해:
+- "이번에 새로 모은 자료가 그 desk에 진짜 중요한지"를 수치화해서 상위 2개 desk만 다시 돌린다.
+
+## 5.7 rerun이 실제로 바뀌는 이유
+
+macro/fundamental/sentiment desk는 rerun 시 `evidence_store`를 읽어 `evidence_digest`를 만들고,
+- `key_drivers`
+- `what_to_watch`
+에 근거 문장을 반영한다.
+
+쉽게 말해:
+- rerun은 단순 재실행이 아니라, 새 근거를 읽고 내용이 실제로 갱신되는 재분석이다.
 
 ---
 
-## 4.7 Report Writer (`agents/report_agent.py`)
+## 6) 데스크 출력 필드: "실제로 무슨 뜻인지"
 
-역할:
-- 최종 IC Memo 마크다운 생성
+## 6.1 공통 출력 필드 (Macro/Fundamental/Sentiment)
 
-시나리오:
-- APPROVE: 알파 논리, 사이징 근거 강조
-- REJECT/FALLBACK: 거래하지 않는 이유와 재검토 조건 강조
+- `key_drivers`: 결론의 핵심 이유 2~5개
+- `what_to_watch`: 다음에 꼭 확인할 관찰 포인트
+- `open_questions`: 결론을 뒤집을 수 있는 남은 질문
+- `decision_sensitivity`: 어떤 조건 변화에서 결론이 바뀌는지
+- `followups`: 후속 실행 액션 제안
+- `evidence_requests`: 추가로 필요한 근거 요청
+- `evidence_digest`: 이미 확보한 외부 근거 요약
 
-동작:
-- LLM 사용 가능 시 프롬프트 기반 생성
-- 불가 시 규칙 기반 `_mock_generate_report()` 생성
+주의:
+- 위 필드는 **분석 desk 3종(Macro/Fundamental/Sentiment)** 기준이다.
+- Quant는 순수 계산 중심이라 이 세트(`open_questions`, `decision_sensitivity`, `followups`)를 기본으로 내지 않는다.
 
-특징:
-- 리스크 플래그, 헷지, gross/net 조정, 재검토 트리거까지 포함
+예시(사람이 읽는 방식):
+- open_questions: "다음 CPI가 예상보다 높으면 지금 bullish를 유지할 수 있나?"
+- decision_sensitivity: "10Y 금리가 4.8%를 넘으면 결론을 neutral로 하향"
+- followups: "FOMC 직후 macro desk rerun"
+
+## 6.2 결정 필드 해석
+
+- `primary_decision`
+  - 방향성(상승/중립/하락)을 한 단어로 표현
+- `recommendation`
+  - 행동 강도
+  - `allow`: 진행 가능
+  - `allow_with_limits`: 진행 가능하지만 제한 필요
+  - `reject`: 지금은 진행 금지
+
+쉽게 말해:
+- `primary_decision`은 "방향"
+- `recommendation`은 "허용 여부"
 
 ---
 
-## 5) 에이전트 상호작용의 실제 메커니즘
+## 7) 에이전트별 역할(쉬운 설명 포함)
 
-1. 오케스트레이터가 iteration을 증가시키며 라운드를 시작
-2. 데스크 4개가 병렬 실행
-3. barrier가 누락/구버전 출력을 `skipped/stale`로 표준화
-4. 리스크 매니저가 단일 진입점으로 평가
-5. 리스크 피드백이 있으면 오케스트레이터 재호출
-6. 최대 반복에 도달하면 리포트 작성 후 종료
+## 7.1 Orchestrator (`agents/orchestrator_agent.py`)
 
-중요 동기화 장치:
-- `barrier_node`: fan-in 안정화
-- `risk_manager_node`의 `_iteration_evaluated`: 같은 iteration 중복 평가 방지
+기술 설명:
+- 사용자 요청을 해석하고 desk별 `desk_tasks`를 발행
+- 리스크 피드백을 받으면 `scale_down`, `add_hedge`, `pivot_strategy` 중 선택
+
+쉽게 말해:
+- 팀장 역할. "누가 무엇을 볼지" 배정하고, 반려당하면 전략 방향을 바꾼다.
+
+## 7.2 Macro (`agents/macro_agent.py`, `engines/macro_engine.py`)
+
+기술 설명:
+- 금리/물가/성장/신용/유동성 축으로 레짐 계산
+- `primary_decision`/`recommendation` 생성
+- `transmission_map`, `portfolio_implications`, `monitoring_triggers`를 함께 생성해 포트폴리오로 번역
+
+쉽게 말해:
+- "지금 시장 날씨"를 본다. 순풍인지 역풍인지 판단한다.
+- 최근에는 금리/달러/변동성/원유/연준선물 데이터를 읽어 "그래서 SPY/QQQ/GLD/TLT/XLE를 어떻게 볼지"까지 적는다.
+
+자주 나오는 매크로 용어:
+- `risk_on`: 위험자산(주식 등)을 더 사도 되는 분위기
+- `risk_off`: 방어적으로 가야 하는 분위기
+- `yield curve inverted`: 장단기 금리 역전, 경기 둔화 신호로 해석되는 경우가 많음
+- `HY OAS`: 하이일드 채권 신용스프레드. 높을수록 시장이 신용위험을 크게 본다는 뜻
+
+## 7.3 Fundamental (`agents/fundamental_agent.py`, `engines/fundamental_engine.py`)
+
+기술 설명:
+- 구조 리스크(hard flag) 우선
+- 밸류에이션 스트레치와 품질/성장 점수 종합
+
+쉽게 말해:
+- 기업 체력이 괜찮은지, 가격이 과한지 판단한다.
+
+### 7.3.1 Hard Flag 상세 (왜 \"hard\"인지)
+
+Hard flag는 \"있으면 바로 강한 경고\"로 취급되는 항목이다.  
+이 항목들은 단기 변동 이슈가 아니라 **기업의 존속/신뢰/법적 리스크**와 직결되기 때문에 hard로 분류한다.
+
+| Hard flag | 실제 의미 | 왜 hard flag인가(실무적 이유) |
+|---|---|---|
+| `going_concern` | 감사인/공시에서 \"회사가 1년 안에 정상 존속이 어렵다\"는 경고 | 기업이 생존 자체에 의문이 생기면 밸류에이션보다 존속 리스크가 우선 |
+| `material_weakness` | 내부통제에 중대한 결함이 확인됨 | 숫자 신뢰도가 흔들리면 재무지표 기반 판단 자체가 약해짐 |
+| `restatement` | 과거 재무제표를 정정(수치 수정)함 | 이전에 믿고 판단한 숫자가 바뀌었다는 뜻이라 신뢰 리스크 큼 |
+| `accounting_fraud` | 회계부정/분식회계 정황 또는 확정 이슈 | 재무제표 신뢰가 무너지면 valuation/quality 판단 전제가 붕괴 |
+| `regulatory_action` | 규제기관 조사/제재/집행 이슈 | 벌금·영업제한·평판손상 등 다운사이드가 비선형으로 커질 수 있음 |
+| `default_risk` | 채무불이행 가능성이 높음 | 자금조달/상환 실패는 지분가치 훼손으로 직결될 수 있음 |
+
+판정 규칙:
+- 위 항목이 강하게 확인되면 `structural_risk_flag=True`로 보고, `recommendation`을 보수적으로 낮추거나 `reject`로 보낸다.
+- Risk Gate3는 구조 리스크 코드 집합(`default_risk`, `accounting_fraud`, `regulatory_action`, `going_concern`, `material_weakness`, `restatement`)을 차단 조건으로 사용한다.
+
+## 7.4 Sentiment (`agents/sentiment_agent.py`, `engines/sentiment_engine.py`)
+
+기술 설명:
+- 뉴스/포지셔닝/변동성으로 전술 틸트 생성
+- `tilt_factor` 하드캡 `[0.7, 1.3]`
+- 단독 방향성 의사결정 금지(R5)
+
+쉽게 말해:
+- 시장 심리가 과열/위축인지 보고 "강약 조절"만 한다.
+
+자주 나오는 감성 용어:
+- `tilt_factor`: 기본 포지션을 얼마나 가감할지 계수(1.0=중립, 0.9=10% 축소, 1.1=10% 확대)
+- `VIX`: 시장 변동성 공포지수. 높을수록 불안 심리가 강함
+- `PCR(Put/Call Ratio)`: 풋 대비 콜 비율. 과열/과냉 단서로 사용
+- `crowding`: 같은 방향 포지션이 과하게 몰린 상태. 반대방향 급반전 위험이 커질 수 있음
+
+## 7.5 Quant (`investment_team.py` + `engines/quant_engine.py`)
+
+기술 설명:
+- 가격 시계열 기반 순수 계산
+- Z-score, CVaR 등으로 `LONG/SHORT/HOLD/CLEAR` 결정
+
+쉽게 말해:
+- 숫자 규칙으로 타이밍/리스크를 계산하는 계산기다.
+
+정책 주의:
+- Quant는 웹 evidence로 강제 수정/재실행 대상이 아니다(독립성 유지).
+
+자주 나오는 퀀트 용어:
+- `Z-score`: 현재 값이 평균에서 표준편차 몇 배 떨어졌는지. 극단값 판단에 사용
+- `CVaR`: \"최악 구간 평균 손실\". 단순 VaR보다 꼬리 위험을 더 보수적으로 봄
+- `LONG/SHORT/HOLD/CLEAR`: 매수/매도/유지/청산 의사결정 상태
+
+## 7.6 Risk Manager (`agents/risk_agent.py`)
+
+기술 설명:
+- 5개 게이트 순서 고정(Gate1→2→3→4→5)
+- 불일치 점수, 구조 리스크, 집중도, 레짐 적합성 등을 심사
+- 필요 시 Orchestrator에 피드백 반환
+
+쉽게 말해:
+- 투자심사위원회 역할. "좋아 보여도 규칙 위반이면 반려"한다.
+
+### 7.6.1 5개 게이트를 쉬운 말로
+
+| Gate | 기술 이름 | 쉬운 의미 | 여기서 막히는 전형적 상황 |
+|---|---|---|---|
+| Gate1 | Hard limits | 절대 한도 체크 | 손실 가능치(CVaR), 레버리지 등 물리적 한도 초과 |
+| Gate2 | Concentration | 쏠림 위험 체크 | 특정 종목/섹터에 비중 과집중 |
+| Gate3 | Structural risk | 기업 구조 리스크 체크 | 7.3.1 hard flag + `accounting_fraud` 등이 탐지됨 |
+| Gate4 | Regime fit | 시장 국면 적합성 체크 | 위험회피 국면인데 공격적 포지션 유지 |
+| Gate5 | Model anomaly | 모델 이상치 체크 | 모델 신호가 비정상적으로 튀거나 상충 |
+
+## 7.7 Report Writer (`agents/report_agent.py`)
+
+기술 설명:
+- 최종 보고서(Investment Committee Memo) 생성
+
+쉽게 말해:
+- 위 모든 판단을 사람이 읽는 문서로 정리해준다.
 
 ---
 
-## 6) 데이터 계층 (`data_providers/*`)
+## 8) 데이터 계층과 신뢰성
 
-중앙 허브:
+중앙 진입점:
 - `data_providers/data_hub.py`
 
-모드 분기:
-- `mock`: 레거시 mock 함수(`fred_provider`/`market_data_provider`) 사용
-- `live`: FRED/FMP/SEC/NewsAPI/AlphaVantage/TwelveData 실제 프로바이더 사용
+모드:
+- `mock`: 합성/모의 데이터 중심
+- `live`: 외부 API 실호출
 
-프로바이더 특징:
-- `BaseProvider`: HTTP 세션 + retry + rate limit + sqlite cache
-- `FREDProvider`: 매크로 스냅샷
-- `FMPProvider`: 재무/비율
-- `SECEdgarProvider`: 공시 키워드 플래그
-- `NewsAPIProvider`, `AlphaVantageProvider`: 뉴스 감성
-- `TwelveDataProvider`: 가격시계열(실패 시 yfinance fallback, 최후 mock)
+프로바이더 공통 기반(`BaseProvider`):
+- HTTP retry
+- rate limit 처리
+- sqlite 캐시
+- 요청 로그
+- API 사용량 집계(`api_usage_stats.py`)
 
----
+추가된 매크로 입력:
+- `fred_provider.py`: `dgs2`, `dgs10`, `real_10y_yield`, `dollar_index`, `vix_level`, `wti_spot`, `brent_spot`
+- `market_data_provider.py`: `wti_front_month`, `brent_front_month`, `vix_index`
+- `fed_funds_futures_provider.py`: dated `30-Day Fed Funds futures` 곡선과 `implied_change_6m_bp`
 
-## 7) 리스크 모듈 이중 구조 정리
+최후 fallback(옵션):
+- `PERPLEXITY_API_KEY`가 설정되면, 고신뢰 provider(SEC/공식 릴리즈/NewsAPI)가 빈 결과일 때만
+  `perplexity_search`를 마지막 보루로 사용한다.
+- resolver 경로는 `perplexity_fallback_*`로 기록되어 감사 추적이 가능하다.
 
-현재 저장소에는 리스크 로직이 2계층으로 존재합니다.
-
-1. **실행 경로(메인 파이프라인에서 사용)**  
-   - `agents/risk_agent.py`의 `risk_manager_node` + `compute_risk_decision`
-
-2. **모듈형 게이트 엔진(테스트/리팩터링 경로)**  
-   - `risk/engine.py` + `risk/gates/gate1~5.py`
-
-현재 `investment_team.py`는 1번 경로를 호출합니다.
-`risk/engine.py`는 주로 `tests/test_gate_parity.py`, `tests/test_pipeline_reproducibility.py`에서 검증됩니다.
+쉽게 말해:
+- 데이터는 "한 곳(DataHub)"으로 들어오고, 실패/재시도/캐시를 공통으로 관리한다.
 
 ---
 
-## 8) 감사/저장 계층
+## 9) LLM 호출 정책(운영에서 중요한 부분)
 
-실행 감사:
-- `telemetry.py`
-  - `runs/{run_id}/meta.json`
-  - `runs/{run_id}/events.jsonl`
-  - `runs/{run_id}/final_state.json`
+핵심 정책:
+- 기본 provider: ZAI(GLM)
+- 전역 동시성 제한: 기본 1개
+- 전역 요청 간격: 기본 2초 (`LLM_MIN_REQUEST_INTERVAL_SEC`)
+- rate limit 시 10초 대기 후 1회 재시도
 
-PIT 저장 유틸:
-- `storage/pit_store.py`
-  - raw/features/decisions/llm_io/final_report/config 구조 지원
-  - 현재 메인 파이프라인에서 전면 사용되지는 않음
-  - 백테스트에서 일부(`save_gate_trace`, `save_positions`, `save_config_snapshot`) 사용
+데이터 fallback 정책:
+- 1차: 구조화/고신뢰 provider
+- 2차: 웹 수집 provider
+- 3차(옵션): Perplexity 검색 API (`PERPLEXITY_MODEL`, 기본 `sonar`)
 
----
+주의:
+- 설정상 fallback chain은 정의되어 있지만, 현재 `_build_provider_chain`에서 fallback 경로가 비활성화되어 GLM 단일 경로로 동작한다.
 
-## 9) 백테스트 (`backtest/runner.py`)
-
-특징:
-- 현재는 실제 그래프 호출형 백테스트가 아니라
-  **결정론적 mock 포지션 생성 + 비용 반영 PnL 계산** 중심
-- 결과 저장:
-  - `runs/backtest_{id}/backtest_results.csv`
-  - `runs/backtest_{id}/backtest_summary.json`
-  - `runs/backtest_{id}/config/config_hash.txt`
+쉽게 말해:
+- "한 번에 하나씩", "요청 사이 2초 쉬고", "막히면 10초 기다렸다 1번 재시도"한다.
 
 ---
 
-## 10) 파일별 역할 맵
+## 10) 로그/감사 파일 읽는 법
 
-## 10.1 루트/핵심
+## 10.1 run 폴더 기본 파일
 
-| 파일 | 역할 | 런타임 사용 |
-|---|---|---|
-| `investment_team.py` | LangGraph 메인 파이프라인, 노드 조립/실행 | 핵심 |
-| `telemetry.py` | 실행 이벤트/최종 상태 로깅 | 핵심 |
-| `README.md` | 개요/실행 가이드 | 문서 |
-| `.env.example` | API 키/튜닝 변수 예시 | 설정 |
-| `requirements.txt` | 의존성 목록 | 설정 |
+- `runs/{run_id}/meta.json`: 실행 메타(시각, 모드)
+- `runs/{run_id}/events.jsonl`: 노드별 이벤트 로그(기계친화)
+- `runs/{run_id}/final_state.json`: 최종 상태 스냅샷
+- `runs/{run_id}/operator_timeline.log`: 운영자용 읽기 쉬운 타임라인
+- `runs/{run_id}/operator_summary.md`: 핵심 이벤트 요약본
 
-## 10.2 에이전트
+쉽게 말해:
+- `events.jsonl`은 원본 로그, `operator_*`는 사람이 빠르게 읽는 요약이다.
 
-| 파일 | 역할 | 비고 |
-|---|---|---|
-| `agents/orchestrator_agent.py` | CIO 플래닝, 피드백 대응, fallback | 메인 경로 |
-| `agents/macro_agent.py` | 매크로 레짐/리스크온오프 해석 | 메인 경로 |
-| `agents/fundamental_agent.py` | 구조리스크/밸류/팩터 해석 | 메인 경로 |
-| `agents/sentiment_agent.py` | 감성 틸트/이벤트 리스크 해석 | 메인 경로 |
-| `agents/risk_agent.py` | 리스크 의사결정 게이트(실행 경로) | 메인 경로 |
-| `agents/report_agent.py` | 최종 IC Memo 생성 | 메인 경로 |
-| `agents/quant_agent.py` | 확장형 독립 퀀트 에이전트 | 보조/실험 |
+## 10.2 API 사용량 파일
 
-## 10.3 엔진
+- 기본 경로: `.cache/api_usage/YYYY-MM-DD.json` (UTC 날짜)
+- 항목: API별 `requests`, `success`, `failure`, `last_status`
+- 경로 변경: `API_USAGE_STATS_DIR`
 
-| 파일 | 역할 |
-|---|---|
-| `engines/macro_engine.py` | 5축 매크로 점수/레짐 계산 |
-| `engines/fundamental_engine.py` | Altman/coverage/FCF/valuation 계산 |
-| `engines/sentiment_engine.py` | 감성/뉴스 dedupe/vol regime 계산 |
-| `engines/quant_engine.py` | 순수 정량 계산 + 규칙 결정 |
-
-## 10.4 데이터/LLM/스키마
-
-| 파일 | 역할 |
-|---|---|
-| `data_providers/data_hub.py` | 에이전트 공통 데이터 진입점 |
-| `data_providers/base.py` | 공통 HTTP/cache/rate-limit 기반 |
-| `data_providers/cache.py` | sqlite 캐시 |
-| `data_providers/rate_limiter.py` | QPS 제한 |
-| `data_providers/fred_provider.py` | 매크로/FRED + 레거시 mock 래퍼 |
-| `data_providers/fmp_provider.py` | 재무/FMP |
-| `data_providers/sec_edgar_provider.py` | SEC 공시 플래그 |
-| `data_providers/newsapi_provider.py` | 뉴스 감성(룰기반 점수) |
-| `data_providers/alphavantage_provider.py` | AV 뉴스 감성(옵션) |
-| `data_providers/twelvedata_provider.py` | 시계열 가격 |
-| `data_providers/market_data_provider.py` | 레거시 가격 fetch(mock/live) |
-| `llm/router.py` | 에이전트별 모델 라우팅/캐시/fallback |
-| `schemas/common.py` | Evidence/State/공통 모델 |
-| `schemas/taxonomy.py` | 매크로 레짐 canonical 매핑 |
-| `config/settings.py` | 환경변수 기반 설정 로더 |
-
-## 10.5 리스크/포트폴리오/스토리지/검증
-
-| 파일 | 역할 | 사용 현황 |
-|---|---|---|
-| `risk/engine.py` | 모듈형 5게이트 실행기 | 테스트 중심 |
-| `risk/gates/gate1_hard_limits.py` | Gate1 구현 | 테스트 중심 |
-| `risk/gates/gate2_concentration.py` | Gate2 구현 | 테스트 중심 |
-| `risk/gates/gate3_structural.py` | Gate3 구현 | 테스트 중심 |
-| `risk/gates/gate4_regime_fit.py` | Gate4 구현 | 테스트 중심 |
-| `risk/gates/gate5_model_anomaly.py` | Gate5 구현 | 테스트 중심 |
-| `portfolio/allocator.py` | 멀티티커 제안 비중 생성기 | 현재 미연결 |
-| `storage/pit_store.py` | PIT 저장 유틸 | 일부(백테스트) |
-| `validators/factcheck.py` | 출력 사실성 검증 규칙 | 테스트 중심(런타임 미연결) |
-
-## 10.6 스크립트/평가
-
-| 파일 | 역할 |
-|---|---|
-| `scripts/smoke_test_llm.py` | LLM 라우터 스모크 테스트 |
-| `scripts/test_single_agent.py` | 개별 에이전트 단독 테스트(일부 시그니처 구버전 가능성) |
-| `eval/smoke_run.py` | 파이프라인 다회 실행 스모크 |
-| `backtest/runner.py` | 결정론적 PIT 백테스트 |
-
-## 10.7 테스트 파일 역할
-
-| 파일 | 검증 포인트 |
-|---|---|
-| `tests/test_graph_end_to_end.py` | E2E 완료, evidence 존재, events 생성, R0 |
-| `tests/test_graph_finishes.py` | 그래프 종료 보장 |
-| `tests/test_risk_barrier.py` | iteration당 risk_manager 중복 실행 방지 |
-| `tests/test_risk_hardening.py` | 하드닝 항목(0.0/short/taxonomy/disagreement 등) |
-| `tests/test_sentiment_tilt_cap.py` | R5 틸트 범위/센티먼트 제한 |
-| `tests/test_structural_risk_gate3.py` | 구조 리스크 reject |
-| `tests/test_report_factcheck.py` | factcheck 규칙 검증 |
-| `tests/test_quant_engine_purity.py` | quant engine 순수성(R3) |
-| `tests/test_provider_smoke.py` | 프로바이더 키 유무 스모크 |
-| `tests/test_gate_parity.py` | `agents/risk_agent` vs `risk/engine` 결정 패리티 |
-| `tests/test_pipeline_reproducibility.py` | 동일 PIT 입력 재현성 |
-| `tests/test_coverage_expansion.py` | 확장 커버리지(axes/stretch/dedupe/intent 등) |
-| `tests/test_gate_order.py` | 게이트 순서 점검(현 구현 경로와 일부 불일치 가능) |
+쉽게 말해:
+- "오늘 어떤 API를 몇 번 불렀고, 몇 번 성공/실패했는지" 일 단위로 본다.
 
 ---
 
-## 11) 온보딩 시 반드시 알아야 할 운영 포인트
+## 11) 주요 내부 점수/변수 해설
 
-1. 메인 런타임 리스크는 `agents/risk_agent.py` 경로다.  
-2. `risk/engine.py`는 리팩터링/테스트용 병행 구현이다.  
-3. `portfolio/allocator.py`는 현재 메인 그래프에 연결되어 있지 않다.  
-4. `validators/factcheck.py` 규칙은 테스트로 검증되지만 메인 실행에 직접 연결되지 않았다.  
-5. `scripts/test_single_agent.py`는 일부 함수 시그니처가 최신 코드와 맞지 않을 수 있다.  
-6. `tests/test_gate_order.py`는 루트 `risk_agent.py`를 참조해 실효성이 제한될 수 있다.  
-7. `investment_team.py`에서 CLI `--seed`는 출력에 표시되지만 `create_initial_state(..., seed=...)`로 전달되지 않아, mock 데이터는 사실상 `run_id` 기반 시드 경로를 탄다(동일 seed라도 run마다 결과가 달라질 수 있음).  
+## 11.1 `research_need_score`
 
----
+기술 설명:
+- `research_need_score = impact_score + uncertainty_score`
 
-## 12) 다른 LLM에게 자문 요청할 때 권장 컨텍스트
+쉽게 말해:
+- "중요한데 불확실한가?"를 숫자로 표현한 값.
 
-아래 파일을 함께 제공하면 정확도가 높다.
+## 11.2 `evidence_relevance`, `open_question_match`, `risk_relevance`
 
-1. `investment_team.py`
-2. `agents/orchestrator_agent.py`
-3. `agents/risk_agent.py`
-4. `engines/macro_engine.py`
-5. `engines/fundamental_engine.py`
-6. `engines/sentiment_engine.py`
-7. `engines/quant_engine.py`
-8. `schemas/common.py`
-9. `llm/router.py`
-10. 필요한 경우 `tests/test_risk_hardening.py`, `tests/test_gate_parity.py`
+기술 설명:
+- rerun desk 선택 점수의 3요소
+- 가중치: `1.0 / 0.6 / 0.2`
 
-권장 질문 형식:
-- “현재 리스크 피드백 루프가 반복되는 근본 원인을 코드 기준으로 설명해줘”
-- “Gate2가 orchestrator feedback을 덜 발생시키는 것이 의도인지 검토해줘”
-- “`risk/engine.py`를 메인 런타임에 연결할 때 회귀 위험을 분석해줘”
+쉽게 말해:
+- 새 자료가 그 팀에 얼마나 직결되는지,
+- 그 팀이 원래 궁금해하던 질문과 맞는지,
+- 리스크 관점으로 중요한 주제인지
+를 합쳐서 rerun 대상을 고른다.
+
+## 11.3 `last_research_delta`
+
+쉽게 말해:
+- 직전 조사 라운드에서 "진짜 새로 추가된 근거" 개수.
+- 이 값이 작으면 더 찾아도 큰 변화가 없다고 판단한다.
 
 ---
 
-## 13) 빠른 로컬 점검 체크리스트
+## 12) 파일 책임 맵
 
-1. 실행: `python investment_team.py --mode mock --seed 42`
-2. 산출물 확인:
-   - `runs/{run_id}/meta.json`
-   - `runs/{run_id}/events.jsonl`
-   - `runs/{run_id}/final_state.json`
-3. 테스트:
-   - `pytest tests/test_graph_end_to_end.py -q`
-   - `pytest tests/test_risk_hardening.py -q`
-   - `pytest tests/test_gate_parity.py -q`
+## 12.1 핵심 런타임
 
----
+- `investment_team.py`: 그래프 조립/노드 라우팅/실행
+- `agents/*`: 각 에이전트 판단 및 출력 구성
+- `engines/*`: 순수 계산 로직
+- `data_providers/*`: 외부 데이터 수집 (`fred_provider`, `market_data_provider`, `fed_funds_futures_provider` 포함)
+- `llm/router.py`: LLM 호출 정책/제어
+- `telemetry.py`: 실행 이벤트 저장
+- `api_usage_stats.py`: API 일별 집계 저장
 
-## 14) 요약
+## 12.2 테스트
 
-이 프로젝트의 본질은 다음 3가지입니다.
-
-1. **엔진(수치)과 에이전트(해석) 분리**
-2. **리스크 게이트 우선**
-3. **감사 가능한 실행 로그**
-
-특히 실무적으로 중요한 부분은, 오케스트레이터-리스크매니저 피드백 루프가 전략을 단계적으로 축소/피벗/중단시키는 구조이며, 이 판단 근거가 `evidence`와 `events.jsonl`로 추적 가능하다는 점입니다.
+- `tests/test_graph_end_to_end.py`: 전체 파이프라인 완료 검증
+- `tests/test_bounded_swarm_v01.py`: research/rerun 회귀 검증
+- `tests/test_llm_test_policy.py`: LLM 라우터 정책 검증
+- 기타 risk/sentiment/provider 테스트로 세부 규칙 검증
 
 ---
 
-## 15) Autonomy Runtime Self-Heal (v1.1+)
+## 13) 운영 체크리스트 (비개발자용)
 
-런타임 중 발생하는 기술 이슈와 인사이트 공백을 사용자 추가 질의 없이 자동으로 보강하도록 다음 흐름을 사용한다.
+1. 실행
+- `python investment_team.py --mode mock --seed 42`
 
-1. `research_router_node`에서 데스크 출력(`limitations`, `needs_more_data`, `open_questions`, `data_quality`)을 수집한다.
-2. `agents/autonomy_planner.py::plan_runtime_recovery`가 이슈를 구조화하고:
-   - `actions`(예: `provider_fallback`, `run_research`, `rerun_desk`, `adjust_risk`)
-   - `evidence_requests`(공식/공시 우선 경로)
-   를 생성한다.
-3. 생성된 요청은 기존 리서치 정책/예산(`max_web_queries_per_run`, `max_web_queries_per_ticker`) 안에서 자동 실행된다.
-4. 실행 결과는 `evidence_store`에 적재되고 필요한 desk만 rerun되어 인사이트가 갱신된다.
-5. `events.jsonl`에 `autonomy_planner`, `research_round` 이벤트가 남아 자율 보강 과정을 감사 가능하게 유지한다.
-6. 자동 해결 불가로 판단되면 `user_action_required=true`와 `user_action_items[]`를 상태에 기록하고, `human_handoff` 이벤트를 남긴다.
+2. 결과 파일 확인
+- `runs/{run_id}/final_state.json`
+- `runs/{run_id}/operator_timeline.log`
+- `runs/{run_id}/operator_summary.md`
 
-추가로 Risk LLM 서사 보강 단계는 413/TPM 초과 시 compact payload로 자동 재시도하며, 상태를 `risk_decision._llm_enrichment_status`에 기록한다.
+3. 리서치가 실제로 돌았는지 확인
+- `research_router`에서 `run=True/False`와 이유
+- `research_executor`에서 `executed`, `delta`, `rerun_selected`
+
+4. rerun이 실제 반영됐는지 확인
+- rerun된 desk 출력의 `evidence_digest`
+- `key_drivers`/`what_to_watch` 문구 변화
+
+5. API/LLM 상태 점검
+- `.cache/api_usage/YYYY-MM-DD.json`
+- LLM rate limit 로그와 요청 간격 대기 로그
+
+---
+
+## 14) 자주 묻는 질문(FAQ)
+
+Q1. 왜 분석을 여러 번 반복하나?
+- 리스크 반려 또는 근거 부족이 있으면 전략을 자동 수정하기 때문.
+
+Q2. 왜 같은 질문인데 결과가 조금 다를 수 있나?
+- live 모드는 외부 데이터 시점이 바뀌고, 상태 seed 처리 방식에 따라 세부값이 달라질 수 있음.
+
+Q3. 왜 리서치를 멈추나?
+- 근거가 충분하거나(`evidence_score`), 더 얻을 실익이 낮거나(`last_research_delta`), 예산/라운드 한도 때문.
+
+Q4. 이 시스템이 자동 매매까지 하나?
+- 아니오. 주문/브로커 실행은 범위 밖이다.
+
+Q5. 비개발자인데 어떤 파일부터 보면 되나?
+- `operator_summary.md` -> `operator_timeline.log` -> `final_state.json` 순서 추천.
+
+---
+
+## 15) 핵심 한 줄 요약
+
+이 시스템은 "근거를 모으고, 팀별로 해석하고, 리스크로 걸러서, 사람이 읽을 수 있는 결론"을 만드는 자동 투자 검토 파이프라인이다.
