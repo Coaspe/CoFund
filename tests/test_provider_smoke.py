@@ -53,6 +53,18 @@ def test_fed_funds_futures_provider_mock():
     assert "evidence" in result and len(result["evidence"]) >= 4
 
 
+def test_sofr_futures_provider_mock():
+    from data_providers.sofr_futures_provider import SofrFuturesProvider
+    provider = SofrFuturesProvider()
+    result = provider.get_curve(contracts=5, as_of="2026-01-01T00:00:00Z")
+    data = result["data"]
+    assert "sofr_futures_curve" in data
+    assert len(data["sofr_futures_curve"]) >= 3
+    assert "sofr_futures_front_implied_rate" in data
+    assert "sofr_futures_implied_change_6m_bp" in data
+    assert "evidence" in result and len(result["evidence"]) >= 4
+
+
 def test_fmp_no_key():
     """FMP provider without API key → mock fundamentals."""
     from data_providers.fmp_provider import FMPProvider
@@ -116,6 +128,7 @@ def test_datahub_mock_mode():
     assert "vix_level" in macro
     assert "wti_spot" in macro
     assert "cuts_priced_proxy_2y_ffr_bp" in macro
+    assert "sofr_rate" in macro
     assert len(ev) > 0
 
     funda, ev2, meta2 = hub.get_fundamentals("AAPL", seed=42)
@@ -142,6 +155,8 @@ if __name__ == "__main__":
     print("✅ test_market_macro_provider_mock PASSED")
     test_fed_funds_futures_provider_mock()
     print("✅ test_fed_funds_futures_provider_mock PASSED")
+    test_sofr_futures_provider_mock()
+    print("✅ test_sofr_futures_provider_mock PASSED")
     test_sec_no_agent()
     print("✅ test_sec_no_agent PASSED")
     test_newsapi_no_key()

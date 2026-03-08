@@ -155,6 +155,7 @@ class FREDProvider(BaseProvider if isinstance(BaseProvider, type) else object):
                 limitations.append("GDP series unavailable from FRED")
 
             extra_series = [
+                ("SOFR", "sofr_rate"),
                 ("DFII10", "real_10y_yield"),
                 ("DTWEXBGS", "dollar_index"),
                 ("UNRATE", "unemployment_rate"),
@@ -218,6 +219,7 @@ class FREDProvider(BaseProvider if isinstance(BaseProvider, type) else object):
             "cpi_yoy": round(rng.uniform(1.5, 6.0), 2),
             "pmi": round(rng.uniform(42, 62), 1),
             "fed_funds_rate": round(rng.uniform(3.0, 5.75), 2),
+            "sofr_rate": round(rng.uniform(3.0, 5.75), 2),
             "gdp_growth": round(rng.uniform(-1.0, 4.5), 2),
             "real_10y_yield": round(rng.uniform(0.5, 2.5), 2),
             "dollar_index": round(rng.uniform(105, 130), 2),
@@ -261,6 +263,7 @@ def fetch_macro_indicators(*, mode: str = "mock", as_of: str = "", seed: int | N
         "cpi_yoy": round(rng.uniform(1.5, 6.0), 2),
         "pmi": round(rng.uniform(42, 62), 1),
         "fed_funds_rate": round(rng.uniform(3.0, 5.75), 2),
+        "sofr_rate": round(rng.uniform(3.0, 5.75), 2),
         "gdp_growth": round(rng.uniform(-1.0, 4.5), 2),
         "real_10y_yield": round(rng.uniform(0.5, 2.5), 2),
         "dollar_index": round(rng.uniform(105, 130), 2),

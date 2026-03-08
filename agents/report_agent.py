@@ -249,6 +249,7 @@ def _build_macro_market_inputs_section(macro: dict, *, lang: str = "ko") -> str:
         ("2Y Treasury", "dgs2"),
         ("10Y Treasury", "dgs10"),
         ("Fed Funds", "fed_funds_rate"),
+        ("SOFR", "sofr_rate"),
         ("Real 10Y Yield", "real_10y_yield"),
         ("Dollar Index", "dollar_index"),
         ("VIX (FRED)", "vix_level"),
@@ -260,6 +261,11 @@ def _build_macro_market_inputs_section(macro: dict, *, lang: str = "ko") -> str:
         ("Fed Funds Fut 3M", "fed_funds_futures_3m_implied_rate"),
         ("Fed Funds Fut 6M", "fed_funds_futures_6m_implied_rate"),
         ("Fed Funds Fut 6M Change(bp)", "fed_funds_futures_implied_change_6m_bp"),
+        ("SOFR Fut Front", "sofr_futures_front_implied_rate"),
+        ("SOFR Fut 3M", "sofr_futures_3m_implied_rate"),
+        ("SOFR Fut 6M", "sofr_futures_6m_implied_rate"),
+        ("SOFR Fut 6M Change(bp)", "sofr_futures_implied_change_6m_bp"),
+        ("SOFR-FF 6M Basis(bp)", "sofr_ff_6m_basis_bp"),
         ("2Y-FFR Proxy(bp)", "cuts_priced_proxy_2y_ffr_bp"),
     ]
     rows = []

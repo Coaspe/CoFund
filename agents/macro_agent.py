@@ -410,13 +410,41 @@ def _build_transmission_map(
             "portfolio_readthrough": "멀티플 확장/축소와 beta 수용도를 결정",
         },
     }
+    sofr_change = indicators.get("sofr_futures_implied_change_6m_bp")
     futures_change = indicators.get("fed_funds_futures_implied_change_6m_bp")
-    if futures_change is not None:
+    basis_bp = indicators.get("sofr_ff_6m_basis_bp")
+    if basis_bp is None:
+        ff_6m = indicators.get("fed_funds_futures_6m_implied_rate")
+        sofr_6m = indicators.get("sofr_futures_6m_implied_rate")
+        if ff_6m is not None and sofr_6m is not None:
+            basis_bp = round((sofr_6m - ff_6m) * 100, 1)
+
+    if sofr_change is not None:
+        transmission["rates_pricing"] = {
+            "score": sofr_change,
+            "signal": "dovish_pricing" if sofr_change <= -10 else ("hawkish_pricing" if sofr_change >= 10 else "balanced_pricing"),
+            "current_state": (
+                "divergent_pricing"
+                if basis_bp is not None and abs(basis_bp) >= 10
+                else ("easing_priced" if sofr_change <= -10 else ("higher_rates_priced" if sofr_change >= 10 else "balanced"))
+            ),
+            "current_value": sofr_change,
+            "primary_metric": "sofr_futures_implied_change_6m_bp",
+            "secondary_metric": "fed_funds_futures_implied_change_6m_bp" if futures_change is not None else None,
+            "secondary_value": futures_change,
+            "basis_bp": basis_bp,
+            "portfolio_readthrough": "SOFR futures를 우선으로, Fed funds futures를 보조로 사용해 정책 경로와 듀레이션·성장주 할인율 민감도를 보정",
+        }
+    elif futures_change is not None:
         transmission["rates_pricing"] = {
             "score": futures_change,
             "signal": "dovish_pricing" if futures_change <= -10 else ("hawkish_pricing" if futures_change >= 10 else "balanced_pricing"),
             "current_state": "easing_priced" if futures_change <= -10 else ("higher_rates_priced" if futures_change >= 10 else "balanced"),
             "current_value": futures_change,
+            "primary_metric": "fed_funds_futures_implied_change_6m_bp",
+            "secondary_metric": None,
+            "secondary_value": None,
+            "basis_bp": basis_bp,
             "portfolio_readthrough": "실제 Fed funds futures curve 기반 경로로 듀레이션·성장주 민감도를 보정",
         }
     cuts_proxy = indicators.get("cuts_priced_proxy_2y_ffr_bp")
@@ -426,6 +454,10 @@ def _build_transmission_map(
             "signal": "dovish_pricing" if cuts_proxy >= 25 else ("hawkish_pricing" if cuts_proxy <= -25 else "balanced_pricing"),
             "current_state": "cuts_priced" if cuts_proxy >= 25 else ("hikes_priced" if cuts_proxy <= -25 else "balanced"),
             "current_value": cuts_proxy,
+            "primary_metric": "cuts_priced_proxy_2y_ffr_bp",
+            "secondary_metric": None,
+            "secondary_value": None,
+            "basis_bp": basis_bp,
             "portfolio_readthrough": "2Y-FFR gap 기반 easing/tightening pricing proxy로 듀레이션·성장주 민감도를 보정",
         }
     vix_level = indicators.get("vix_level")
@@ -575,11 +607,32 @@ def _build_monitoring_triggers(
         },
         {
             "name": "Policy repricing",
-            "metric": "fed_funds_futures_implied_change_6m_bp" if indicators.get("fed_funds_futures_implied_change_6m_bp") is not None else "cuts_priced_proxy_2y_ffr_bp",
-            "current_value": indicators.get("fed_funds_futures_implied_change_6m_bp")
-            if indicators.get("fed_funds_futures_implied_change_6m_bp") is not None
-            else indicators.get("cuts_priced_proxy_2y_ffr_bp"),
-            "trigger": "< -10bp or > 10bp" if indicators.get("fed_funds_futures_implied_change_6m_bp") is not None else "< -25bp or > 50bp",
+            "metric": (
+                "sofr_futures_implied_change_6m_bp"
+                if indicators.get("sofr_futures_implied_change_6m_bp") is not None
+                else (
+                    "fed_funds_futures_implied_change_6m_bp"
+                    if indicators.get("fed_funds_futures_implied_change_6m_bp") is not None
+                    else "cuts_priced_proxy_2y_ffr_bp"
+                )
+            ),
+            "current_value": (
+                indicators.get("sofr_futures_implied_change_6m_bp")
+                if indicators.get("sofr_futures_implied_change_6m_bp") is not None
+                else (
+                    indicators.get("fed_funds_futures_implied_change_6m_bp")
+                    if indicators.get("fed_funds_futures_implied_change_6m_bp") is not None
+                    else indicators.get("cuts_priced_proxy_2y_ffr_bp")
+                )
+            ),
+            "trigger": (
+                "< -10bp or > 10bp"
+                if (
+                    indicators.get("sofr_futures_implied_change_6m_bp") is not None
+                    or indicators.get("fed_funds_futures_implied_change_6m_bp") is not None
+                )
+                else "< -25bp or > 50bp"
+            ),
             "action": "듀레이션·성장주 할인율 가정을 즉시 업데이트",
             "priority": 2,
         },
@@ -615,6 +668,23 @@ def _build_monitoring_triggers(
                 "current_value": dollar_index,
                 "trigger": "sudden breakout with tighter rates",
                 "action": "원자재·금·글로벌 risk appetite 경로를 재평가",
+                "priority": 2,
+            }
+        )
+    basis_bp = indicators.get("sofr_ff_6m_basis_bp")
+    if basis_bp is None:
+        ff_6m = indicators.get("fed_funds_futures_6m_implied_rate")
+        sofr_6m = indicators.get("sofr_futures_6m_implied_rate")
+        if ff_6m is not None and sofr_6m is not None:
+            basis_bp = round((sofr_6m - ff_6m) * 100, 1)
+    if basis_bp is not None:
+        triggers.append(
+            {
+                "name": "Rates basis divergence",
+                "metric": "sofr_ff_6m_basis_bp",
+                "current_value": basis_bp,
+                "trigger": "< -10bp or > 10bp",
+                "action": "SOFR와 Fed funds pricing 괴리를 확인하고 정책경로 해석을 한 단계 보수적으로 재점검",
                 "priority": 2,
             }
         )
@@ -785,6 +855,7 @@ def macro_analyst_run(
         "core_cpi_yoy",
         "pmi",
         "fed_funds_rate",
+        "sofr_rate",
         "gdp_growth",
         "unemployment_rate",
         "financial_conditions_index",
@@ -794,6 +865,11 @@ def macro_analyst_run(
         "fed_funds_futures_3m_implied_rate",
         "fed_funds_futures_6m_implied_rate",
         "fed_funds_futures_implied_change_6m_bp",
+        "sofr_futures_front_implied_rate",
+        "sofr_futures_3m_implied_rate",
+        "sofr_futures_6m_implied_rate",
+        "sofr_futures_implied_change_6m_bp",
+        "sofr_ff_6m_basis_bp",
         "dollar_index",
         "vix_level",
         "vix_index",
@@ -805,6 +881,22 @@ def macro_analyst_run(
         val = macro_indicators.get(key)
         if val is not None:
             evidence.append(make_evidence(metric=key, value=val, source_name=source_name, quality=q, as_of=as_of))
+    ff_6m = macro_indicators.get("fed_funds_futures_6m_implied_rate")
+    sofr_6m = macro_indicators.get("sofr_futures_6m_implied_rate")
+    if macro_indicators.get("sofr_ff_6m_basis_bp") is None and ff_6m is not None and sofr_6m is not None:
+        macro_indicators["sofr_ff_6m_basis_bp"] = round((sofr_6m - ff_6m) * 100, 1)
+    if macro_indicators.get("sofr_ff_6m_basis_bp") is not None:
+        evidence.append(
+            make_evidence(
+                metric="sofr_ff_6m_basis_bp",
+                value=macro_indicators["sofr_ff_6m_basis_bp"],
+                source_name="derived:SOFR-FF",
+                source_type="model",
+                quality=q,
+                as_of=as_of,
+                note="SOFR 6m implied minus Fed funds 6m implied, in basis points",
+            )
+        )
     for bk in ["curve_state", "credit_stress_level", "inflation_state", "growth_state"]:
         evidence.append(
             make_evidence(
@@ -924,6 +1016,7 @@ def macro_analyst_run(
         "dgs2",
         "dgs10",
         "fed_funds_rate",
+        "sofr_rate",
         "real_10y_yield",
         "dollar_index",
         "vix_level",
@@ -937,6 +1030,11 @@ def macro_analyst_run(
         "fed_funds_futures_3m_implied_rate",
         "fed_funds_futures_6m_implied_rate",
         "fed_funds_futures_implied_change_6m_bp",
+        "sofr_futures_front_implied_rate",
+        "sofr_futures_3m_implied_rate",
+        "sofr_futures_6m_implied_rate",
+        "sofr_futures_implied_change_6m_bp",
+        "sofr_ff_6m_basis_bp",
         "unemployment_rate",
         "financial_conditions_index",
         "yield_curve_spread",

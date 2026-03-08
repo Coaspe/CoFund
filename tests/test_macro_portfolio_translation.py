@@ -144,3 +144,36 @@ def test_macro_prefers_true_fed_funds_futures_pricing_when_available():
     assert rates["signal"] == "dovish_pricing"
     assert rates["current_value"] == -50.0
     assert policy_trigger["metric"] == "fed_funds_futures_implied_change_6m_bp"
+
+
+def test_macro_dualizes_rates_pricing_with_sofr_and_basis():
+    state = _build_state(["SPY", "QQQ", "GLD", "TLT", "XLE"])
+    ind = {
+        "yield_curve_spread": 0.10,
+        "dgs2": 4.2,
+        "fed_funds_rate": 4.25,
+        "sofr_rate": 4.20,
+        "fed_funds_futures_front_implied_rate": 4.10,
+        "fed_funds_futures_3m_implied_rate": 3.90,
+        "fed_funds_futures_6m_implied_rate": 3.70,
+        "fed_funds_futures_implied_change_6m_bp": -40.0,
+        "sofr_futures_front_implied_rate": 4.15,
+        "sofr_futures_3m_implied_rate": 4.00,
+        "sofr_futures_6m_implied_rate": 3.85,
+        "sofr_futures_implied_change_6m_bp": -30.0,
+        "hy_oas": 320,
+        "cpi_yoy": 2.4,
+        "pmi": 52,
+    }
+
+    out = macro_analyst_run("SPY", ind, state=state, focus_areas=["SOFR/OIS implied path", "Fed policy path"])
+    rates = out["transmission_map"]["rates_pricing"]
+    policy_trigger = next(item for item in out["monitoring_triggers"] if item["name"] == "Policy repricing")
+    basis_trigger = next(item for item in out["monitoring_triggers"] if item["name"] == "Rates basis divergence")
+
+    assert rates["primary_metric"] == "sofr_futures_implied_change_6m_bp"
+    assert rates["secondary_metric"] == "fed_funds_futures_implied_change_6m_bp"
+    assert rates["current_value"] == -30.0
+    assert rates["basis_bp"] == 15.0
+    assert policy_trigger["metric"] == "sofr_futures_implied_change_6m_bp"
+    assert basis_trigger["metric"] == "sofr_ff_6m_basis_bp"

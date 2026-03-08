@@ -12,6 +12,7 @@ from typing import Any, Dict, List, Tuple
 
 import numpy as np
 
+from schemas.common import make_evidence
 from data_providers.cache import DiskCache
 from data_providers.rate_limiter import RateLimiter
 from data_providers.fred_provider import FREDProvider
@@ -21,6 +22,7 @@ from data_providers.newsapi_provider import NewsAPIProvider
 from data_providers.alphavantage_provider import AlphaVantageProvider
 from data_providers.twelvedata_provider import TwelveDataProvider
 from data_providers.fed_funds_futures_provider import FedFundsFuturesProvider
+from data_providers.sofr_futures_provider import SofrFuturesProvider
 from data_providers.base import is_rate_limit_error
 
 # Legacy mock wrappers
@@ -59,6 +61,7 @@ class DataHub:
             self._av = AlphaVantageProvider(cache=self._cache, rate_limiter=self._limiter)
             self._td = TwelveDataProvider(cache=self._cache, rate_limiter=self._limiter)
             self._fff = FedFundsFuturesProvider(cache=self._cache, rate_limiter=self._limiter)
+            self._sfr = SofrFuturesProvider(cache=self._cache, rate_limiter=self._limiter)
 
     # ── Macro ─────────────────────────────────────────────────────────────
 
@@ -72,6 +75,7 @@ class DataHub:
         snapshot = self._fred.get_macro_snapshot(as_of=self.as_of)
         market_data, market_evidence, market_meta = _legacy_macro_market(mode="live", as_of=self.as_of, seed=seed)
         futures_snapshot = self._fff.get_curve(as_of=self.as_of)
+        sofr_snapshot = self._sfr.get_curve(as_of=self.as_of)
         merged = dict(snapshot["data"])
         for key, value in (market_data or {}).items():
             if key not in merged or merged.get(key) is None:
@@ -81,13 +85,41 @@ class DataHub:
         for key, value in (futures_snapshot.get("data", {}) or {}).items():
             if key not in merged or merged.get(key) is None:
                 merged[key] = value
+        for key, value in (sofr_snapshot.get("data", {}) or {}).items():
+            if key not in merged or merged.get(key) is None:
+                merged[key] = value
+        ff_6m = merged.get("fed_funds_futures_6m_implied_rate")
+        sofr_6m = merged.get("sofr_futures_6m_implied_rate")
+        basis_as_of = self.as_of
+        ff_curve = (futures_snapshot.get("data", {}) or {}).get("fed_funds_futures_curve", [])
+        sofr_curve = (sofr_snapshot.get("data", {}) or {}).get("sofr_futures_curve", [])
+        if isinstance(sofr_curve, list) and sofr_curve:
+            basis_as_of = str(sofr_curve[min(2, len(sofr_curve) - 1)].get("as_of") or basis_as_of)
+        elif isinstance(ff_curve, list) and ff_curve:
+            basis_as_of = str(ff_curve[min(5, len(ff_curve) - 1)].get("as_of") or basis_as_of)
+        if ff_6m is not None and sofr_6m is not None:
+            merged["sofr_ff_6m_basis_bp"] = round((sofr_6m - ff_6m) * 100, 1)
         limitations = (
             list(snapshot["limitations"])
             + list((market_meta or {}).get("limitations", []))
             + list((futures_snapshot or {}).get("limitations", []))
+            + list((sofr_snapshot or {}).get("limitations", []))
         )
-        return merged, list(snapshot["evidence"]) + list(market_evidence) + list(futures_snapshot.get("evidence", [])), {
-            "data_ok": bool(snapshot["data_ok"] or (market_meta or {}).get("data_ok") or futures_snapshot.get("data_ok")),
+        evidence = list(snapshot["evidence"]) + list(market_evidence) + list(futures_snapshot.get("evidence", [])) + list(sofr_snapshot.get("evidence", []))
+        if ff_6m is not None and sofr_6m is not None:
+            evidence.append(
+                make_evidence(
+                    metric="sofr_ff_6m_basis_bp",
+                    value=merged["sofr_ff_6m_basis_bp"],
+                    source_name="derived:SOFR-FF",
+                    source_type="model",
+                    quality=0.78,
+                    as_of=basis_as_of,
+                    note="SOFR 6m implied minus Fed funds 6m implied, in basis points",
+                )
+            )
+        return merged, evidence, {
+            "data_ok": bool(snapshot["data_ok"] or (market_meta or {}).get("data_ok") or futures_snapshot.get("data_ok") or sofr_snapshot.get("data_ok")),
             "limitations": limitations,
         }
 

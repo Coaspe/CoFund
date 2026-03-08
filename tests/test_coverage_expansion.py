@@ -331,6 +331,7 @@ class TestReportIncludesNewFields:
                 "dgs2": 4.1,
                 "dgs10": 3.9,
                 "fed_funds_rate": 4.25,
+                "sofr_rate": 4.20,
                 "dollar_index": 120.0,
                 "vix_level": 21.0,
                 "wti_spot": 81.0,
@@ -338,6 +339,11 @@ class TestReportIncludesNewFields:
                 "fed_funds_futures_3m_implied_rate": 3.9,
                 "fed_funds_futures_6m_implied_rate": 3.6,
                 "fed_funds_futures_implied_change_6m_bp": -50.0,
+                "sofr_futures_front_implied_rate": 4.15,
+                "sofr_futures_3m_implied_rate": 4.0,
+                "sofr_futures_6m_implied_rate": 3.8,
+                "sofr_futures_implied_change_6m_bp": -35.0,
+                "sofr_ff_6m_basis_bp": 20.0,
             },
         )
         funda = fundamental_analyst_run("AAPL", {"pe_ratio": 30, "revenue_growth": 10, "roe": 20})
@@ -362,6 +368,7 @@ class TestReportIncludesNewFields:
         assert "Key Drivers" in msg or "핵심 내용" in msg
         assert "Macro Market Inputs" in msg
         assert "Fed Funds Fut 6M" in msg
+        assert "SOFR Fut 6M" in msg
 
     def test_mock_report_contains_top_drivers_section(self):
         from agents.report_agent import _mock_generate_report
