@@ -1,0 +1,216 @@
+"""
+data_providers/fed_funds_futures_provider.py — Fed Funds futures curve provider
+===============================================================================
+Uses dated 30-Day Fed Funds futures contracts via yfinance.
+No API key required. Dates are preserved per contract.
+"""
+
+from __future__ import annotations
+
+from datetime import datetime, timezone
+from typing import Any, List
+
+from schemas.common import make_evidence
+
+try:
+    from data_providers.base import BaseProvider
+except ImportError:
+    BaseProvider = object  # type: ignore
+
+
+_MONTH_CODES = {
+    1: "F",
+    2: "G",
+    3: "H",
+    4: "J",
+    5: "K",
+    6: "M",
+    7: "N",
+    8: "Q",
+    9: "U",
+    10: "V",
+    11: "X",
+    12: "Z",
+}
+
+
+def _add_months(year: int, month: int, delta: int) -> tuple[int, int]:
+    total = (year * 12 + (month - 1)) + delta
+    y, m0 = divmod(total, 12)
+    return y, m0 + 1
+
+
+class FedFundsFuturesProvider(BaseProvider if isinstance(BaseProvider, type) else object):
+    PROVIDER_NAME = "fed_funds_futures"
+
+    def get_curve(self, *, months: int = 6, as_of: str = "") -> dict:
+        as_of = as_of or datetime.now(timezone.utc).isoformat()
+        try:
+            curve = self._fetch_live_curve(months=months)
+            evidence = self._build_evidence(curve, as_of=as_of)
+            data = self._curve_to_data(curve)
+            return {
+                "data": data,
+                "evidence": evidence,
+                "data_ok": len(curve) >= 3,
+                "limitations": [] if len(curve) >= 3 else ["Insufficient futures contracts fetched"],
+                "as_of": as_of,
+            }
+        except Exception as e:
+            curve = self._mock_curve(months=months, as_of=as_of)
+            evidence = self._build_evidence(curve, as_of=as_of, source_name="mock", quality=0.3)
+            data = self._curve_to_data(curve)
+            return {
+                "data": data,
+                "evidence": evidence,
+                "data_ok": False,
+                "limitations": [f"fed funds futures live error: {e}", "Using mock fed funds futures curve"],
+                "as_of": as_of,
+            }
+
+    def _fetch_live_curve(self, *, months: int) -> list[dict]:
+        import yfinance as yf  # type: ignore
+
+        now = datetime.now(timezone.utc)
+        curve: list[dict] = []
+        for i in range(months):
+            year, month = _add_months(now.year, now.month, i)
+            symbol = f"ZQ{_MONTH_CODES[month]}{str(year % 100).zfill(2)}.CBT"
+            df = yf.download(symbol, period="10d", interval="1d", progress=False, auto_adjust=False)
+            if df is None or df.empty:
+                continue
+            close = df["Close"]
+            if hasattr(close, "columns"):
+                close = close.iloc[:, 0]
+            close = close.dropna()
+            if close.empty:
+                continue
+            last_ts = close.index[-1]
+            ts = getattr(last_ts, "to_pydatetime", lambda: last_ts)()
+            if isinstance(ts, datetime):
+                if ts.tzinfo is None:
+                    ts = ts.replace(tzinfo=timezone.utc)
+                else:
+                    ts = ts.astimezone(timezone.utc)
+                point_as_of = ts.isoformat()
+            else:
+                point_as_of = datetime.now(timezone.utc).isoformat()
+            price = float(close.iloc[-1])
+            curve.append(
+                {
+                    "contract": symbol,
+                    "contract_month": f"{year:04d}-{month:02d}",
+                    "price": round(price, 6),
+                    "implied_rate": round(100.0 - price, 4),
+                    "as_of": point_as_of,
+                }
+            )
+        if not curve:
+            raise ValueError("no fed funds futures contracts available")
+        return curve
+
+    def _mock_curve(self, *, months: int, as_of: str) -> list[dict]:
+        base = [
+            4.25,
+            4.10,
+            3.95,
+            3.85,
+            3.75,
+            3.65,
+        ]
+        now = datetime.now(timezone.utc)
+        curve: list[dict] = []
+        for i in range(months):
+            year, month = _add_months(now.year, now.month, i)
+            implied = base[i] if i < len(base) else max(base[-1] - 0.05 * (i - len(base) + 1), 2.0)
+            curve.append(
+                {
+                    "contract": f"ZQ{_MONTH_CODES[month]}{str(year % 100).zfill(2)}.CBT",
+                    "contract_month": f"{year:04d}-{month:02d}",
+                    "price": round(100.0 - implied, 6),
+                    "implied_rate": round(implied, 4),
+                    "as_of": as_of,
+                }
+            )
+        return curve
+
+    @staticmethod
+    def _curve_to_data(curve: list[dict]) -> dict:
+        out: dict[str, Any] = {
+            "fed_funds_futures_curve": curve,
+        }
+        if not curve:
+            return out
+        front = curve[0]
+        mid = curve[min(2, len(curve) - 1)]
+        far = curve[min(5, len(curve) - 1)]
+        out.update(
+            {
+                "fed_funds_futures_front_contract": front["contract"],
+                "fed_funds_futures_front_implied_rate": front["implied_rate"],
+                "fed_funds_futures_3m_implied_rate": mid["implied_rate"],
+                "fed_funds_futures_6m_implied_rate": far["implied_rate"],
+                "fed_funds_futures_implied_change_6m_bp": round((far["implied_rate"] - front["implied_rate"]) * 100, 1),
+            }
+        )
+        return out
+
+    @staticmethod
+    def _build_evidence(
+        curve: list[dict],
+        *,
+        as_of: str,
+        source_name: str = "yfinance",
+        quality: float = 0.78,
+    ) -> List[dict]:
+        evidence: List[dict] = []
+        if not curve:
+            return evidence
+        front = curve[0]
+        mid = curve[min(2, len(curve) - 1)]
+        far = curve[min(5, len(curve) - 1)]
+        evidence.append(
+            make_evidence(
+                metric="fed_funds_futures_front_implied_rate",
+                value=front["implied_rate"],
+                source_name=f"{source_name}:{front['contract']}",
+                source_type="api",
+                quality=quality,
+                as_of=front.get("as_of") or as_of,
+                note=f"front contract {front['contract_month']}",
+            )
+        )
+        evidence.append(
+            make_evidence(
+                metric="fed_funds_futures_3m_implied_rate",
+                value=mid["implied_rate"],
+                source_name=f"{source_name}:{mid['contract']}",
+                source_type="api",
+                quality=quality,
+                as_of=mid.get("as_of") or as_of,
+                note=f"3m contract {mid['contract_month']}",
+            )
+        )
+        evidence.append(
+            make_evidence(
+                metric="fed_funds_futures_6m_implied_rate",
+                value=far["implied_rate"],
+                source_name=f"{source_name}:{far['contract']}",
+                source_type="api",
+                quality=quality,
+                as_of=far.get("as_of") or as_of,
+                note=f"6m contract {far['contract_month']}",
+            )
+        )
+        evidence.append(
+            make_evidence(
+                metric="fed_funds_futures_implied_change_6m_bp",
+                value=round((far["implied_rate"] - front["implied_rate"]) * 100, 1),
+                source_name=f"derived:{front['contract']}->{far['contract']}",
+                source_type="model",
+                quality=quality,
+                as_of=far.get("as_of") or as_of,
+                note="negative means easing priced over the next 6 months",
+            )
+        )
+        return evidence

@@ -41,6 +41,18 @@ def test_market_macro_provider_mock():
     assert meta["data_ok"] is False
 
 
+def test_fed_funds_futures_provider_mock():
+    from data_providers.fed_funds_futures_provider import FedFundsFuturesProvider
+    provider = FedFundsFuturesProvider()
+    result = provider.get_curve(months=6, as_of="2026-01-01T00:00:00Z")
+    data = result["data"]
+    assert "fed_funds_futures_curve" in data
+    assert len(data["fed_funds_futures_curve"]) >= 3
+    assert "fed_funds_futures_front_implied_rate" in data
+    assert "fed_funds_futures_implied_change_6m_bp" in data
+    assert "evidence" in result and len(result["evidence"]) >= 4
+
+
 def test_fmp_no_key():
     """FMP provider without API key → mock fundamentals."""
     from data_providers.fmp_provider import FMPProvider
@@ -128,6 +140,8 @@ if __name__ == "__main__":
     print("✅ test_fmp_no_key PASSED")
     test_market_macro_provider_mock()
     print("✅ test_market_macro_provider_mock PASSED")
+    test_fed_funds_futures_provider_mock()
+    print("✅ test_fed_funds_futures_provider_mock PASSED")
     test_sec_no_agent()
     print("✅ test_sec_no_agent PASSED")
     test_newsapi_no_key()

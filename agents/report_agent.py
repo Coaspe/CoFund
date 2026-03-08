@@ -136,6 +136,12 @@ def _build_report_human_msg(state: dict) -> str:
         "[Macro 핵심 내용]",
         _desk_narrative("macro_analysis"),
         "",
+        "[Macro Market Inputs]",
+        _build_macro_market_inputs_section(state.get("macro_analysis", {}), lang="ko"),
+        "",
+        "[Macro Translation]",
+        _build_macro_translation_section(state.get("macro_analysis", {}), lang="ko"),
+        "",
         "[Fundamental 핵심 내용]",
         _desk_narrative("fundamental_analysis"),
         "",
@@ -212,6 +218,98 @@ def _safe_get(d: dict, *keys: str, default: Any = "N/A") -> Any:
         else:
             return default
     return cur
+
+
+def _metric_as_of_map(evidence: list[dict] | None) -> dict[str, str]:
+    out: dict[str, str] = {}
+    for item in evidence or []:
+        if not isinstance(item, dict):
+            continue
+        metric = str(item.get("metric", "") or "").strip()
+        ts = str(item.get("as_of", "") or item.get("published_at", "")).strip()
+        if metric and ts and metric not in out:
+            out[metric] = ts
+    return out
+
+
+def _macro_metric_value(macro: dict, key: str) -> Any:
+    if not isinstance(macro, dict):
+        return None
+    if key in macro and macro.get(key) is not None:
+        return macro.get(key)
+    indicators = macro.get("indicators", {})
+    if isinstance(indicators, dict):
+        return indicators.get(key)
+    return None
+
+
+def _build_macro_market_inputs_section(macro: dict, *, lang: str = "ko") -> str:
+    evidence_map = _metric_as_of_map(macro.get("evidence", []))
+    metric_rows = [
+        ("2Y Treasury", "dgs2"),
+        ("10Y Treasury", "dgs10"),
+        ("Fed Funds", "fed_funds_rate"),
+        ("Real 10Y Yield", "real_10y_yield"),
+        ("Dollar Index", "dollar_index"),
+        ("VIX (FRED)", "vix_level"),
+        ("WTI Spot", "wti_spot"),
+        ("Brent Spot", "brent_spot"),
+        ("WTI Front", "wti_front_month"),
+        ("Brent Front", "brent_front_month"),
+        ("Fed Funds Fut Front", "fed_funds_futures_front_implied_rate"),
+        ("Fed Funds Fut 3M", "fed_funds_futures_3m_implied_rate"),
+        ("Fed Funds Fut 6M", "fed_funds_futures_6m_implied_rate"),
+        ("Fed Funds Fut 6M Change(bp)", "fed_funds_futures_implied_change_6m_bp"),
+        ("2Y-FFR Proxy(bp)", "cuts_priced_proxy_2y_ffr_bp"),
+    ]
+    rows = []
+    for label, key in metric_rows:
+        value = _macro_metric_value(macro, key)
+        if value is None:
+            continue
+        rows.append((label, value, evidence_map.get(key, "")))
+    if not rows:
+        return ""
+    if lang == "en":
+        lines = ["", "## Macro Market Inputs", "", "| Metric | Value | As Of |", "|---|---:|---|"]
+    else:
+        lines = ["", "## Macro Market Inputs", "", "| Metric | Value | As Of |", "|---|---:|---|"]
+    for label, value, ts in rows:
+        lines.append(f"| {label} | {value} | {ts or 'n/a'} |")
+    return "\n".join(lines) + "\n"
+
+
+def _build_macro_translation_section(macro: dict, *, lang: str = "ko") -> str:
+    transmission = macro.get("transmission_map", {}) if isinstance(macro, dict) else {}
+    portfolio = macro.get("portfolio_implications", {}) if isinstance(macro, dict) else {}
+    triggers = macro.get("monitoring_triggers", []) if isinstance(macro, dict) else []
+    lines: list[str] = ["", "## Macro Translation"]
+    if isinstance(transmission, dict) and transmission:
+        lines.append("- Transmission map:")
+        for key in ("growth_beta", "policy_rates", "rates_pricing", "credit", "inflation_real_assets", "usd", "volatility", "commodity_shock_watch"):
+            item = transmission.get(key)
+            if not isinstance(item, dict):
+                continue
+            lines.append(
+                f"  - {key}: signal={item.get('signal')}, value={item.get('current_value')}, state={item.get('current_state')}"
+            )
+    if isinstance(portfolio, dict) and portfolio.get("targets"):
+        lines.append("- Portfolio implications:")
+        for row in portfolio.get("targets", [])[:6]:
+            if not isinstance(row, dict):
+                continue
+            lines.append(
+                f"  - {row.get('ticker')}: {row.get('stance')} / score={row.get('macro_fit_score')} / bucket={row.get('bucket')}"
+            )
+    if isinstance(triggers, list) and triggers:
+        lines.append("- Monitoring triggers:")
+        for row in triggers[:5]:
+            if not isinstance(row, dict):
+                continue
+            lines.append(
+                f"  - {row.get('name')}: {row.get('metric')} {row.get('trigger')} (current={row.get('current_value')})"
+            )
+    return "\n".join(lines) + "\n" if len(lines) > 1 else ""
 
 
 def _mock_generate_report(state: dict) -> str:
@@ -353,6 +451,9 @@ def _mock_generate_report(state: dict) -> str:
 
 ---
 
+{_build_macro_market_inputs_section(macro, lang="ko")}
+{_build_macro_translation_section(macro, lang="ko")}
+
 *본 보고서는 AI 투자 분석 시스템에 의해 자동 생성되었습니다. 최종 투자 결정은 반드시 인간 심의위원의 승인이 필요합니다.*
 
 {_fmt_research_appendix(state)}"""
@@ -447,6 +548,9 @@ def _mock_generate_report(state: dict) -> str:
 | XLU | 유틸리티 섹터 ETF | 방어 섹터, 배당 수익 |
 
 ---
+
+{_build_macro_market_inputs_section(macro, lang="ko")}
+{_build_macro_translation_section(macro, lang="ko")}
 
 *본 보고서는 AI 투자 분석 시스템에 의해 자동 생성되었습니다. 최종 투자 결정은 반드시 인간 심의위원의 승인이 필요합니다.*
 

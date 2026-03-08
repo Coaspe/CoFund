@@ -322,7 +322,24 @@ class TestReportIncludesNewFields:
         from agents.macro_agent import macro_analyst_run
         from agents.fundamental_agent import fundamental_analyst_run
         from agents.sentiment_agent import sentiment_analyst_run
-        macro = macro_analyst_run("AAPL", {"pmi": 48, "hy_oas": 450, "yield_curve_spread": -0.2})
+        macro = macro_analyst_run(
+            "AAPL",
+            {
+                "pmi": 48,
+                "hy_oas": 450,
+                "yield_curve_spread": -0.2,
+                "dgs2": 4.1,
+                "dgs10": 3.9,
+                "fed_funds_rate": 4.25,
+                "dollar_index": 120.0,
+                "vix_level": 21.0,
+                "wti_spot": 81.0,
+                "fed_funds_futures_front_implied_rate": 4.1,
+                "fed_funds_futures_3m_implied_rate": 3.9,
+                "fed_funds_futures_6m_implied_rate": 3.6,
+                "fed_funds_futures_implied_change_6m_bp": -50.0,
+            },
+        )
         funda = fundamental_analyst_run("AAPL", {"pe_ratio": 30, "revenue_growth": 10, "roe": 20})
         senti = sentiment_analyst_run("AAPL", {"vix_level": 18, "put_call_ratio": 0.9})
         return {
@@ -343,6 +360,8 @@ class TestReportIncludesNewFields:
         msg = _build_report_human_msg(state)
         # Should contain at least one reference to key data section
         assert "Key Drivers" in msg or "핵심 내용" in msg
+        assert "Macro Market Inputs" in msg
+        assert "Fed Funds Fut 6M" in msg
 
     def test_mock_report_contains_top_drivers_section(self):
         from agents.report_agent import _mock_generate_report
@@ -350,6 +369,8 @@ class TestReportIncludesNewFields:
         report = _mock_generate_report(state)
         assert isinstance(report, str)
         assert len(report) > 100   # non-empty report
+        assert "Macro Market Inputs" in report
+        assert "Macro Translation" in report
 
 
 # ─────────────────────────────────────────────────────────────────────────────

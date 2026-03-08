@@ -20,6 +20,7 @@ from data_providers.sec_edgar_provider import SECEdgarProvider
 from data_providers.newsapi_provider import NewsAPIProvider
 from data_providers.alphavantage_provider import AlphaVantageProvider
 from data_providers.twelvedata_provider import TwelveDataProvider
+from data_providers.fed_funds_futures_provider import FedFundsFuturesProvider
 from data_providers.base import is_rate_limit_error
 
 # Legacy mock wrappers
@@ -57,6 +58,7 @@ class DataHub:
             self._news = NewsAPIProvider(cache=self._cache, rate_limiter=self._limiter)
             self._av = AlphaVantageProvider(cache=self._cache, rate_limiter=self._limiter)
             self._td = TwelveDataProvider(cache=self._cache, rate_limiter=self._limiter)
+            self._fff = FedFundsFuturesProvider(cache=self._cache, rate_limiter=self._limiter)
 
     # ── Macro ─────────────────────────────────────────────────────────────
 
@@ -69,15 +71,23 @@ class DataHub:
 
         snapshot = self._fred.get_macro_snapshot(as_of=self.as_of)
         market_data, market_evidence, market_meta = _legacy_macro_market(mode="live", as_of=self.as_of, seed=seed)
+        futures_snapshot = self._fff.get_curve(as_of=self.as_of)
         merged = dict(snapshot["data"])
         for key, value in (market_data or {}).items():
             if key not in merged or merged.get(key) is None:
                 merged[key] = value
             else:
                 merged[f"{key}_market"] = value
-        limitations = list(snapshot["limitations"]) + list((market_meta or {}).get("limitations", []))
-        return merged, list(snapshot["evidence"]) + list(market_evidence), {
-            "data_ok": bool(snapshot["data_ok"] or (market_meta or {}).get("data_ok")),
+        for key, value in (futures_snapshot.get("data", {}) or {}).items():
+            if key not in merged or merged.get(key) is None:
+                merged[key] = value
+        limitations = (
+            list(snapshot["limitations"])
+            + list((market_meta or {}).get("limitations", []))
+            + list((futures_snapshot or {}).get("limitations", []))
+        )
+        return merged, list(snapshot["evidence"]) + list(market_evidence) + list(futures_snapshot.get("evidence", [])), {
+            "data_ok": bool(snapshot["data_ok"] or (market_meta or {}).get("data_ok") or futures_snapshot.get("data_ok")),
             "limitations": limitations,
         }
 

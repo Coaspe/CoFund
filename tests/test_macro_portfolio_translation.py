@@ -119,3 +119,28 @@ def test_macro_uses_market_and_rates_pricing_inputs_directly():
     assert transmission["commodity_shock_watch"]["current_value"] == 82.0
     assert "Volatility regime shift" in trigger_names
     assert "Dollar regime shift" in trigger_names
+
+
+def test_macro_prefers_true_fed_funds_futures_pricing_when_available():
+    state = _build_state(["SPY", "QQQ", "GLD", "TLT", "XLE"])
+    ind = {
+        "yield_curve_spread": 0.10,
+        "dgs2": 4.2,
+        "fed_funds_rate": 4.25,
+        "cuts_priced_proxy_2y_ffr_bp": 5.0,
+        "fed_funds_futures_front_implied_rate": 4.10,
+        "fed_funds_futures_3m_implied_rate": 3.90,
+        "fed_funds_futures_6m_implied_rate": 3.60,
+        "fed_funds_futures_implied_change_6m_bp": -50.0,
+        "hy_oas": 320,
+        "cpi_yoy": 2.4,
+        "pmi": 52,
+    }
+
+    out = macro_analyst_run("SPY", ind, state=state, focus_areas=["Fed policy path"])
+    rates = out["transmission_map"]["rates_pricing"]
+    policy_trigger = next(item for item in out["monitoring_triggers"] if item["name"] == "Policy repricing")
+
+    assert rates["signal"] == "dovish_pricing"
+    assert rates["current_value"] == -50.0
+    assert policy_trigger["metric"] == "fed_funds_futures_implied_change_6m_bp"

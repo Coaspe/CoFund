@@ -410,8 +410,17 @@ def _build_transmission_map(
             "portfolio_readthrough": "멀티플 확장/축소와 beta 수용도를 결정",
         },
     }
+    futures_change = indicators.get("fed_funds_futures_implied_change_6m_bp")
+    if futures_change is not None:
+        transmission["rates_pricing"] = {
+            "score": futures_change,
+            "signal": "dovish_pricing" if futures_change <= -10 else ("hawkish_pricing" if futures_change >= 10 else "balanced_pricing"),
+            "current_state": "easing_priced" if futures_change <= -10 else ("higher_rates_priced" if futures_change >= 10 else "balanced"),
+            "current_value": futures_change,
+            "portfolio_readthrough": "실제 Fed funds futures curve 기반 경로로 듀레이션·성장주 민감도를 보정",
+        }
     cuts_proxy = indicators.get("cuts_priced_proxy_2y_ffr_bp")
-    if cuts_proxy is not None:
+    if cuts_proxy is not None and "rates_pricing" not in transmission:
         transmission["rates_pricing"] = {
             "score": cuts_proxy,
             "signal": "dovish_pricing" if cuts_proxy >= 25 else ("hawkish_pricing" if cuts_proxy <= -25 else "balanced_pricing"),
@@ -566,9 +575,11 @@ def _build_monitoring_triggers(
         },
         {
             "name": "Policy repricing",
-            "metric": "cuts_priced_proxy_2y_ffr_bp",
-            "current_value": indicators.get("cuts_priced_proxy_2y_ffr_bp"),
-            "trigger": "< -25bp or > 50bp",
+            "metric": "fed_funds_futures_implied_change_6m_bp" if indicators.get("fed_funds_futures_implied_change_6m_bp") is not None else "cuts_priced_proxy_2y_ffr_bp",
+            "current_value": indicators.get("fed_funds_futures_implied_change_6m_bp")
+            if indicators.get("fed_funds_futures_implied_change_6m_bp") is not None
+            else indicators.get("cuts_priced_proxy_2y_ffr_bp"),
+            "trigger": "< -10bp or > 10bp" if indicators.get("fed_funds_futures_implied_change_6m_bp") is not None else "< -25bp or > 50bp",
             "action": "듀레이션·성장주 할인율 가정을 즉시 업데이트",
             "priority": 2,
         },
@@ -779,6 +790,10 @@ def macro_analyst_run(
         "financial_conditions_index",
         "real_10y_yield",
         "cuts_priced_proxy_2y_ffr_bp",
+        "fed_funds_futures_front_implied_rate",
+        "fed_funds_futures_3m_implied_rate",
+        "fed_funds_futures_6m_implied_rate",
+        "fed_funds_futures_implied_change_6m_bp",
         "dollar_index",
         "vix_level",
         "vix_index",
@@ -904,6 +919,37 @@ def macro_analyst_run(
         "anomaly_flags": ["tail_risk_active"] if tail_risk else [],
         "source_timestamps": {},
     }
+    indicator_snapshot = dict(features)
+    for key in [
+        "dgs2",
+        "dgs10",
+        "fed_funds_rate",
+        "real_10y_yield",
+        "dollar_index",
+        "vix_level",
+        "vix_index",
+        "wti_spot",
+        "brent_spot",
+        "wti_front_month",
+        "brent_front_month",
+        "cuts_priced_proxy_2y_ffr_bp",
+        "fed_funds_futures_front_implied_rate",
+        "fed_funds_futures_3m_implied_rate",
+        "fed_funds_futures_6m_implied_rate",
+        "fed_funds_futures_implied_change_6m_bp",
+        "unemployment_rate",
+        "financial_conditions_index",
+        "yield_curve_spread",
+        "hy_oas",
+        "pmi",
+        "cpi_yoy",
+        "core_cpi_yoy",
+        "inflation_expectation",
+        "gdp_growth",
+    ]:
+        value = macro_indicators.get(key)
+        if value is not None:
+            indicator_snapshot[key] = value
 
     output = {
         "agent_type": "macro",
@@ -946,7 +992,7 @@ def macro_analyst_run(
         "macro_regime_raw": regime,
         "macro_regime": map_macro_regime_to_canonical(regime),
         "tail_risk_warning": tail_risk,
-        "indicators": features,
+        "indicators": indicator_snapshot,
         "regime": map_macro_regime_to_canonical(regime),
         "gdp_growth": macro_indicators.get("gdp_growth"),
         "interest_rate": macro_indicators.get("fed_funds_rate"),
