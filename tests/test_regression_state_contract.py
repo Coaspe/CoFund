@@ -7,6 +7,7 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 import investment_team
+from agents import orchestrator_agent as orch
 from agents.fundamental_agent import fundamental_analyst_run
 from agents.report_agent import report_writer_node
 from schemas.common import create_initial_state
@@ -37,6 +38,70 @@ def test_ac1_orchestrator_universe_and_execution_mode(monkeypatch):
     assert len(out.get("universe", [])) >= 2
     assert out.get("analysis_execution_mode", "").startswith("B_")
     assert out.get("target_ticker") == "SPY"
+
+
+def test_ac1b_orchestrator_applies_portfolio_context_mandate(monkeypatch):
+    monkeypatch.setattr(
+        orch,
+        "_call_llm",
+        lambda user_request, iteration, risk_feedback=None, portfolio_context=None: orch._mock_orchestrator_decision(
+            user_request, iteration, risk_feedback
+        ),
+    )
+
+    state = create_initial_state(user_request="미국 시장 단기/장기 전망", mode="mock", seed=11)
+    state["portfolio_context"] = {
+        "allowed_tickers": ["SPY", "QQQ", "TLT", "GLD"],
+        "blocked_tickers": ["QQQ"],
+        "preferred_hedges": ["TLT", "GLD"],
+        "max_universe_size": 3,
+        "benchmark": "SPY",
+        "quant_risk_budget": "Conservative",
+        "rebalance_frequency": "weekly",
+        "target_gross_exposure": 1.0,
+        "max_drawdown_pct": 0.08,
+    }
+
+    out = orch.orchestrator_node(state)
+    directives = out.get("orchestrator_directives", {})
+    brief = directives.get("investment_brief", {})
+    universe = brief.get("target_universe", [])
+    quant = (directives.get("desk_tasks", {}) or {}).get("quant", {})
+    mandate = directives.get("portfolio_mandate", {})
+    monitoring = directives.get("monitoring_plan", {})
+
+    assert universe == ["SPY", "TLT", "GLD"]
+    assert quant.get("risk_budget") == "Conservative"
+    assert mandate.get("applied") is True
+    assert "preferred_hedges" in mandate.get("changes", [])
+    assert monitoring.get("review_frequency") == "weekly"
+    assert any("그로스" in item for item in monitoring.get("review_triggers", []))
+
+
+def test_ac1c_investment_team_trace_records_portfolio_mandate(monkeypatch):
+    monkeypatch.setattr(
+        orch,
+        "_call_llm",
+        lambda user_request, iteration, risk_feedback=None, portfolio_context=None: orch._mock_orchestrator_decision(
+            user_request, iteration, risk_feedback
+        ),
+    )
+    monkeypatch.setattr(investment_team, "_orch_node_impl", orch.orchestrator_node)
+    monkeypatch.setattr(investment_team, "HAS_ORCHESTRATOR", True)
+
+    state = create_initial_state(user_request="미국 시장 단기/장기 전망", mode="mock", seed=13)
+    state["portfolio_context"] = {
+        "allowed_tickers": ["SPY", "TLT", "GLD"],
+        "preferred_hedges": ["TLT", "GLD"],
+        "max_universe_size": 3,
+        "quant_risk_budget": "Conservative",
+    }
+
+    out = investment_team.orchestrator_node(state)
+
+    assert out.get("universe") == ["SPY", "TLT", "GLD"]
+    assert out.get("analysis_execution_mode", "").startswith("B_")
+    assert out.get("trace", [{}])[0].get("portfolio_mandate_applied") is True
 
 
 def test_ac2_etf_fundamental_no_insider_form4_requests():

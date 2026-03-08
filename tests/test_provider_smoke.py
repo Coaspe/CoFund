@@ -32,6 +32,15 @@ def test_fred_no_key():
     assert "limitations" in snapshot
 
 
+def test_market_macro_provider_mock():
+    """market_data_provider macro snapshot mock → dated structured fields."""
+    from data_providers.market_data_provider import fetch_macro_market_indicators
+    data, evidence, meta = fetch_macro_market_indicators(mode="mock", as_of="2026-01-01T00:00:00Z", seed=42)
+    assert set(data) >= {"wti_front_month", "brent_front_month", "vix_index"}
+    assert len(evidence) == 3
+    assert meta["data_ok"] is False
+
+
 def test_fmp_no_key():
     """FMP provider without API key → mock fundamentals."""
     from data_providers.fmp_provider import FMPProvider
@@ -91,6 +100,10 @@ def test_datahub_mock_mode():
 
     macro, ev, meta = hub.get_macro_indicators(seed=42)
     assert "yield_curve_spread" in macro
+    assert "dollar_index" in macro
+    assert "vix_level" in macro
+    assert "wti_spot" in macro
+    assert "cuts_priced_proxy_2y_ffr_bp" in macro
     assert len(ev) > 0
 
     funda, ev2, meta2 = hub.get_fundamentals("AAPL", seed=42)
@@ -113,6 +126,8 @@ if __name__ == "__main__":
     print("✅ test_fred_no_key PASSED")
     test_fmp_no_key()
     print("✅ test_fmp_no_key PASSED")
+    test_market_macro_provider_mock()
+    print("✅ test_market_macro_provider_mock PASSED")
     test_sec_no_agent()
     print("✅ test_sec_no_agent PASSED")
     test_newsapi_no_key()

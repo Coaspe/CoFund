@@ -221,6 +221,95 @@ def test_compute_risk_decision_signed_weight_preserved():
     assert "component_var_dominant" in decision["per_ticker_decisions"]["TSLA"]["flags"]
 
 
+def test_compute_risk_decision_enforces_portfolio_mandate_caps():
+    from agents.risk_agent import compute_risk_decision
+
+    payload = {
+        "risk_limits": {"max_portfolio_cvar_1d": 0.015, "max_leverage": 2.0,
+                        "max_net_exposure": 0.8, "max_gross_exposure": 2.0,
+                        "max_single_name_weight": 0.15, "max_sector_weight": 0.35,
+                        "max_hhi": 0.25, "max_quant_weight_anomaly": 0.20,
+                        "conservative_fallback_weight": 0.03, "liquidity_days_warning": 5},
+        "portfolio_risk_summary": {
+            "component_var_by_ticker": {"SPY": 0.01, "QQQ": 0.006, "TLT": 0.004},
+            "portfolio_cvar_1d": 0.005,
+            "leverage_ratio": 1.0,
+            "herfindahl_index": 0.20,
+            "sector_exposure": {"Broad Market": 0.8, "Fixed Income": 0.2},
+            "total_net_exposure": 1.0,
+        },
+        "positions_proposed": {"SPY": 0.7, "QQQ": 0.2, "TLT": 0.1},
+        "portfolio_mandate": {
+            "constraints": {
+                "allowed_tickers": ["SPY", "TLT"],
+                "blocked_tickers": ["QQQ"],
+                "max_single_name_weight": 0.5,
+                "target_gross_exposure": 0.6,
+                "target_net_exposure": 0.6,
+            }
+        },
+        "analyst_reports": {
+            "macro": {"macro_regime": "expansion", "regime": "expansion", "evidence": [1], "data_ok": True},
+            "fundamental": {"risk_flags": [], "evidence": [1], "data_ok": True},
+            "sentiment": {"evidence": [1], "data_ok": True},
+            "quant": {"decision": "LONG", "final_allocation_pct": 0.10, "evidence": [1], "data_ok": True},
+            "_target_ticker": "SPY",
+        },
+    }
+
+    decision = compute_risk_decision(payload)
+    per = decision["per_ticker_decisions"]
+
+    assert per["QQQ"]["final_weight"] == 0.0
+    assert "blocked_ticker" in per["QQQ"]["flags"]
+    assert abs(per["SPY"]["final_weight"]) <= 0.5
+    total_gross = sum(abs(v["final_weight"]) for v in per.values())
+    assert total_gross <= 0.6001
+    assert "mandate_violation" in decision["orchestrator_feedback"]["reasons"]
+
+
+def test_risk_manager_node_enforces_portfolio_context_mandate(monkeypatch):
+    from agents import risk_agent as risk
+    from schemas.common import create_initial_state
+
+    monkeypatch.setattr(risk, "_call_llm", lambda payload: risk.compute_risk_decision(payload))
+
+    state = create_initial_state(user_request="시장 전망 + 헤지", mode="mock", seed=5)
+    state["iteration_count"] = 1
+    state["target_ticker"] = "SPY"
+    state["positions_proposed"] = {"SPY": 0.7, "QQQ": 0.2, "TLT": 0.1}
+    state["portfolio_context"] = {
+        "allowed_tickers": ["SPY", "TLT"],
+        "blocked_tickers": ["QQQ"],
+        "max_single_name_weight": 0.5,
+        "target_gross_exposure": 0.6,
+    }
+    state["orchestrator_directives"] = {
+        "portfolio_mandate": {
+            "applied": True,
+            "constraints": {
+                "allowed_tickers": ["SPY", "TLT"],
+                "blocked_tickers": ["QQQ"],
+                "max_single_name_weight": 0.5,
+                "target_gross_exposure": 0.6,
+            },
+        }
+    }
+    state["macro_analysis"] = {"macro_regime": "expansion", "regime": "expansion", "evidence": [1], "data_ok": True}
+    state["fundamental_analysis"] = {"sector": "Broad Market", "risk_flags": [], "evidence": [1], "data_ok": True}
+    state["sentiment_analysis"] = {"evidence": [1], "data_ok": True}
+    state["technical_analysis"] = {"decision": "LONG", "final_allocation_pct": 0.10, "evidence": [1], "data_ok": True}
+
+    out = risk.risk_manager_node(state)
+    positions_final = out["positions_final"]
+    decision = out["risk_assessment"]["risk_decision"]
+
+    assert positions_final["QQQ"] == 0.0
+    assert positions_final["SPY"] <= 0.5
+    assert sum(abs(v) for v in positions_final.values()) <= 0.6001
+    assert "mandate_violation" in decision["orchestrator_feedback"]["reasons"]
+
+
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 # Item 8: Disagreement score
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━

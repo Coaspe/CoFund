@@ -29,6 +29,7 @@ from data_providers.fred_provider import (
     fetch_fundamentals as _legacy_fundamentals,
 )
 from data_providers.market_data_provider import fetch_prices as _legacy_prices
+from data_providers.market_data_provider import fetch_macro_market_indicators as _legacy_macro_market
 
 
 class DataHub:
@@ -67,8 +68,17 @@ class DataHub:
             return data, evidence, {"data_ok": True, "limitations": ["Mock data"]}
 
         snapshot = self._fred.get_macro_snapshot(as_of=self.as_of)
-        return snapshot["data"], snapshot["evidence"], {
-            "data_ok": snapshot["data_ok"], "limitations": snapshot["limitations"],
+        market_data, market_evidence, market_meta = _legacy_macro_market(mode="live", as_of=self.as_of, seed=seed)
+        merged = dict(snapshot["data"])
+        for key, value in (market_data or {}).items():
+            if key not in merged or merged.get(key) is None:
+                merged[key] = value
+            else:
+                merged[f"{key}_market"] = value
+        limitations = list(snapshot["limitations"]) + list((market_meta or {}).get("limitations", []))
+        return merged, list(snapshot["evidence"]) + list(market_evidence), {
+            "data_ok": bool(snapshot["data_ok"] or (market_meta or {}).get("data_ok")),
+            "limitations": limitations,
         }
 
     # ── Fundamentals ──────────────────────────────────────────────────────

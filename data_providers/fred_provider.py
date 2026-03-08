@@ -79,7 +79,13 @@ class FREDProvider(BaseProvider if isinstance(BaseProvider, type) else object):
             dgs10_val, dgs10_date = self.get_latest_observation("DGS10")
             dgs2_val, dgs2_date = self.get_latest_observation("DGS2")
             if dgs10_val is not None and dgs2_val is not None:
+                result["dgs10"] = dgs10_val
+                result["dgs2"] = dgs2_val
                 result["yield_curve_spread"] = round(dgs10_val - dgs2_val, 2)
+                evidence.append(make_evidence(metric="dgs10", value=dgs10_val,
+                                              source_name="FRED:DGS10", source_type="api", quality=0.85, as_of=dgs10_date))
+                evidence.append(make_evidence(metric="dgs2", value=dgs2_val,
+                                              source_name="FRED:DGS2", source_type="api", quality=0.85, as_of=dgs2_date))
                 evidence.append(make_evidence(metric="yield_curve_spread", value=result["yield_curve_spread"],
                                               source_name="FRED:DGS10-DGS2", source_type="api", quality=0.85, as_of=dgs10_date))
 
@@ -104,12 +110,27 @@ class FREDProvider(BaseProvider if isinstance(BaseProvider, type) else object):
                 evidence.append(make_evidence(metric="cpi_yoy", value=cpi_val,
                                               source_name="FRED:CPIAUCSL", source_type="api", quality=0.85, as_of=cpi_date))
 
-            # Fed Funds Rate
-            ff_val, ff_date = self.get_latest_observation("FEDFUNDS")
+            # Fed Funds Rate — prefer daily effective rate (DFF), fallback to monthly FEDFUNDS
+            ff_val, ff_date, ff_series = None, "", ""
+            for series_id in ("DFF", "FEDFUNDS"):
+                try:
+                    ff_candidate, ff_candidate_date = self.get_latest_observation(series_id)
+                except ProviderError:
+                    ff_candidate, ff_candidate_date = None, ""
+                if ff_candidate is not None:
+                    ff_val, ff_date, ff_series = ff_candidate, ff_candidate_date, series_id
+                    break
             if ff_val is not None:
                 result["fed_funds_rate"] = ff_val
                 evidence.append(make_evidence(metric="fed_funds_rate", value=ff_val,
-                                              source_name="FRED:FEDFUNDS", source_type="api", quality=0.85, as_of=ff_date))
+                                              source_name=f"FRED:{ff_series}", source_type="api", quality=0.85, as_of=ff_date))
+                if dgs2_val is not None:
+                    result["cuts_priced_proxy_2y_ffr_bp"] = round((ff_val - dgs2_val) * 100, 1)
+                    evidence.append(make_evidence(metric="cuts_priced_proxy_2y_ffr_bp",
+                                                  value=result["cuts_priced_proxy_2y_ffr_bp"],
+                                                  source_name=f"derived:DGS2-{ff_series}", source_type="model",
+                                                  quality=0.8, as_of=ff_date,
+                                                  note="positive means 2Y below effective policy rate; market pricing easier policy"))
 
             # PMI (ISM Manufacturing — try MANEMP as proxy, or set None)
             try:
@@ -132,6 +153,27 @@ class FREDProvider(BaseProvider if isinstance(BaseProvider, type) else object):
             except ProviderError:
                 result["gdp_growth"] = None
                 limitations.append("GDP series unavailable from FRED")
+
+            extra_series = [
+                ("DFII10", "real_10y_yield"),
+                ("DTWEXBGS", "dollar_index"),
+                ("UNRATE", "unemployment_rate"),
+                ("NFCI", "financial_conditions_index"),
+                ("VIXCLS", "vix_level"),
+                ("DCOILWTICO", "wti_spot"),
+                ("DCOILBRENTEU", "brent_spot"),
+            ]
+            for series_id, key in extra_series:
+                try:
+                    val, obs_date = self.get_latest_observation(series_id)
+                    if val is None:
+                        continue
+                    result[key] = val
+                    evidence.append(make_evidence(metric=key, value=val,
+                                                  source_name=f"FRED:{series_id}", source_type="api",
+                                                  quality=0.82, as_of=obs_date))
+                except ProviderError:
+                    limitations.append(f"{key} series unavailable from FRED")
 
         except ProviderError as e:
             limitations.append(f"FRED API error: {e}")
@@ -168,6 +210,8 @@ class FREDProvider(BaseProvider if isinstance(BaseProvider, type) else object):
     def _mock_snapshot(as_of: str) -> dict:
         rng = random.Random(42)
         indicators = {
+            "dgs10": round(rng.uniform(3.0, 5.5), 2),
+            "dgs2": round(rng.uniform(2.5, 5.75), 2),
             "yield_curve_spread": round(rng.uniform(-0.5, 2.5), 2),
             "hy_oas": round(rng.uniform(200, 700), 0),
             "inflation_expectation": round(rng.uniform(1.0, 5.5), 2),
@@ -175,7 +219,15 @@ class FREDProvider(BaseProvider if isinstance(BaseProvider, type) else object):
             "pmi": round(rng.uniform(42, 62), 1),
             "fed_funds_rate": round(rng.uniform(3.0, 5.75), 2),
             "gdp_growth": round(rng.uniform(-1.0, 4.5), 2),
+            "real_10y_yield": round(rng.uniform(0.5, 2.5), 2),
+            "dollar_index": round(rng.uniform(105, 130), 2),
+            "unemployment_rate": round(rng.uniform(3.2, 6.8), 2),
+            "financial_conditions_index": round(rng.uniform(-1.0, 1.5), 2),
+            "vix_level": round(rng.uniform(12, 35), 2),
+            "wti_spot": round(rng.uniform(65, 95), 2),
+            "brent_spot": round(rng.uniform(68, 100), 2),
         }
+        indicators["cuts_priced_proxy_2y_ffr_bp"] = round((indicators["fed_funds_rate"] - indicators["dgs2"]) * 100, 1)
         evidence = [
             make_evidence(metric=k, value=v, source_name="mock", quality=0.3, as_of=as_of)
             for k, v in indicators.items()
@@ -201,6 +253,8 @@ def fetch_macro_indicators(*, mode: str = "mock", as_of: str = "", seed: int | N
     # Mock
     rng = random.Random(seed)
     indicators = {
+        "dgs10": round(rng.uniform(3.0, 5.5), 2),
+        "dgs2": round(rng.uniform(2.5, 5.75), 2),
         "yield_curve_spread": round(rng.uniform(-0.50, 2.50), 2),
         "hy_oas": round(rng.uniform(200, 700), 0),
         "inflation_expectation": round(rng.uniform(1.0, 5.5), 2),
@@ -208,7 +262,15 @@ def fetch_macro_indicators(*, mode: str = "mock", as_of: str = "", seed: int | N
         "pmi": round(rng.uniform(42, 62), 1),
         "fed_funds_rate": round(rng.uniform(3.0, 5.75), 2),
         "gdp_growth": round(rng.uniform(-1.0, 4.5), 2),
+        "real_10y_yield": round(rng.uniform(0.5, 2.5), 2),
+        "dollar_index": round(rng.uniform(105, 130), 2),
+        "unemployment_rate": round(rng.uniform(3.2, 6.8), 2),
+        "financial_conditions_index": round(rng.uniform(-1.0, 1.5), 2),
+        "vix_level": round(rng.uniform(12, 35), 2),
+        "wti_spot": round(rng.uniform(65, 95), 2),
+        "brent_spot": round(rng.uniform(68, 100), 2),
     }
+    indicators["cuts_priced_proxy_2y_ffr_bp"] = round((indicators["fed_funds_rate"] - indicators["dgs2"]) * 100, 1)
     evidence = [
         make_evidence(metric=k, value=v, source_name="mock", quality=0.3, as_of=as_of)
         for k, v in indicators.items()

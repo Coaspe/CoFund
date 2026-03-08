@@ -73,6 +73,73 @@ LIMITS = {
 }
 
 
+def _normalize_ticker_list(value: Any) -> list[str]:
+    if value is None:
+        return []
+    if isinstance(value, str):
+        items = value.replace(",", " ").split()
+    elif isinstance(value, (list, tuple, set)):
+        items = list(value)
+    else:
+        return []
+    out: list[str] = []
+    seen: set[str] = set()
+    for item in items:
+        ticker = str(item or "").strip().upper()
+        if not ticker or ticker in seen:
+            continue
+        seen.add(ticker)
+        out.append(ticker)
+    return out
+
+
+def _coerce_float(value: Any) -> Optional[float]:
+    try:
+        if value is None or value == "":
+            return None
+        return float(value)
+    except (TypeError, ValueError):
+        return None
+
+
+def _extract_portfolio_mandate(payload: dict) -> dict:
+    orch_mandate = payload.get("portfolio_mandate", {}) or {}
+    constraints = orch_mandate.get("constraints", {}) if isinstance(orch_mandate, dict) else {}
+    raw_ctx = payload.get("portfolio_context", {}) or {}
+    if not isinstance(raw_ctx, dict):
+        raw_ctx = {}
+
+    def _pick_list(*keys: str) -> list[str]:
+        for key in keys:
+            if key in constraints and constraints.get(key):
+                return _normalize_ticker_list(constraints.get(key))
+            if key in raw_ctx and raw_ctx.get(key):
+                return _normalize_ticker_list(raw_ctx.get(key))
+        return []
+
+    def _pick_float(*keys: str) -> Optional[float]:
+        for key in keys:
+            if key in constraints:
+                val = _coerce_float(constraints.get(key))
+                if val is not None:
+                    return val
+            if key in raw_ctx:
+                val = _coerce_float(raw_ctx.get(key))
+                if val is not None:
+                    return val
+        return None
+
+    return {
+        "allowed_tickers": _pick_list("allowed_tickers", "allowed_universe"),
+        "blocked_tickers": _pick_list("blocked_tickers", "forbidden_tickers"),
+        "required_tickers": _pick_list("required_tickers", "must_include"),
+        "max_single_name_weight": _pick_float("max_single_name_weight"),
+        "target_gross_exposure": _pick_float("target_gross_exposure"),
+        "target_net_exposure": _pick_float("target_net_exposure"),
+        "max_drawdown_pct": _pick_float("max_drawdown_pct"),
+    }
+
+
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 # Part 1-A.  calculate_portfolio_risk_summary
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
@@ -668,6 +735,96 @@ def compute_risk_decision(payload: dict) -> dict:
         ticker_decisions[target] = "reduce" if ticker_decisions[target] != "reject_local" else "reject_local"
         ticker_flags.setdefault(target, []).append("quant_anomaly")
 
+    # ── Portfolio mandate enforcement (hard constraints from PM/CIO) ──────
+    mandate = _extract_portfolio_mandate(payload)
+    mandate_breached = False
+
+    allowed = set(mandate.get("allowed_tickers", []) or [])
+    blocked = set(mandate.get("blocked_tickers", []) or [])
+    required = set(mandate.get("required_tickers", []) or [])
+
+    if required:
+        missing_required = [t for t in required if t not in tickers_in_play]
+        if missing_required:
+            mandate_breached = True
+            feedback_required = True
+            feedback_reasons.append("required_ticker_missing")
+            feedback_detail_parts.append(
+                f"필수 티커 누락: {missing_required}. 포트폴리오 mandate 재계획 필요."
+            )
+
+    for t in tickers_in_play:
+        disallowed = (allowed and t not in allowed) or (t in blocked)
+        if not disallowed:
+            continue
+        mandate_breached = True
+        ticker_weights[t] = 0.0
+        ticker_decisions[t] = "reject_local"
+        code = "blocked_ticker" if t in blocked else "outside_allowed_universe"
+        ticker_flags.setdefault(t, []).append(code)
+        feedback_required = True
+        feedback_reasons.append("mandate_violation")
+        feedback_detail_parts.append(f"{t}: portfolio mandate 위반({code})으로 0 비중 처리.")
+
+    single_cap = mandate.get("max_single_name_weight")
+    if single_cap is not None and single_cap >= 0:
+        for t in tickers_in_play:
+            cur = float(ticker_weights.get(t, 0.0))
+            if abs(cur) <= float(single_cap) + 1e-12:
+                continue
+            mandate_breached = True
+            sign = -1.0 if cur < 0 else 1.0
+            ticker_weights[t] = round(sign * float(single_cap), 4)
+            ticker_decisions[t] = "reduce" if ticker_decisions[t] != "reject_local" else "reject_local"
+            ticker_flags.setdefault(t, []).append("max_single_name_weight_breach")
+            feedback_required = True
+            feedback_reasons.append("mandate_violation")
+            feedback_detail_parts.append(
+                f"{t}: 단일 비중 {abs(cur):.2%} > mandate 한도 {float(single_cap):.2%}."
+            )
+
+    def _scale_weights(scale: float, flag: str, reason: str) -> None:
+        nonlocal mandate_breached, feedback_required, gna
+        if scale >= 1.0:
+            return
+        mandate_breached = True
+        feedback_required = True
+        feedback_reasons.append("mandate_violation")
+        feedback_detail_parts.append(reason)
+        for t in tickers_in_play:
+            if ticker_decisions.get(t) == "reject_local":
+                continue
+            ticker_weights[t] = round(float(ticker_weights.get(t, 0.0)) * scale, 4)
+            ticker_decisions[t] = "reduce"
+            ticker_flags.setdefault(t, []).append(flag)
+        gross_after = sum(abs(float(ticker_weights.get(t, 0.0))) for t in tickers_in_play)
+        net_after = sum(float(ticker_weights.get(t, 0.0)) for t in tickers_in_play)
+        gna = {
+            "target_gross_exposure": round(gross_after, 4),
+            "target_net_exposure": round(net_after, 4),
+            "reason": reason,
+        }
+
+    target_gross = mandate.get("target_gross_exposure")
+    if target_gross is not None and target_gross >= 0:
+        current_gross = sum(abs(float(ticker_weights.get(t, 0.0))) for t in tickers_in_play)
+        if current_gross > float(target_gross) + 1e-12:
+            _scale_weights(
+                float(target_gross) / max(current_gross, 1e-8),
+                "target_gross_exposure_cap",
+                f"총 그로스 노출 {current_gross:.2%} > mandate 한도 {float(target_gross):.2%}.",
+            )
+
+    target_net = mandate.get("target_net_exposure")
+    if target_net is not None and target_net >= 0:
+        current_net = sum(float(ticker_weights.get(t, 0.0)) for t in tickers_in_play)
+        if abs(current_net) > float(target_net) + 1e-12:
+            _scale_weights(
+                float(target_net) / max(abs(current_net), 1e-8),
+                "target_net_exposure_cap",
+                f"순 노출 {abs(current_net):.2%} > mandate 한도 {float(target_net):.2%}.",
+            )
+
     # ── 최종 조립 ─────────────────────────────────────────────────────────
     per_ticker = {}
     for t in tickers_in_play:
@@ -826,6 +983,12 @@ def risk_manager_node(state: InvestmentState) -> dict:
     payload = aggregate_risk_payload(risk_summary, analyst_reports)
     if positions_proposed:
         payload["positions_proposed"] = positions_proposed
+    payload["portfolio_context"] = state.get("portfolio_context", {}) or {}
+    payload["portfolio_mandate"] = (
+        ((state.get("orchestrator_directives", {}) or {}).get("portfolio_mandate", {}))
+        if isinstance(state.get("orchestrator_directives", {}), dict)
+        else {}
+    )
 
     print("   [LLM] 5-Gate CRO 의사결정 요청 중...")
     decision = _call_llm(payload)

@@ -727,6 +727,7 @@ def orchestrator_node(state: InvestmentState) -> dict:
         "intent": intent,
         "execution_mode": execution_mode,
         "universe_size": len(universe),
+        "portfolio_mandate_applied": bool(((directives.get("portfolio_mandate") or {}) if isinstance(directives, dict) else {}).get("applied")),
     }
     result["trace"] = [trace_entry]
 
@@ -738,6 +739,7 @@ def orchestrator_node(state: InvestmentState) -> dict:
         [
             f"action={trace_entry.get('action_type')} targets={_list_preview(brief.get('target_universe', []), max_items=7, max_len=160) or 'n/a'}",
             f"intent={intent} mode={execution_mode} language={output_language}",
+            f"mandate_applied={trace_entry.get('portfolio_mandate_applied')}",
             f"tasks={','.join(result.get('analysis_tasks', []))}",
             f"rationale={_short_text(brief.get('rationale', ''), max_len=180) or 'n/a'}",
         ],

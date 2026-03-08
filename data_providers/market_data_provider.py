@@ -14,6 +14,12 @@ import numpy as np
 
 from schemas.common import make_evidence
 
+_MACRO_MARKET_SYMBOLS = {
+    "wti_front_month": "CL=F",
+    "brent_front_month": "BZ=F",
+    "vix_index": "^VIX",
+}
+
 
 def fetch_prices(
     ticker: str,
@@ -72,3 +78,91 @@ def _fetch_mock(ticker: str, days: int, as_of: str, seed: int | None) -> Tuple[n
         note=f"{ticker} synthetic via OU process",
     )]
     return prices, evidence
+
+
+def fetch_macro_market_indicators(
+    *,
+    mode: str = "mock",
+    as_of: str = "",
+    seed: int | None = None,
+) -> Tuple[dict, List[dict], dict]:
+    as_of = as_of or datetime.now(timezone.utc).isoformat()
+    if mode == "live":
+        try:
+            data, evidence = _fetch_live_macro_market(as_of)
+            return data, evidence, {"data_ok": bool(data), "limitations": [], "as_of": as_of}
+        except Exception as e:
+            data, evidence = _fetch_mock_macro_market(as_of, seed)
+            return data, evidence, {
+                "data_ok": False,
+                "limitations": [f"market_data_provider live error: {e}", "Using mock macro market data"],
+                "as_of": as_of,
+            }
+    data, evidence = _fetch_mock_macro_market(as_of, seed)
+    return data, evidence, {"data_ok": False, "limitations": ["Mock macro market data"], "as_of": as_of}
+
+
+def _fetch_live_macro_market(as_of: str) -> Tuple[dict, List[dict]]:
+    try:
+        import yfinance as yf  # type: ignore
+    except ImportError:
+        raise ImportError("yfinance 미설치. pip install yfinance 필요")
+
+    data: dict = {}
+    evidence: List[dict] = []
+
+    for metric, symbol in _MACRO_MARKET_SYMBOLS.items():
+        df = yf.download(symbol, period="1mo", interval="1d", progress=False, auto_adjust=False)
+        if df is None or df.empty:
+            continue
+        close = df["Close"]
+        if hasattr(close, "columns"):
+            close = close.iloc[:, 0]
+        close = close.dropna()
+        if close.empty:
+            continue
+        last_ts = close.index[-1]
+        last_val = float(close.iloc[-1])
+        ts = getattr(last_ts, "to_pydatetime", lambda: last_ts)()
+        if isinstance(ts, datetime):
+            if ts.tzinfo is None:
+                ts = ts.replace(tzinfo=timezone.utc)
+            else:
+                ts = ts.astimezone(timezone.utc)
+            point_as_of = ts.isoformat()
+        else:
+            point_as_of = as_of
+        data[metric] = round(last_val, 4)
+        evidence.append(
+            make_evidence(
+                metric=metric,
+                value=data[metric],
+                source_name=f"yfinance:{symbol}",
+                source_type="api",
+                quality=0.75,
+                as_of=point_as_of,
+                note=f"last trading date for {symbol}",
+            )
+        )
+    return data, evidence
+
+
+def _fetch_mock_macro_market(as_of: str, seed: int | None) -> Tuple[dict, List[dict]]:
+    rng = np.random.default_rng(seed if seed is not None else 42)
+    data = {
+        "wti_front_month": round(float(rng.uniform(65, 95)), 2),
+        "brent_front_month": round(float(rng.uniform(68, 100)), 2),
+        "vix_index": round(float(rng.uniform(12, 32)), 2),
+    }
+    evidence = [
+        make_evidence(
+            metric=metric,
+            value=value,
+            source_name="mock",
+            quality=0.3,
+            as_of=as_of,
+            note="synthetic macro market fallback",
+        )
+        for metric, value in data.items()
+    ]
+    return data, evidence

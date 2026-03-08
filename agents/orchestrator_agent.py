@@ -135,6 +135,7 @@ A. 초기 지시 모드 (iteration_count == 0)
 사용자의 요청을 분석하여 아래 사항을 포함한 미니 IPS(Investment Policy Statement)를 수립하라:
 - 투자 목적과 판단 근거 (rationale)
 - 분석 대상 종목/ETF 유니버스 (target_universe)
+- Portfolio Context가 제공되면 허용/금지 티커, 벤치마크, 리스크 예산, 리밸런싱 주기 같은 mandate를 우선 반영하라.
 각 데스크가 수행할 분석의 파라미터를 명시한 작업 지시서(Task Payload)를 작성하라:
 - horizon_days: 투자기간
 - risk_budget: 리스크 예산 수준 (Conservative / Moderate / Aggressive) — Quant 데스크에 적용
@@ -186,6 +187,7 @@ def _build_orchestrator_human_msg(
     user_request: str,
     iteration: int,
     risk_feedback: Optional[dict] = None,
+    portfolio_context: Optional[dict] = None,
 ) -> str:
     """LLM에게 전달할 Human 메시지 조립."""
     parts = [
@@ -197,6 +199,11 @@ def _build_orchestrator_human_msg(
         parts.append(
             f"[Risk Manager 피드백]\n```json\n"
             f"{json.dumps(risk_feedback, ensure_ascii=False, indent=2)}\n```"
+        )
+    if portfolio_context:
+        parts.append(
+            f"[Portfolio Context]\n```json\n"
+            f"{json.dumps(portfolio_context, ensure_ascii=False, indent=2)}\n```"
         )
     return "\n".join(parts)
 
@@ -224,6 +231,304 @@ def _default_desk_tasks(
         "quant":       {"horizon_days": horizon_days, "risk_budget": risk_budget,
                         "focus_areas": ["CVaR 최적화", "Z-score"]},
     }
+
+
+def _normalize_ticker_list(value: Any) -> list[str]:
+    if value is None:
+        return []
+    if isinstance(value, str):
+        items = re.split(r"[\s,]+", value)
+    elif isinstance(value, (list, tuple, set)):
+        items = list(value)
+    else:
+        return []
+    out: list[str] = []
+    seen: set[str] = set()
+    for item in items:
+        t = str(item or "").strip().upper()
+        if not t or t in seen:
+            continue
+        seen.add(t)
+        out.append(t)
+    return out
+
+
+def _coerce_float(value: Any) -> Optional[float]:
+    try:
+        if value is None or value == "":
+            return None
+        return float(value)
+    except (TypeError, ValueError):
+        return None
+
+
+def _coerce_int(value: Any) -> Optional[int]:
+    try:
+        if value is None or value == "":
+            return None
+        return int(value)
+    except (TypeError, ValueError):
+        return None
+
+
+def _normalize_risk_budget(value: Any) -> Optional[str]:
+    raw = str(value or "").strip().lower()
+    if not raw:
+        return None
+    if raw.startswith("cons"):
+        return "Conservative"
+    if raw.startswith("agg"):
+        return "Aggressive"
+    if raw.startswith("mod"):
+        return "Moderate"
+    return None
+
+
+def _normalize_portfolio_context(portfolio_context: Optional[dict]) -> dict:
+    if not isinstance(portfolio_context, dict):
+        return {}
+    benchmark = str(
+        portfolio_context.get("benchmark")
+        or portfolio_context.get("benchmark_ticker")
+        or ""
+    ).strip().upper()
+    return {
+        "allowed_tickers": _normalize_ticker_list(
+            portfolio_context.get("allowed_tickers")
+            or portfolio_context.get("allowed_universe")
+        ),
+        "blocked_tickers": _normalize_ticker_list(
+            portfolio_context.get("blocked_tickers")
+            or portfolio_context.get("forbidden_tickers")
+        ),
+        "required_tickers": _normalize_ticker_list(
+            portfolio_context.get("required_tickers")
+            or portfolio_context.get("must_include")
+        ),
+        "preferred_hedges": _normalize_ticker_list(
+            portfolio_context.get("preferred_hedges")
+            or portfolio_context.get("hedge_candidates")
+        ),
+        "benchmark": benchmark,
+        "max_universe_size": _coerce_int(portfolio_context.get("max_universe_size")),
+        "quant_risk_budget": _normalize_risk_budget(
+            portfolio_context.get("quant_risk_budget")
+            or portfolio_context.get("risk_budget_override")
+        ),
+        "review_frequency": str(
+            portfolio_context.get("rebalance_frequency")
+            or portfolio_context.get("review_frequency")
+            or ""
+        ).strip().lower(),
+        "max_single_name_weight": _coerce_float(portfolio_context.get("max_single_name_weight")),
+        "max_drawdown_pct": _coerce_float(portfolio_context.get("max_drawdown_pct")),
+        "target_gross_exposure": _coerce_float(portfolio_context.get("target_gross_exposure")),
+        "target_net_exposure": _coerce_float(portfolio_context.get("target_net_exposure")),
+    }
+
+
+def _append_focus_area(task: dict, item: str) -> dict:
+    out = dict(task or {})
+    focus_areas = list(out.get("focus_areas", []) or [])
+    if item and item not in focus_areas:
+        focus_areas.append(item)
+    out["focus_areas"] = focus_areas
+    return out
+
+
+def _trim_universe(universe: list[str], max_size: Optional[int], required: list[str]) -> list[str]:
+    if max_size is None or max_size <= 0 or len(universe) <= max_size:
+        return universe
+    required_set = set(required)
+    ordered = list(universe[:1])
+    ordered.extend(t for t in universe[1:] if t in required_set)
+    ordered.extend(t for t in universe[1:] if t not in required_set)
+    out: list[str] = []
+    seen: set[str] = set()
+    for ticker in ordered:
+        if ticker in seen:
+            continue
+        seen.add(ticker)
+        out.append(ticker)
+        if len(out) >= max_size:
+            break
+    return out
+
+
+def _build_monitoring_plan(mandate: dict) -> dict:
+    review_triggers: list[str] = []
+    benchmark = mandate.get("benchmark")
+    if benchmark:
+        review_triggers.append(f"벤치마크({benchmark}) 대비 상대 성과/베타 이탈 시 재점검")
+    if mandate.get("target_gross_exposure") is not None:
+        review_triggers.append(
+            f"총 그로스 노출이 {float(mandate['target_gross_exposure']):.0%} 수준에 근접하면 재점검"
+        )
+    if mandate.get("target_net_exposure") is not None:
+        review_triggers.append(
+            f"순 노출이 {float(mandate['target_net_exposure']):.0%} 수준을 벗어나면 재점검"
+        )
+    if mandate.get("max_single_name_weight") is not None:
+        review_triggers.append(
+            f"단일 아이디어 비중이 {float(mandate['max_single_name_weight']):.0%} 한도에 접근하면 재점검"
+        )
+    if mandate.get("max_drawdown_pct") is not None:
+        review_triggers.append(
+            f"누적 손실이 {float(mandate['max_drawdown_pct']):.0%} 수준에 근접하면 리밸런싱 검토"
+        )
+    if mandate.get("preferred_hedges"):
+        review_triggers.append(
+            f"지정 헤지 후보({', '.join(mandate['preferred_hedges'][:3])})의 상관/유동성 훼손 시 재검토"
+        )
+    return {
+        "review_frequency": mandate.get("review_frequency") or "event-driven",
+        "review_triggers": review_triggers,
+    }
+
+
+def _apply_portfolio_mandate(decision: dict, portfolio_context: Optional[dict]) -> dict:
+    mandate = _normalize_portfolio_context(portfolio_context)
+    if not mandate:
+        return decision
+
+    out = dict(decision or {})
+    brief = dict(out.get("investment_brief", {}) or {})
+    raw_tasks = out.get("desk_tasks", {}) or {}
+    desk_tasks = {
+        str(k): (dict(v) if isinstance(v, dict) else {})
+        for k, v in raw_tasks.items()
+    }
+    universe = _normalize_ticker_list(brief.get("target_universe", []))
+    original_universe = list(universe)
+    changes: list[str] = []
+
+    allowed = set(mandate.get("allowed_tickers", []))
+    blocked = set(mandate.get("blocked_tickers", []))
+    required = [
+        t for t in mandate.get("required_tickers", [])
+        if (not allowed or t in allowed) and t not in blocked
+    ]
+    preferred_hedges = [
+        t for t in mandate.get("preferred_hedges", [])
+        if (not allowed or t in allowed) and t not in blocked
+    ]
+
+    if allowed:
+        filtered = [t for t in universe if t in allowed]
+        if filtered != universe:
+            changes.append("allowed_tickers")
+        universe = filtered
+
+    if blocked:
+        filtered = [t for t in universe if t not in blocked]
+        if filtered != universe:
+            changes.append("blocked_tickers")
+        universe = filtered
+
+    if not universe:
+        fallback = []
+        if required:
+            fallback.extend(required)
+        elif allowed:
+            fallback.extend(list(mandate.get("allowed_tickers", []))[:1])
+        elif mandate.get("benchmark") and mandate["benchmark"] not in blocked:
+            fallback.append(mandate["benchmark"])
+        if fallback:
+            universe = _normalize_ticker_list(fallback)
+            changes.append("fallback_universe")
+
+    for ticker in required:
+        if ticker not in universe:
+            universe.append(ticker)
+            changes.append("required_tickers")
+
+    for hedge in preferred_hedges:
+        if hedge not in universe:
+            universe.append(hedge)
+            changes.append("preferred_hedges")
+
+    trimmed = _trim_universe(universe, mandate.get("max_universe_size"), required)
+    if trimmed != universe:
+        changes.append("max_universe_size")
+    universe = trimmed
+
+    quant = dict(desk_tasks.get("quant", {}) or {})
+    if mandate.get("quant_risk_budget"):
+        if quant.get("risk_budget") != mandate["quant_risk_budget"]:
+            changes.append("quant_risk_budget")
+        quant["risk_budget"] = mandate["quant_risk_budget"]
+    if mandate.get("benchmark"):
+        quant = _append_focus_area(quant, f"벤치마크({mandate['benchmark']}) 대비 베타/상대 성과 점검")
+        desk_tasks["macro"] = _append_focus_area(
+            desk_tasks.get("macro", {}),
+            f"벤치마크({mandate['benchmark']}) 대비 매크로 레짐 적합성 점검",
+        )
+    if mandate.get("preferred_hedges"):
+        quant = _append_focus_area(
+            quant,
+            f"지정 헤지 후보({', '.join(mandate['preferred_hedges'][:3])}) 상관/유동성 점검",
+        )
+        desk_tasks["sentiment"] = _append_focus_area(
+            desk_tasks.get("sentiment", {}),
+            "리스크오프 흐름과 헤지 수요 변화 확인",
+        )
+    if mandate.get("max_single_name_weight") is not None:
+        quant = _append_focus_area(
+            quant,
+            f"단일 아이디어 비중 한도({float(mandate['max_single_name_weight']):.0%}) 적합성 점검",
+        )
+        desk_tasks["fundamental"] = _append_focus_area(
+            desk_tasks.get("fundamental", {}),
+            "아이디어 집중도 정당화 가능 여부 점검",
+        )
+    if (
+        mandate.get("target_gross_exposure") is not None
+        or mandate.get("target_net_exposure") is not None
+        or mandate.get("max_drawdown_pct") is not None
+    ):
+        quant = _append_focus_area(quant, "포트폴리오 mandate(그로스/넷/드로다운) 적합성 점검")
+    desk_tasks["quant"] = quant
+
+    brief["target_universe"] = universe
+    rationale = str(brief.get("rationale", "")).strip()
+    rationale_notes: list[str] = []
+    if "allowed_tickers" in changes or "blocked_tickers" in changes or "fallback_universe" in changes:
+        rationale_notes.append("허용/금지 유니버스 제약 반영")
+    if "preferred_hedges" in changes:
+        rationale_notes.append("지정 헤지 후보 반영")
+    if "quant_risk_budget" in changes:
+        rationale_notes.append(f"quant 리스크 예산을 {mandate['quant_risk_budget']}로 조정")
+    if "max_universe_size" in changes:
+        rationale_notes.append("유니버스 크기 한도 반영")
+    if rationale_notes:
+        suffix = " 포트폴리오 mandate 반영: " + "; ".join(rationale_notes) + "."
+        if suffix not in rationale:
+            brief["rationale"] = (rationale + suffix).strip()
+
+    out["investment_brief"] = brief
+    out["desk_tasks"] = desk_tasks
+    out["portfolio_mandate"] = {
+        "applied": bool(changes),
+        "changes": changes,
+        "original_universe": original_universe,
+        "final_universe": universe,
+        "benchmark": mandate.get("benchmark"),
+        "review_frequency": mandate.get("review_frequency") or "event-driven",
+        "constraints": {
+            "allowed_tickers": mandate.get("allowed_tickers", []),
+            "blocked_tickers": mandate.get("blocked_tickers", []),
+            "required_tickers": required,
+            "preferred_hedges": preferred_hedges,
+            "max_universe_size": mandate.get("max_universe_size"),
+            "quant_risk_budget": mandate.get("quant_risk_budget"),
+            "max_single_name_weight": mandate.get("max_single_name_weight"),
+            "max_drawdown_pct": mandate.get("max_drawdown_pct"),
+            "target_gross_exposure": mandate.get("target_gross_exposure"),
+            "target_net_exposure": mandate.get("target_net_exposure"),
+        },
+    }
+    out["monitoring_plan"] = _build_monitoring_plan(mandate)
+    return out
 
 
 def classify_intent_rules(user_request: str) -> dict:
@@ -280,10 +585,16 @@ def classify_intent_rules(user_request: str) -> dict:
             "desk_tasks": _default_desk_tasks(30, "Moderate")}
 
 
-def _plan_cache_key(user_request: str, iteration: int, risk_feedback: Optional[dict]) -> str:
-    """(user_request + iteration + risk_feedback_hash) → md5 key."""
+def _plan_cache_key(
+    user_request: str,
+    iteration: int,
+    risk_feedback: Optional[dict],
+    portfolio_context: Optional[dict] = None,
+) -> str:
+    """(user_request + iteration + risk_feedback_hash + portfolio_context_hash) → md5 key."""
     fb_str = json.dumps(risk_feedback or {}, sort_keys=True)
-    raw    = f"{user_request}::{iteration}::{fb_str}"
+    ctx_str = json.dumps(portfolio_context or {}, sort_keys=True, ensure_ascii=False)
+    raw    = f"{user_request}::{iteration}::{fb_str}::{ctx_str}"
     return hashlib.md5(raw.encode()).hexdigest()
 
 
@@ -350,6 +661,7 @@ def _call_llm(
     user_request: str,
     iteration: int,
     risk_feedback: Optional[dict] = None,
+    portfolio_context: Optional[dict] = None,
 ) -> dict:
     """
     LLM-first: LLM plan을 생성하고 Pydantic 검증.
@@ -364,7 +676,7 @@ def _call_llm(
     _orch_trace(f"user_request={user_request}")
 
     # ── Plan cache check ──────────────────────────────────────────────
-    cache_key = _plan_cache_key(user_request, iteration, risk_feedback)
+    cache_key = _plan_cache_key(user_request, iteration, risk_feedback, portfolio_context)
     if use_plan_cache and cache_key in _PLAN_CACHE:
         _orch_trace(f"plan cache hit key={cache_key[:10]}")
         print("   [LLM] plan cache hit")
@@ -385,7 +697,12 @@ def _call_llm(
             _PLAN_CACHE[cache_key] = rules_plan
         return rules_plan
 
-    human_msg = _build_orchestrator_human_msg(user_request, iteration, risk_feedback)
+    human_msg = _build_orchestrator_human_msg(
+        user_request,
+        iteration,
+        risk_feedback,
+        portfolio_context,
+    )
     human_msg_preview = human_msg if len(human_msg) <= 800 else (human_msg[:800] + " ...<truncated>")
     _orch_trace("human_msg:\n" + human_msg_preview)
 
@@ -693,7 +1010,9 @@ def orchestrator_node(state: InvestmentState) -> dict:
 
     # LLM/Mock 호출
     print(f"   [LLM] CIO 의사결정 요청 중...")
-    decision = _call_llm(user_request, iteration, risk_feedback)
+    portfolio_context = state.get("portfolio_context", {})
+    decision = _call_llm(user_request, iteration, risk_feedback, portfolio_context)
+    decision = _apply_portfolio_mandate(decision, portfolio_context)
 
     action = decision.get("action_type", "initial_delegation")
     brief = decision.get("investment_brief", {})
@@ -708,6 +1027,10 @@ def orchestrator_node(state: InvestmentState) -> dict:
     desk_tasks = decision.get("desk_tasks", {})
     for desk, task in desk_tasks.items():
         print(f"   [데스크:{desk}] horizon={task.get('horizon_days')}d, focus={task.get('focus_areas', [])}")
+    mandate_meta = decision.get("portfolio_mandate", {})
+    if isinstance(mandate_meta, dict) and mandate_meta.get("applied"):
+        print(f"   [mandate] changes={mandate_meta.get('changes', [])}")
+        print(f"   [mandate] final_universe={mandate_meta.get('final_universe', universe)}")
 
     if action == "fallback_abort":
         print(f"   ⚠️  FALLBACK: 신규 매수 포기. 현금 관망 또는 방어 대안 제시.")
