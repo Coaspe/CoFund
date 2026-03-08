@@ -126,6 +126,509 @@ class TestFundaValuationStretch:
         ww = " ".join(out.get("what_to_watch") or [])
         assert "valuation" in ww.lower() or len(out.get("what_to_watch", [])) > 0
 
+    def test_fundamental_agent_emits_consensus_catalyst_and_variant_fields(self):
+        fin = {
+            "total_assets": 500_000,
+            "current_assets": 150_000,
+            "current_liabilities": 50_000,
+            "retained_earnings": 200_000,
+            "ebit": 75_000,
+            "ebitda": 100_000,
+            "market_cap": 2_000_000,
+            "total_liabilities": 200_000,
+            "revenue": 400_000,
+            "interest_expense": 5_000,
+            "net_debt": 50_000,
+            "free_cash_flow": 70_000,
+            "fcf_history": [60_000, 58_000, 52_000, 45_000, 41_000],
+            "revenue_growth": 15.0,
+            "earnings_growth": 18.0,
+            "pe_ratio": 20.0,
+            "ps_ratio": 6.0,
+            "roe": 25.0,
+            "debt_to_equity": 0.7,
+            "current_price": 100.0,
+            "next_earnings_date": "2026-04-30",
+            "earnings_in_days": 10,
+            "next_eps_estimate": 1.8,
+            "next_revenue_estimate": 405_000,
+            "analyst_estimate_fy": "2027-09-30",
+            "analyst_eps_estimate_next_fy": 8.2,
+            "analyst_revenue_estimate_next_fy": 450_000,
+            "price_target_consensus": 118.0,
+            "price_target_upside_pct": 18.0,
+            "rating": "B",
+            "rating_overall_score": 3,
+            "rating_dcf_score": 3,
+        }
+        out = fundamental_analyst_run("AAPL", fin)
+        assert "consensus_snapshot" in out
+        assert "catalyst_calendar" in out and out["catalyst_calendar"]
+        assert "valuation_anchor" in out
+        assert "variant_view" in out
+        assert out["consensus_snapshot"]["price_target_upside_pct"] == 18.0
+        assert out["catalyst_calendar"][0]["type"] == "earnings"
+        assert out["valuation_anchor"]["price_target_consensus"] == 118.0
+        assert out["variant_view"]["key_gap"]
+
+    def test_fundamental_agent_near_earnings_limits_sizing(self):
+        fin = {
+            "total_assets": 500_000,
+            "current_assets": 150_000,
+            "current_liabilities": 50_000,
+            "retained_earnings": 200_000,
+            "ebit": 75_000,
+            "ebitda": 100_000,
+            "market_cap": 2_000_000,
+            "total_liabilities": 200_000,
+            "revenue": 400_000,
+            "interest_expense": 5_000,
+            "net_debt": 50_000,
+            "free_cash_flow": 70_000,
+            "fcf_history": [60_000, 58_000, 52_000, 45_000, 41_000],
+            "revenue_growth": 15.0,
+            "pe_ratio": 20.0,
+            "roe": 25.0,
+            "debt_to_equity": 0.7,
+            "next_earnings_date": "2026-04-30",
+            "earnings_in_days": 7,
+            "next_eps_estimate": 1.8,
+            "next_revenue_estimate": 405_000,
+        }
+        out = fundamental_analyst_run("AAPL", fin)
+        assert out["recommendation"] == "allow_with_limits"
+
+    def test_fundamental_agent_emits_peer_model_management_and_ownership_layers(self):
+        fin = {
+            "total_assets": 500_000,
+            "current_assets": 150_000,
+            "current_liabilities": 50_000,
+            "retained_earnings": 200_000,
+            "ebit": 75_000,
+            "ebitda": 100_000,
+            "market_cap": 2_000_000,
+            "total_liabilities": 200_000,
+            "revenue": 400_000,
+            "interest_expense": 5_000,
+            "net_debt": 50_000,
+            "free_cash_flow": 70_000,
+            "fcf_history": [60_000, 58_000, 52_000, 45_000, 41_000],
+            "revenue_growth": 15.0,
+            "earnings_growth": 18.0,
+            "pe_ratio": 20.0,
+            "ps_ratio": 6.0,
+            "roe": 25.0,
+            "debt_to_equity": 0.7,
+            "operating_margin": 22.0,
+            "current_price": 100.0,
+            "price_avg_50d": 95.0,
+            "price_avg_200d": 90.0,
+            "eps_ttm_proxy": 5.0,
+            "next_earnings_date": "2026-04-30",
+            "earnings_in_days": 18,
+            "next_eps_estimate": 1.8,
+            "next_revenue_estimate": 405_000,
+            "analyst_estimate_fy": "2027-09-30",
+            "analyst_eps_estimate_next_fy": 8.2,
+            "analyst_revenue_estimate_next_fy": 450_000,
+            "price_target_consensus": 118.0,
+            "price_target_upside_pct": 18.0,
+            "rating_revision_score_30d": 2.0,
+            "rating_revision_score_90d": 3.5,
+            "street_revision_proxy": "improving",
+            "estimate_periods": {
+                "0q": {
+                    "eps_estimate": 1.95,
+                    "revenue_estimate": 410_000,
+                    "eps_revision_30d_pct": 3.2,
+                    "eps_revision_90d_pct": 5.5,
+                    "up_last_30d": 14,
+                    "down_last_30d": 2,
+                    "revision_state": "improving",
+                },
+                "0y": {
+                    "eps_estimate": 8.4,
+                    "revenue_estimate": 455_000,
+                    "eps_revision_30d_pct": 2.1,
+                    "eps_revision_90d_pct": 4.4,
+                    "up_last_30d": 18,
+                    "down_last_30d": 1,
+                    "revision_state": "improving",
+                },
+            },
+            "valuation_history_real": {
+                "status": "ok",
+                "source": "quarterly_statements_plus_quarter_end_prices",
+                "valuation_points": [
+                    {"date": "2025-03-31", "pe_ratio": 18.0, "ps_ratio": 5.5, "fcf_yield_pct": 3.0},
+                    {"date": "2025-06-30", "pe_ratio": 19.0, "ps_ratio": 5.7, "fcf_yield_pct": 2.9},
+                    {"date": "2025-09-30", "pe_ratio": 20.0, "ps_ratio": 6.0, "fcf_yield_pct": 2.8},
+                    {"date": "2025-12-31", "pe_ratio": 21.0, "ps_ratio": 6.1, "fcf_yield_pct": 2.7},
+                ],
+                "pe_ratios": [18.0, 19.0, 20.0, 21.0],
+                "ps_ratios": [5.5, 5.7, 6.0, 6.1],
+                "fcf_yield_pcts": [3.0, 2.9, 2.8, 2.7],
+            },
+            "ttm_revenue_real": 430_000,
+            "ttm_operating_margin_real": 23.0,
+            "ttm_fcf_real": 75_000,
+            "ttm_fcf_margin_real": 17.4,
+            "eps_ttm_real": 5.2,
+            "shares_outstanding_real": 15_000,
+            "buyback_yield_pct": 2.5,
+            "dividend_cash_yield_pct": 0.7,
+            "capital_return_yield_pct": 3.2,
+            "acquisitions_last_fy": 1_000,
+            "debt_funded_buyback_flag": False,
+            "last_eps_surprise_pct": 4.0,
+            "earnings_beat_rate_4q": 75.0,
+            "revenue_beat_rate_4q": 75.0,
+            "eps_surprise_avg_4q": 3.5,
+            "audit_risk_yahoo": 2,
+            "board_risk_yahoo": 1,
+            "compensation_risk_yahoo": 6,
+            "shareholder_rights_risk_yahoo": 2,
+        }
+        peers = [
+            {"symbol": "MSFT", "pe_ratio": 28.0, "ps_ratio": 10.0, "operating_margin": 44.0, "roe": 30.0, "revenue_growth": 14.0},
+            {"symbol": "GOOGL", "pe_ratio": 24.0, "ps_ratio": 7.0, "operating_margin": 31.0, "roe": 27.0, "revenue_growth": 13.0},
+            {"symbol": "META", "pe_ratio": 25.0, "ps_ratio": 8.0, "operating_margin": 38.0, "roe": 29.0, "revenue_growth": 16.0},
+        ]
+        ownership_items = [
+            {"title": "APPLE INC  (AAPL)  (CIK 0000320193) Form 4", "published_at": "2026-03-01"},
+            {"title": "APPLE INC  (AAPL)  (CIK 0000320193) SC 13G", "published_at": "2026-02-20"},
+        ]
+        ownership_snapshot = {
+            "status": "ok",
+            "institutions_percent_held": 0.65,
+            "institutions_float_percent_held": 0.67,
+            "institutions_count": 4500,
+            "top_holder_pct": 0.10,
+            "institutional_top10_pct": 0.31,
+            "institutional_hhi_top10": 0.018,
+            "institutional_concentration_level": "medium",
+            "crowding_risk": "normal",
+            "insider_net_activity": "buying",
+            "insider_net_shares_6m": 120000,
+            "incremental_buyer_seller_map": {
+                "buyers": [{"holder": "Vanguard", "pct_change": 0.02, "pct_held": 0.10, "date_reported": "2025-12-31"}],
+                "sellers": [{"holder": "FMR", "pct_change": -0.01, "pct_held": 0.03, "date_reported": "2025-12-31"}],
+            },
+            "ownership_report_date": "2025-12-31",
+        }
+        out = fundamental_analyst_run("AAPL", fin, peers=peers, ownership_items=ownership_items, ownership_snapshot=ownership_snapshot)
+        assert out["consensus_revision_layer"]["estimate_revision_proxy"]["mode"] == "yfinance_eps_trend"
+        assert out["consensus_revision_layer"]["estimate_revision_proxy"]["state"] == "improving"
+        assert out["peer_comp_engine"]["status"] == "ok"
+        assert out["peer_comp_engine"]["peer_median_pe"] == 25.0
+        assert out["model_pack"]["status"] == "ok"
+        assert out["street_disagreement_layer"]["consensus_strength"] in {"strong", "balanced"}
+        assert out["expected_return_profile"]["quality"] in {"attractive", "balanced"}
+        assert out["management_capital_allocation"]["guidance_credibility"] == "high"
+        assert out["model_pack"]["basis"].startswith("real TTM financials")
+        assert out["model_pack"]["revenue_build"]["history_quarters"] == []
+        assert out["ownership_crowding"]["status"] == "structured"
+        assert out["ownership_crowding"]["institutional_concentration"]["top10_pct"] == 0.31
+        assert out["data_provenance"]["quality"] in {"high", "medium"}
+        assert out["monitoring_triggers"]
+
+    def test_fundamental_low_provenance_and_high_uncertainty_reduce_recommendation(self):
+        fin = {
+            "total_assets": 500_000,
+            "current_assets": 150_000,
+            "current_liabilities": 50_000,
+            "retained_earnings": 200_000,
+            "ebit": 75_000,
+            "ebitda": 100_000,
+            "market_cap": 2_000_000,
+            "total_liabilities": 200_000,
+            "revenue": 400_000,
+            "interest_expense": 5_000,
+            "net_debt": 50_000,
+            "free_cash_flow": 70_000,
+            "fcf_history": [60_000, 58_000, 52_000, 45_000, 41_000],
+            "revenue_growth": 15.0,
+            "earnings_growth": 18.0,
+            "pe_ratio": 20.0,
+            "ps_ratio": 6.0,
+            "roe": 25.0,
+            "debt_to_equity": 0.7,
+            "operating_margin": 22.0,
+            "current_price": 100.0,
+            "next_earnings_date": "2026-04-30",
+            "earnings_in_days": 5,
+            "next_eps_estimate": 1.8,
+            "next_revenue_estimate": 405_000,
+            "analyst_estimate_fy": "2027-09-30",
+            "analyst_eps_estimate_next_fy": 8.2,
+            "analyst_revenue_estimate_next_fy": 450_000,
+            "price_target_consensus": 109.0,
+            "price_target_high": 140.0,
+            "price_target_low": 80.0,
+            "price_target_upside_pct": 9.0,
+            "street_revision_proxy": "deteriorating",
+            "rating_revision_score_30d": -2.5,
+            "rating_revision_score_90d": -3.0,
+        }
+        out = fundamental_analyst_run("AAPL", fin)
+        assert out["data_provenance"]["quality"] == "low"
+        assert out["street_disagreement_layer"]["uncertainty_level"] == "high"
+        assert out["recommendation"] == "allow_with_limits"
+        assert out["confidence"] <= 0.52
+
+    def test_fundamental_monitoring_triggers_capture_revision_crowding_and_peer_stress(self):
+        fin = {
+            "total_assets": 500_000,
+            "current_assets": 150_000,
+            "current_liabilities": 50_000,
+            "retained_earnings": 200_000,
+            "ebit": 75_000,
+            "ebitda": 100_000,
+            "market_cap": 2_000_000,
+            "total_liabilities": 200_000,
+            "revenue": 400_000,
+            "interest_expense": 5_000,
+            "net_debt": 50_000,
+            "free_cash_flow": 70_000,
+            "fcf_history": [60_000, 58_000, 52_000, 45_000, 41_000],
+            "revenue_growth": 15.0,
+            "earnings_growth": 18.0,
+            "pe_ratio": 34.0,
+            "ps_ratio": 6.0,
+            "roe": 25.0,
+            "debt_to_equity": 0.7,
+            "operating_margin": 22.0,
+            "current_price": 100.0,
+            "next_earnings_date": "2026-04-30",
+            "earnings_in_days": 6,
+            "price_target_consensus": 104.0,
+            "price_target_high": 120.0,
+            "price_target_low": 78.0,
+            "price_target_upside_pct": 4.0,
+            "estimate_periods": {
+                "0q": {
+                    "eps_estimate": 1.95,
+                    "revenue_estimate": 410_000,
+                    "eps_revision_30d_pct": -3.2,
+                    "eps_revision_90d_pct": -5.5,
+                    "up_last_30d": 2,
+                    "down_last_30d": 10,
+                    "revision_state": "deteriorating",
+                },
+            },
+            "earnings_beat_rate_4q": 75.0,
+            "revenue_beat_rate_4q": 75.0,
+            "eps_surprise_avg_4q": 3.5,
+            "audit_risk_yahoo": 2,
+            "board_risk_yahoo": 1,
+            "compensation_risk_yahoo": 6,
+            "shareholder_rights_risk_yahoo": 2,
+        }
+        peers = [
+            {"symbol": "MSFT", "pe_ratio": 20.0, "ps_ratio": 8.0, "operating_margin": 44.0},
+            {"symbol": "GOOGL", "pe_ratio": 18.0, "ps_ratio": 7.0, "operating_margin": 31.0},
+            {"symbol": "META", "pe_ratio": 19.0, "ps_ratio": 8.0, "operating_margin": 38.0},
+        ]
+        ownership_snapshot = {
+            "status": "ok",
+            "institutions_percent_held": 0.78,
+            "institutions_float_percent_held": 0.80,
+            "institutions_count": 4500,
+            "top_holder_pct": 0.14,
+            "institutional_top10_pct": 0.36,
+            "institutional_hhi_top10": 0.025,
+            "institutional_concentration_level": "high",
+            "crowding_risk": "elevated",
+            "insider_net_activity": "selling",
+            "insider_net_shares_6m": -120000,
+            "incremental_buyer_seller_map": {"buyers": [], "sellers": []},
+            "ownership_report_date": "2025-12-31",
+        }
+        out = fundamental_analyst_run("AAPL", fin, peers=peers, ownership_snapshot=ownership_snapshot)
+        trigger_names = {t["name"] for t in out["monitoring_triggers"]}
+        assert "Earnings catalyst" in trigger_names
+        assert "Estimate revision drift" in trigger_names
+        assert "Peer premium stress" in trigger_names
+        assert "Ownership pressure" in trigger_names
+
+    def test_fundamental_catalyst_engine_marks_sec_8k_as_confirmed(self, monkeypatch):
+        monkeypatch.setattr("agents.fundamental_agent.apply_llm_overlay_fundamental", lambda *args, **kwargs: {})
+        fin = {
+            "total_assets": 500_000,
+            "current_assets": 150_000,
+            "current_liabilities": 50_000,
+            "retained_earnings": 200_000,
+            "ebit": 75_000,
+            "ebitda": 100_000,
+            "market_cap": 2_000_000,
+            "total_liabilities": 200_000,
+            "revenue": 400_000,
+            "interest_expense": 5_000,
+            "net_debt": 50_000,
+            "free_cash_flow": 70_000,
+            "fcf_history": [60_000, 58_000, 52_000, 45_000, 41_000],
+            "revenue_growth": 15.0,
+            "pe_ratio": 20.0,
+            "roe": 25.0,
+            "debt_to_equity": 0.7,
+        }
+        catalyst_items = [
+            {
+                "title": "Apple Inc. Announces Investor Day and capital markets day agenda",
+                "url": "https://www.sec.gov/Archives/edgar/data/0000320193/example8k.htm",
+                "published_at": "2026-03-01",
+                "kind": "press_release_or_ir",
+                "resolver_path": "sec_8k",
+                "source": "sec.gov",
+                "snippet": "Investor Day and capital markets day event details",
+            }
+        ]
+        out = fundamental_analyst_run("AAPL", fin, catalyst_items=catalyst_items)
+        investor_day = next(x for x in out["catalyst_calendar"] if x["type"] == "investor_day")
+        assert investor_day["source_classification"] == "confirmed"
+        assert investor_day["resolver_path"] == "sec_8k"
+
+    def test_fundamental_catalyst_engine_prefers_confirmed_over_inferred_same_type(self, monkeypatch):
+        monkeypatch.setattr("agents.fundamental_agent.apply_llm_overlay_fundamental", lambda *args, **kwargs: {})
+        fin = {
+            "total_assets": 500_000,
+            "current_assets": 150_000,
+            "current_liabilities": 50_000,
+            "retained_earnings": 200_000,
+            "ebit": 75_000,
+            "ebitda": 100_000,
+            "market_cap": 2_000_000,
+            "total_liabilities": 200_000,
+            "revenue": 400_000,
+            "interest_expense": 5_000,
+            "net_debt": 50_000,
+            "free_cash_flow": 70_000,
+            "fcf_history": [60_000, 58_000, 52_000, 45_000, 41_000],
+            "revenue_growth": 15.0,
+            "pe_ratio": 20.0,
+            "roe": 25.0,
+            "debt_to_equity": 0.7,
+        }
+        state = {
+            "evidence_store": {
+                "abc": {
+                    "title": "Blog speculates company price cut and discount campaign",
+                    "url": "https://example.com/blog/price-cut",
+                    "published_at": "2026-03-02",
+                    "snippet": "Possible price cut and discount",
+                    "source": "example.com",
+                    "desk": "fundamental",
+                    "ticker": "AAPL",
+                    "kind": "press_release_or_ir",
+                    "resolver_path": "tavily_web_fallback",
+                }
+            }
+        }
+        catalyst_items = [
+            {
+                "title": "Company files 8-K on pricing update and discount changes",
+                "url": "https://www.sec.gov/Archives/edgar/data/0000320193/example-price-8k.htm",
+                "published_at": "2026-03-03",
+                "kind": "press_release_or_ir",
+                "resolver_path": "sec_8k",
+                "source": "sec.gov",
+                "snippet": "pricing update and discount changes",
+            }
+        ]
+        out = fundamental_analyst_run("AAPL", fin, state=state, catalyst_items=catalyst_items)
+        pricing_reset = next(x for x in out["catalyst_calendar"] if x["type"] == "pricing_reset")
+        assert pricing_reset["source_classification"] == "confirmed"
+        assert pricing_reset["source_title"].startswith("Company files 8-K")
+
+    def test_fundamental_catalyst_engine_uses_structured_ir_event_type(self, monkeypatch):
+        monkeypatch.setattr("agents.fundamental_agent.apply_llm_overlay_fundamental", lambda *args, **kwargs: {})
+        fin = {
+            "total_assets": 500_000,
+            "current_assets": 150_000,
+            "current_liabilities": 50_000,
+            "retained_earnings": 200_000,
+            "ebit": 75_000,
+            "ebitda": 100_000,
+            "market_cap": 2_000_000,
+            "total_liabilities": 200_000,
+            "revenue": 400_000,
+            "interest_expense": 5_000,
+            "net_debt": 50_000,
+            "free_cash_flow": 70_000,
+            "fcf_history": [60_000, 58_000, 52_000, 45_000, 41_000],
+            "revenue_growth": 15.0,
+            "pe_ratio": 20.0,
+            "roe": 25.0,
+            "debt_to_equity": 0.7,
+        }
+        catalyst_items = [
+            {
+                "title": "Company unveils next-generation product family",
+                "url": "https://www.businesswire.com/news/home/example",
+                "published_at": "2026-03-04",
+                "kind": "press_release_or_ir",
+                "resolver_path": "ir_press_release_tavily",
+                "source": "businesswire.com",
+                "snippet": "Launch event",
+                "catalyst_type": "product_cycle",
+                "source_classification": "confirmed",
+            }
+        ]
+        out = fundamental_analyst_run("AAPL", fin, catalyst_items=catalyst_items)
+        product = next(x for x in out["catalyst_calendar"] if x["type"] == "product_cycle")
+        assert product["source_classification"] == "confirmed"
+        assert product["source_title"] == "Company unveils next-generation product family"
+
+    def test_fundamental_agent_revision_and_peer_premium_can_turn_bearish(self):
+        fin = {
+            "total_assets": 500_000,
+            "current_assets": 150_000,
+            "current_liabilities": 50_000,
+            "retained_earnings": 200_000,
+            "ebit": 75_000,
+            "ebitda": 100_000,
+            "market_cap": 2_000_000,
+            "total_liabilities": 200_000,
+            "revenue": 400_000,
+            "interest_expense": 5_000,
+            "net_debt": 50_000,
+            "free_cash_flow": 70_000,
+            "fcf_history": [60_000, 58_000, 52_000, 45_000, 41_000],
+            "revenue_growth": 15.0,
+            "pe_ratio": 35.0,
+            "ps_ratio": 10.0,
+            "roe": 25.0,
+            "debt_to_equity": 0.7,
+            "operating_margin": 20.0,
+            "current_price": 100.0,
+            "analyst_eps_estimate_next_fy": 3.2,
+            "analyst_revenue_estimate_next_fy": 410_000,
+            "price_target_consensus": 97.0,
+            "price_target_upside_pct": -3.0,
+            "rating_revision_score_30d": -3.0,
+            "rating_revision_score_90d": -4.5,
+            "street_revision_proxy": "deteriorating",
+            "estimate_periods": {
+                "0q": {
+                    "eps_estimate": 1.42,
+                    "revenue_estimate": 398_000,
+                    "eps_revision_30d_pct": -4.5,
+                    "eps_revision_90d_pct": -7.2,
+                    "up_last_30d": 1,
+                    "down_last_30d": 16,
+                    "revision_state": "deteriorating",
+                },
+            },
+        }
+        peers = [
+            {"symbol": "MSFT", "pe_ratio": 20.0, "ps_ratio": 6.0, "operating_margin": 35.0, "roe": 28.0, "revenue_growth": 10.0},
+            {"symbol": "GOOGL", "pe_ratio": 18.0, "ps_ratio": 5.0, "operating_margin": 28.0, "roe": 24.0, "revenue_growth": 8.0},
+            {"symbol": "META", "pe_ratio": 17.0, "ps_ratio": 4.0, "operating_margin": 30.0, "roe": 26.0, "revenue_growth": 9.0},
+        ]
+        out = fundamental_analyst_run("AAPL", fin, peers=peers)
+        assert out["primary_decision"] == "bearish"
+        assert out["recommendation"] == "allow_with_limits"
+
 
 # ─────────────────────────────────────────────────────────────────────────────
 # T_senti_dedupe
@@ -254,10 +757,64 @@ class TestInferVolRegime:
         r = infer_vol_regime({}, {"vix_level": 25})
         assert r["vol_regime"] == "high"
 
+    def test_term_structure_backwardation_with_vvix_is_high(self):
+        r = infer_vol_regime({}, {"vix_level": 24, "vvix_level": 102, "vix_term_structure": "backwardation"})
+        assert r["vol_regime"] in {"high", "crisis"}
+        assert r["source"] == "vix_term_structure"
+
     def test_unknown_fallback(self):
         r = infer_vol_regime({}, {})
         assert r["vol_regime"] == "normal"
         assert "vol_regime_unknown" in r.get("warnings", [])
+
+
+class TestSentimentCatalystAndStructure:
+    def test_detect_catalyst_risk_counts_confirmed_imminent_events(self):
+        catalyst = detect_catalyst_risk(
+            [
+                {"type": "earnings", "status": "imminent", "days_to_event": 2, "confirmed": True, "source_classification": "confirmed"},
+                {"type": "macro_event", "status": "upcoming", "days_to_event": 10, "confirmed": True, "source_classification": "confirmed"},
+            ],
+            news_volume_z=0.2,
+        )
+        assert catalyst["catalyst_present"] is True
+        assert catalyst["confirmed_count"] == 2
+        assert catalyst["imminent_count"] == 1
+        assert catalyst["catalyst_risk_level"] == "high"
+
+    def test_sentiment_agent_emits_structured_positioning_and_event_layers(self):
+        out = sentiment_analyst_run(
+            "SPY",
+            {
+                "news_sentiment_score": -0.25,
+                "news_articles": [
+                    {"title": "SPY volatility rises into Fed week", "source": "Reuters", "published_at": datetime.now(timezone.utc).isoformat()},
+                    {"title": "Options hedging grows before Fed week", "source": "Bloomberg", "published_at": datetime.now(timezone.utc).isoformat()},
+                ],
+                "vix_level": 27.0,
+                "vvix_level": 104.0,
+                "skew_index": 146.0,
+                "vix_term_structure": "backwardation",
+                "put_call_oi_ratio": 1.22,
+                "put_call_volume_ratio": 1.15,
+                "short_interest_pct": 3.2,
+                "short_interest_change_pct": 18.0,
+                "held_percent_institutions": 82.0,
+                "institutional_top10_pct": 41.0,
+                "ownership_crowding_risk": "elevated",
+                "upcoming_events": [
+                    {"type": "macro_event", "subtype": "FOMC", "status": "imminent", "days_to_event": 2, "confirmed": True, "source_classification": "confirmed"},
+                ],
+            },
+            source_name="multi_source",
+        )
+        assert out["options_vol_structure"]["vix_term_structure"] == "backwardation"
+        assert out["positioning_snapshot"]["positioning_crowding"] in {"short_crowded", "long_crowded", "balanced"}
+        assert out["confirmed_events"]
+        assert out["data_provenance"]["quality"] in {"medium", "high"}
+        assert out["monitoring_triggers"]
+        assert out["catalyst_risk"]["confirmed_count"] == 1
+        assert out["volatility_regime"] in {"high", "crisis"}
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -378,6 +935,31 @@ class TestReportIncludesNewFields:
         assert len(report) > 100   # non-empty report
         assert "Macro Market Inputs" in report
         assert "Macro Translation" in report
+
+    def test_fidelity_report_contains_quality_and_monitoring_sections(self):
+        from agents.report_agent import report_writer_node
+        state = self._make_mock_state()
+        state["target_ticker"] = "AAPL"
+        state["positions_proposed"] = {"AAPL": 0.08}
+        state["positions_final"] = {"AAPL": 0.08}
+        state["book_allocation_plan"] = {"gross_target": 0.5, "single_name_cap": 0.08, "quality_haircut": 0.9}
+        state["capital_competition"] = [{"ticker": "AAPL", "book_action": "add", "conviction_score": 0.7, "expected_return_score": 0.6, "downside_penalty": 0.2, "catalyst_proximity_score": 0.1, "target_weight": 0.08}]
+        state["decision_quality_scorecard"] = {"overall_score": 0.61, "weak_desks": ["sentiment"]}
+        state["event_calendar"] = [{"desk": "macro", "type": "fomc", "status": "imminent", "date": "2026-03-18T18:00:00+00:00", "source": "federalreserve.gov"}]
+        state["monitoring_actions"] = {"force_research": True, "selected_desks": ["macro"], "risk_refresh_required": True}
+        state["technical_analysis"] = {
+            "decision": "HOLD",
+            "final_allocation_pct": 0.08,
+            "llm_decision": {"cot_reasoning": "혼조"},
+            "data_provenance": {"quality": "high", "raw_components": 5, "coverage_score": 0.83},
+        }
+        state["risk_assessment"] = {"risk_decision": {"per_ticker_decisions": {"AAPL": {"flags": [], "decision": "approve", "final_weight": 0.08}}}}
+
+        report = report_writer_node(state)["final_report"]
+        assert "Portfolio Weights" in report
+        assert "Book Allocation" in report
+        assert "Evidence & Decision Quality" in report
+        assert "Event Calendar & Monitoring" in report
 
 
 # ─────────────────────────────────────────────────────────────────────────────

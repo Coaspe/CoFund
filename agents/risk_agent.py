@@ -102,9 +102,17 @@ def _coerce_float(value: Any) -> Optional[float]:
         return None
 
 
+def _safe_float(value: Any, default: float = 0.0) -> float:
+    out = _coerce_float(value)
+    return default if out is None else float(out)
+
+
 def _extract_portfolio_mandate(payload: dict) -> dict:
     orch_mandate = payload.get("portfolio_mandate", {}) or {}
     constraints = orch_mandate.get("constraints", {}) if isinstance(orch_mandate, dict) else {}
+    allocator_guidance = payload.get("allocator_guidance", {}) or {}
+    if not isinstance(allocator_guidance, dict):
+        allocator_guidance = {}
     raw_ctx = payload.get("portfolio_context", {}) or {}
     if not isinstance(raw_ctx, dict):
         raw_ctx = {}
@@ -123,6 +131,10 @@ def _extract_portfolio_mandate(payload: dict) -> dict:
                 val = _coerce_float(constraints.get(key))
                 if val is not None:
                     return val
+            if key in allocator_guidance:
+                val = _coerce_float(allocator_guidance.get(key))
+                if val is not None:
+                    return val
             if key in raw_ctx:
                 val = _coerce_float(raw_ctx.get(key))
                 if val is not None:
@@ -137,6 +149,395 @@ def _extract_portfolio_mandate(payload: dict) -> dict:
         "target_gross_exposure": _pick_float("target_gross_exposure"),
         "target_net_exposure": _pick_float("target_net_exposure"),
         "max_drawdown_pct": _pick_float("max_drawdown_pct"),
+    }
+
+
+def _event_applies_to_ticker(event: dict, ticker: str) -> bool:
+    event_ticker = str(event.get("ticker", "")).strip().upper()
+    if event_ticker in {"", "__GLOBAL__"}:
+        return True
+    affected = {
+        str(item).strip().upper()
+        for item in (event.get("affected_tickers", []) or [])
+        if str(item).strip()
+    }
+    if ticker in affected:
+        return True
+    return event_ticker == ticker
+
+
+def _build_event_risk_summary(event_calendar: list[dict], tickers_in_play: list[str]) -> dict:
+    imminent: list[dict] = []
+    for raw in event_calendar or []:
+        if not isinstance(raw, dict):
+            continue
+        status = str(raw.get("status", "")).strip().lower()
+        if status not in {"imminent", "triggered"}:
+            continue
+        if tickers_in_play and not any(_event_applies_to_ticker(raw, t) for t in tickers_in_play):
+            continue
+        imminent.append(raw)
+
+    confirmed = [item for item in imminent if bool(item.get("confirmed"))]
+    high_priority = [item for item in imminent if int(item.get("priority", 3) or 3) <= 1]
+    nearest_days = None
+    for item in imminent:
+        days = item.get("days_to_event")
+        if isinstance(days, int):
+            nearest_days = days if nearest_days is None else min(nearest_days, days)
+
+    severity = "low"
+    if len(high_priority) >= 2 or any(str(item.get("status", "")).strip().lower() == "triggered" for item in imminent):
+        severity = "critical"
+    elif high_priority or len(confirmed) >= 2:
+        severity = "high"
+    elif imminent:
+        severity = "medium"
+
+    return {
+        "status": "ok",
+        "imminent_count": len(imminent),
+        "confirmed_count": len(confirmed),
+        "high_priority_count": len(high_priority),
+        "nearest_days": nearest_days,
+        "severity": severity,
+        "events": imminent[:6],
+    }
+
+
+def _ticker_risk_bucket(ticker: str, meta: dict) -> str:
+    tt = str(ticker).strip().upper()
+    sector = str((meta or {}).get("sector", "")).strip().lower()
+    asset_type = str((meta or {}).get("asset_type", "")).strip().lower()
+    if tt in {"TLT", "IEF", "SHY", "BND"} or "fixed income" in sector or asset_type in {"bond", "fixed_income"}:
+        return "duration"
+    if tt in {"GLD", "IAU", "SLV"} or "commodity" in sector or "precious" in sector:
+        return "real_asset"
+    if tt in {"XLE", "USO", "OIH"} or sector == "energy":
+        return "energy"
+    if tt in {"QQQ", "XLK"} or sector == "technology":
+        return "growth_equity"
+    return "broad_equity"
+
+
+_STRESS_SCENARIO_SHOCKS = {
+    "equity_gap_down": {
+        "broad_equity": -0.08,
+        "growth_equity": -0.10,
+        "energy": -0.06,
+        "duration": 0.02,
+        "real_asset": 0.015,
+    },
+    "rates_up_100bp": {
+        "broad_equity": -0.03,
+        "growth_equity": -0.05,
+        "energy": -0.01,
+        "duration": -0.09,
+        "real_asset": -0.015,
+    },
+    "rates_down_100bp": {
+        "broad_equity": 0.02,
+        "growth_equity": 0.04,
+        "energy": -0.01,
+        "duration": 0.07,
+        "real_asset": 0.01,
+    },
+    "oil_spike": {
+        "broad_equity": -0.03,
+        "growth_equity": -0.04,
+        "energy": 0.08,
+        "duration": -0.02,
+        "real_asset": 0.025,
+    },
+    "vol_spike": {
+        "broad_equity": -0.05,
+        "growth_equity": -0.07,
+        "energy": -0.04,
+        "duration": 0.015,
+        "real_asset": 0.02,
+    },
+}
+
+
+def _build_stress_test_summary(
+    payload: dict,
+    tickers_in_play: list[str],
+    ticker_weights: dict[str, float],
+    lim: dict,
+    canonical_regime: str,
+    event_risk: dict,
+) -> dict:
+    positions_meta = payload.get("positions_metadata", {}) or {}
+    macro = (payload.get("analyst_reports", {}) or {}).get("macro", {}) or {}
+    pricing_divergence = macro.get("pricing_divergence", {}) if isinstance(macro.get("pricing_divergence", {}), dict) else {}
+    divergence_signal = str(pricing_divergence.get("overall_signal", "")).strip().lower()
+
+    multiplier = 1.0
+    if canonical_regime in RISK_OFF_REGIMES:
+        multiplier += 0.2
+    if divergence_signal in {"hawkish_surprise_risk", "panic_not_priced", "credit_stress_not_priced"}:
+        multiplier += 0.1
+    if event_risk.get("severity") == "high":
+        multiplier += 0.1
+    elif event_risk.get("severity") == "critical":
+        multiplier += 0.2
+
+    scenarios: list[dict] = []
+    warning_loss = max(float(lim.get("max_portfolio_cvar_1d", 0.015)) * 2.0, 0.03)
+    breach_loss = max(float(lim.get("max_portfolio_cvar_1d", 0.015)) * 3.0, 0.05)
+    critical_loss = max(float(lim.get("max_portfolio_cvar_1d", 0.015)) * 4.0, 0.08)
+    worst_case_loss = 0.0
+    worst_scenario = ""
+
+    for name, shock_map in _STRESS_SCENARIO_SHOCKS.items():
+        projected_return = 0.0
+        ticker_impacts = []
+        for ticker in tickers_in_play:
+            meta = positions_meta.get(ticker, {}) if isinstance(positions_meta, dict) else {}
+            bucket = _ticker_risk_bucket(ticker, meta if isinstance(meta, dict) else {})
+            shock = float(shock_map.get(bucket, -0.03)) * multiplier
+            weight = float(ticker_weights.get(ticker, 0.0))
+            contribution = weight * shock
+            projected_return += contribution
+            ticker_impacts.append(
+                {
+                    "ticker": ticker,
+                    "bucket": bucket,
+                    "shock": round(shock, 4),
+                    "weighted_contribution": round(contribution, 4),
+                }
+            )
+        projected_loss = max(0.0, -projected_return)
+        severity = "normal"
+        if projected_loss >= critical_loss:
+            severity = "critical"
+        elif projected_loss >= breach_loss:
+            severity = "high"
+        elif projected_loss >= warning_loss:
+            severity = "medium"
+        scenarios.append(
+            {
+                "name": name,
+                "projected_return": round(projected_return, 4),
+                "projected_loss": round(projected_loss, 4),
+                "severity": severity,
+                "ticker_impacts": ticker_impacts[:6],
+            }
+        )
+        if projected_loss > worst_case_loss:
+            worst_case_loss = projected_loss
+            worst_scenario = name
+
+    breached = [item for item in scenarios if item["severity"] in {"medium", "high", "critical"}]
+    severity = "low"
+    if worst_case_loss >= critical_loss or sum(1 for item in breached if item["severity"] in {"high", "critical"}) >= 2:
+        severity = "critical"
+    elif worst_case_loss >= breach_loss:
+        severity = "high"
+    elif breached:
+        severity = "medium"
+
+    return {
+        "status": "ok",
+        "severity": severity,
+        "stress_multiplier": round(multiplier, 2),
+        "warning_loss_threshold": round(warning_loss, 4),
+        "breach_loss_threshold": round(breach_loss, 4),
+        "worst_scenario": worst_scenario,
+        "worst_case_loss": round(worst_case_loss, 4),
+        "breached_scenarios": [item["name"] for item in breached],
+        "scenarios": scenarios,
+    }
+
+
+def _build_liquidity_risk_summary(
+    payload: dict,
+    tickers_in_play: list[str],
+    lim: dict,
+    canonical_regime: str,
+    event_risk: dict,
+) -> dict:
+    summary = payload.get("portfolio_risk_summary", {}) or {}
+    liquidity_days = summary.get("liquidity_score_by_ticker", {}) or {}
+    macro = (payload.get("analyst_reports", {}) or {}).get("macro", {}) or {}
+    indicators = {}
+    if isinstance(macro.get("raw_market_inputs", {}), dict):
+        indicators = macro.get("raw_market_inputs", {}) or {}
+    vix = _coerce_float(indicators.get("vix_level"))
+    if vix is None:
+        vix = _coerce_float(indicators.get("vix_index"))
+
+    multiplier = 1.0
+    if canonical_regime in RISK_OFF_REGIMES:
+        multiplier += 0.4
+    if vix is not None and vix >= 30:
+        multiplier += 0.5
+    elif vix is not None and vix >= 20:
+        multiplier += 0.25
+    if event_risk.get("severity") == "high":
+        multiplier += 0.2
+    elif event_risk.get("severity") == "critical":
+        multiplier += 0.4
+    monitoring_actions = payload.get("monitoring_actions", {}) or {}
+    if bool(monitoring_actions.get("risk_refresh_required")):
+        multiplier += 0.2
+    multiplier = min(multiplier, 2.5)
+
+    stressed_days = {}
+    max_base = 0.0
+    max_stressed = 0.0
+    worst_ticker = ""
+    warning_days = float(lim.get("liquidity_days_warning", 5))
+    for ticker in tickers_in_play:
+        base_days = _safe_float(liquidity_days.get(ticker), 0.0)
+        stressed = base_days * multiplier
+        stressed_days[ticker] = round(stressed, 2)
+        if stressed > max_stressed:
+            max_stressed = stressed
+            max_base = base_days
+            worst_ticker = ticker
+
+    funding_score = 0.0
+    leverage = _safe_float(summary.get("leverage_ratio"), 0.0)
+    gross = _safe_float(summary.get("total_gross_exposure"), 0.0)
+    cvar = _safe_float(summary.get("portfolio_cvar_1d"), 0.0)
+    funding_score += min(leverage / max(float(lim.get("max_leverage", 2.0)), 1e-8), 1.5)
+    funding_score += min(gross / max(float(lim.get("max_gross_exposure", 2.0)), 1e-8), 1.5)
+    funding_score += min(cvar / max(float(lim.get("max_portfolio_cvar_1d", 0.015)), 1e-8), 2.0)
+    if event_risk.get("severity") == "high":
+        funding_score += 0.5
+    elif event_risk.get("severity") == "critical":
+        funding_score += 1.0
+
+    severity = "low"
+    if max_stressed >= warning_days * 3 or funding_score >= 4.0:
+        severity = "critical"
+    elif max_stressed >= warning_days * 2 or funding_score >= 3.0:
+        severity = "high"
+    elif max_stressed >= warning_days or funding_score >= 2.0:
+        severity = "medium"
+
+    funding_stress_level = "normal"
+    if funding_score >= 4.0:
+        funding_stress_level = "critical"
+    elif funding_score >= 3.0:
+        funding_stress_level = "elevated"
+    elif funding_score >= 2.0:
+        funding_stress_level = "watch"
+
+    return {
+        "status": "ok",
+        "severity": severity,
+        "stress_multiplier": round(multiplier, 2),
+        "warning_days_threshold": round(warning_days, 2),
+        "worst_ticker": worst_ticker,
+        "max_base_days": round(max_base, 2),
+        "max_stressed_days": round(max_stressed, 2),
+        "stressed_days_by_ticker": stressed_days,
+        "funding_stress_score": round(funding_score, 2),
+        "funding_stress_level": funding_stress_level,
+    }
+
+
+def _build_kill_switch(
+    summary: dict,
+    lim: dict,
+    stress_summary: dict,
+    liquidity_risk: dict,
+    event_risk: dict,
+    feedback_reasons: list[str],
+) -> dict:
+    gross = _safe_float(summary.get("total_gross_exposure"), 0.0)
+    net = _safe_float(summary.get("total_net_exposure"), 0.0)
+    cvar = _safe_float(summary.get("portfolio_cvar_1d"), 0.0)
+    severe_conditions: list[str] = []
+    if cvar > float(lim.get("max_portfolio_cvar_1d", 0.015)):
+        severe_conditions.append("cvar_breach")
+    if str(stress_summary.get("severity", "")).strip().lower() in {"high", "critical"}:
+        severe_conditions.append("stress_test_breach")
+    if str(liquidity_risk.get("severity", "")).strip().lower() in {"high", "critical"}:
+        severe_conditions.append("liquidity_stress")
+    if str(event_risk.get("severity", "")).strip().lower() == "critical":
+        severe_conditions.append("event_cluster")
+
+    active = False
+    severity = "low"
+    if "stress_test_breach" in severe_conditions and "liquidity_stress" in severe_conditions:
+        active = True
+        severity = "critical"
+    elif len(severe_conditions) >= 3:
+        active = True
+        severity = "critical"
+    elif len(severe_conditions) == 2:
+        active = True
+        severity = "high"
+    elif severe_conditions:
+        severity = "medium"
+
+    target_gross = None
+    target_net = None
+    if active:
+        target_gross = round(min(gross * 0.5, 0.35), 4)
+        target_net = round(min(abs(net), 0.2), 4)
+    elif severe_conditions:
+        target_gross = round(min(gross * 0.8, 0.6), 4)
+        target_net = round(min(abs(net), 0.35), 4)
+
+    reason = " / ".join(severe_conditions) if severe_conditions else "no_kill_switch_conditions"
+    return {
+        "active": active,
+        "severity": severity,
+        "conditions": severe_conditions,
+        "target_gross_exposure": target_gross,
+        "target_net_exposure": target_net,
+        "freeze_new_risk": active,
+        "reason": reason,
+        "feedback_reasons_snapshot": list(dict.fromkeys(feedback_reasons))[:8],
+    }
+
+
+def _build_escalation_plan(
+    event_risk: dict,
+    stress_summary: dict,
+    liquidity_risk: dict,
+    kill_switch: dict,
+    monitoring_actions: dict,
+) -> dict:
+    breach_types: list[str] = []
+    rerun_desks: set[str] = set(monitoring_actions.get("selected_desks", []) or [])
+    actions: list[str] = []
+
+    if event_risk.get("imminent_count", 0):
+        breach_types.append("event_risk")
+        actions.append("refresh_event_risk")
+    if str(stress_summary.get("severity", "")).strip().lower() in {"medium", "high", "critical"}:
+        breach_types.append("stress_test")
+        rerun_desks.update({"macro", "quant"})
+        actions.append("rerun_macro_quant")
+    if str(liquidity_risk.get("severity", "")).strip().lower() in {"medium", "high", "critical"}:
+        breach_types.append("liquidity")
+        rerun_desks.add("fundamental")
+        actions.append("review_liquidity")
+    if bool(kill_switch.get("active")):
+        breach_types.append("kill_switch")
+        actions.extend(["freeze_new_risk", "cut_gross_exposure"])
+
+    severity = "low"
+    if bool(kill_switch.get("active")) and str(kill_switch.get("severity", "")).strip().lower() == "critical":
+        severity = "critical"
+    elif len(breach_types) >= 3:
+        severity = "high"
+    elif len(breach_types) >= 1:
+        severity = "medium"
+
+    return {
+        "status": "ok",
+        "severity": severity,
+        "breach_types": breach_types,
+        "required_actions": actions,
+        "rerun_desks": sorted(rerun_desks),
+        "freeze_new_risk": bool(kill_switch.get("freeze_new_risk")),
+        "monitoring_source": str(monitoring_actions.get("reason", "")).strip() or "risk_engine",
     }
 
 
@@ -553,6 +954,8 @@ def compute_risk_decision(payload: dict) -> dict:
     macro = reports.get("macro", {})
     funda = reports.get("fundamental", {})
     senti = reports.get("sentiment", {})
+    monitoring_actions = payload.get("monitoring_actions", {}) or {}
+    event_calendar = payload.get("event_calendar", []) or []
 
     per_ticker: dict[str, dict] = {}
     feedback_required = False
@@ -626,6 +1029,25 @@ def compute_risk_decision(payload: dict) -> dict:
             ticker_weights[t] = round(ticker_weights[t] * 0.5, 4)
             ticker_flags.setdefault(t, []).append("disagreement_reduction")
 
+    raw_regime = macro.get("macro_regime", macro.get("regime", "normal"))
+    canonical_regime = map_macro_regime_to_canonical(raw_regime)
+    event_risk = _build_event_risk_summary(event_calendar, tickers_in_play)
+    stress_summary = _build_stress_test_summary(
+        payload,
+        tickers_in_play,
+        ticker_weights,
+        lim,
+        canonical_regime=canonical_regime,
+        event_risk=event_risk,
+    )
+    liquidity_risk = _build_liquidity_risk_summary(
+        payload,
+        tickers_in_play,
+        lim,
+        canonical_regime=canonical_regime,
+        event_risk=event_risk,
+    )
+
     # ── Gate 1: 하드 리스크 한도 ──────────────────────────────────────────
     cvar = first_not_none(summary, ["portfolio_cvar_1d"], default=0.0)
     leverage = first_not_none(summary, ["leverage_ratio"], default=0.0)
@@ -695,9 +1117,6 @@ def compute_risk_decision(payload: dict) -> dict:
         ticker_flags.setdefault(target, []).extend(found_structural)
 
     # ── Gate 4: 레짐/전략 정합성 (uses CANONICAL taxonomy) ────────────────
-    raw_regime = macro.get("macro_regime", macro.get("regime", "normal"))
-    canonical_regime = map_macro_regime_to_canonical(raw_regime)
-
     # BUG FIX: Gate4 only triggers for active LONG, not SHORT.
     # SHORT during risk-off is a HEDGE, not a mismatch.
     is_active_long = signed_weight > 0.10
@@ -720,6 +1139,46 @@ def compute_risk_decision(payload: dict) -> dict:
             "target_net_exposure": round(min(net_exp, 0.3), 2),
             "reason": f"Macro '{canonical_regime}' 레짐에 따른 Net Exposure 축소",
         }
+
+    # ── Gate 4.5: Stress / Liquidity / Event clustering ──────────────────
+    stress_severity = str(stress_summary.get("severity", "")).strip().lower()
+    if stress_severity in {"high", "critical"}:
+        feedback_required = True
+        feedback_reasons.append("stress_test_breach")
+        feedback_detail_parts.append(
+            f"Stress worst-case {stress_summary.get('worst_scenario')} 손실 "
+            f"{_safe_float(stress_summary.get('worst_case_loss')):.2%}."
+        )
+        stress_scale = 0.6 if stress_severity == "critical" else 0.8
+        for t in tickers_in_play:
+            if ticker_decisions.get(t) == "reject_local":
+                continue
+            ticker_weights[t] = round(float(ticker_weights.get(t, 0.0)) * stress_scale, 4)
+            ticker_decisions[t] = "reduce"
+            ticker_flags.setdefault(t, []).append("stress_test_breach")
+
+    liquidity_severity = str(liquidity_risk.get("severity", "")).strip().lower()
+    if liquidity_severity in {"high", "critical"}:
+        feedback_required = True
+        feedback_reasons.append("liquidity_stress")
+        feedback_detail_parts.append(
+            f"Stressed liquidation days max {liquidity_risk.get('max_stressed_days')} "
+            f"(ticker={liquidity_risk.get('worst_ticker')})."
+        )
+        stressed_days = liquidity_risk.get("stressed_days_by_ticker", {}) or {}
+        warning_days = _safe_float(
+            liquidity_risk.get("warning_days_threshold"),
+            float(lim.get("liquidity_days_warning", 5)),
+        )
+        liq_scale = 0.5 if liquidity_severity == "critical" else 0.7
+        for t in tickers_in_play:
+            if ticker_decisions.get(t) == "reject_local":
+                continue
+            if _safe_float(stressed_days.get(t), 0.0) < warning_days:
+                continue
+            ticker_weights[t] = round(float(ticker_weights.get(t, 0.0)) * liq_scale, 4)
+            ticker_decisions[t] = "reduce"
+            ticker_flags.setdefault(t, []).append("liquidity_stress")
 
     # ── Gate 5: 데이터/모델 이상 ──────────────────────────────────────────
     abs_weight = abs(first_not_none({target: ticker_weights.get(target, 0.0)}, [target], 0.0))
@@ -825,6 +1284,49 @@ def compute_risk_decision(payload: dict) -> dict:
                 f"순 노출 {abs(current_net):.2%} > mandate 한도 {float(target_net):.2%}.",
             )
 
+    kill_switch = _build_kill_switch(
+        summary,
+        lim,
+        stress_summary,
+        liquidity_risk,
+        event_risk,
+        feedback_reasons,
+    )
+    if kill_switch.get("active"):
+        feedback_required = True
+        feedback_reasons.append("kill_switch_active")
+        feedback_detail_parts.append(f"Kill switch 활성화: {kill_switch.get('reason')}.")
+        current_gross = sum(abs(float(ticker_weights.get(t, 0.0))) for t in tickers_in_play)
+        target_gross = _coerce_float(kill_switch.get("target_gross_exposure"))
+        if target_gross is not None and current_gross > target_gross + 1e-12:
+            scale = target_gross / max(current_gross, 1e-8)
+            for t in tickers_in_play:
+                if ticker_decisions.get(t) == "reject_local":
+                    continue
+                ticker_weights[t] = round(float(ticker_weights.get(t, 0.0)) * scale, 4)
+                ticker_decisions[t] = "reduce"
+                ticker_flags.setdefault(t, []).append("kill_switch_active")
+            gna = {
+                "target_gross_exposure": round(target_gross, 4),
+                "target_net_exposure": round(_safe_float(kill_switch.get("target_net_exposure"), 0.0), 4),
+                "reason": f"Kill switch: {kill_switch.get('reason')}",
+            }
+    elif str(kill_switch.get("severity", "")).strip().lower() == "medium":
+        feedback_required = True
+        feedback_reasons.append("kill_switch_watch")
+
+    escalation = _build_escalation_plan(
+        event_risk,
+        stress_summary,
+        liquidity_risk,
+        kill_switch,
+        monitoring_actions if isinstance(monitoring_actions, dict) else {},
+    )
+    if escalation.get("severity") in {"high", "critical"}:
+        feedback_required = True
+    if escalation.get("freeze_new_risk"):
+        feedback_reasons.append("freeze_new_risk")
+
     # ── 최종 조립 ─────────────────────────────────────────────────────────
     per_ticker = {}
     for t in tickers_in_play:
@@ -840,12 +1342,17 @@ def compute_risk_decision(payload: dict) -> dict:
         "portfolio_actions": {
             "hedge_recommendations": hedges,
             "gross_net_adjustment": gna,
+            "kill_switch": kill_switch,
+            "escalation": escalation,
         },
         "orchestrator_feedback": {
             "required": feedback_required,
-            "reasons": feedback_reasons,
+            "reasons": list(dict.fromkeys(feedback_reasons)),
             "detail": " ".join(feedback_detail_parts) if feedback_detail_parts else "모든 Gate 통과.",
         },
+        "event_risk": event_risk,
+        "stress_test_summary": stress_summary,
+        "liquidity_risk": liquidity_risk,
         "_disagreement_score": disagreement,
         "_canonical_regime": canonical_regime,
     }
@@ -989,9 +1496,25 @@ def risk_manager_node(state: InvestmentState) -> dict:
         if isinstance(state.get("orchestrator_directives", {}), dict)
         else {}
     )
+    payload["allocator_guidance"] = (
+        ((state.get("orchestrator_directives", {}) or {}).get("allocator_guidance", {}))
+        if isinstance(state.get("orchestrator_directives", {}), dict)
+        else {}
+    )
+    payload["positions_metadata"] = positions
+    payload["event_calendar"] = state.get("event_calendar", []) or []
+    payload["monitoring_actions"] = state.get("monitoring_actions", {}) or {}
+    payload["decision_quality_scorecard"] = state.get("decision_quality_scorecard", {}) or {}
 
     print("   [LLM] 5-Gate CRO 의사결정 요청 중...")
     decision = _call_llm(payload)
+
+    monitoring_actions = state.get("monitoring_actions", {}) if isinstance(state.get("monitoring_actions"), dict) else {}
+    if monitoring_actions.get("risk_refresh_required"):
+        portfolio_actions = decision.setdefault("portfolio_actions", {})
+        portfolio_actions["monitoring_risk_refresh"] = True
+        for t_data in (decision.get("per_ticker_decisions", {}) or {}).values():
+            t_data.setdefault("flags", []).append("monitoring_risk_refresh")
 
     # Add stale desk flags after decision
     if stale_desks:
@@ -1041,6 +1564,9 @@ def risk_manager_node(state: InvestmentState) -> dict:
     per = decision.get("per_ticker_decisions", {})
     for t, d in per.items():
         print(f"   [결과] {t}: {d.get('decision')} → {d.get('final_weight')}")
+    kill_switch = (decision.get("portfolio_actions", {}) or {}).get("kill_switch", {}) or {}
+    if kill_switch.get("active"):
+        print(f"   [결과] Kill switch: {kill_switch.get('severity')} gross->{kill_switch.get('target_gross_exposure')}")
     print(f"   [CoT] {fb.get('detail', '')[:120]}...")
 
     return {"risk_assessment": risk_assessment, "positions_final": positions_final}

@@ -23,6 +23,10 @@ from data_providers.alphavantage_provider import AlphaVantageProvider
 from data_providers.twelvedata_provider import TwelveDataProvider
 from data_providers.fed_funds_futures_provider import FedFundsFuturesProvider
 from data_providers.sofr_futures_provider import SofrFuturesProvider
+from data_providers.macro_event_calendar_provider import MacroEventCalendarProvider
+from data_providers.yahoo_structured_provider import YahooStructuredProvider
+from data_providers.ir_press_release_provider import IRPressReleaseProvider
+from data_providers.sentiment_market_provider import SentimentMarketProvider
 from data_providers.base import is_rate_limit_error
 
 # Legacy mock wrappers
@@ -62,6 +66,10 @@ class DataHub:
             self._td = TwelveDataProvider(cache=self._cache, rate_limiter=self._limiter)
             self._fff = FedFundsFuturesProvider(cache=self._cache, rate_limiter=self._limiter)
             self._sfr = SofrFuturesProvider(cache=self._cache, rate_limiter=self._limiter)
+            self._mec = MacroEventCalendarProvider(cache=self._cache, rate_limiter=self._limiter)
+            self._yfs = YahooStructuredProvider(cache=self._cache, rate_limiter=self._limiter)
+            self._irpr = IRPressReleaseProvider(mode=mode, cache=self._cache, rate_limiter=self._limiter)
+            self._smp = SentimentMarketProvider(mode=mode, cache=self._cache, rate_limiter=self._limiter)
 
     # ── Macro ─────────────────────────────────────────────────────────────
 
@@ -123,6 +131,22 @@ class DataHub:
             "limitations": limitations,
         }
 
+    def get_macro_event_calendar(self) -> Tuple[list, list, dict]:
+        """Returns structured macro event calendar from official sources where accessible."""
+        if self.mode == "mock":
+            result = MacroEventCalendarProvider._mock_calendar(self.as_of)
+            items = result.get("items", [])
+            return items, result.get("evidence", []), {
+                "data_ok": result["data_ok"],
+                "limitations": result["limitations"],
+            }
+        result = self._mec.get_calendar(as_of=self.as_of)
+        items = result.get("items", [])
+        return items, result.get("evidence", []), {
+            "data_ok": result["data_ok"],
+            "limitations": result["limitations"],
+        }
+
     # ── Fundamentals ──────────────────────────────────────────────────────
 
     def get_fundamentals(self, ticker: str, seed: int | None = None) -> Tuple[dict, list, dict]:
@@ -142,6 +166,83 @@ class DataHub:
             return None, [], {"data_ok": False, "limitations": ["Mock mode — no SEC data"]}
 
         result = self._sec.get_sec_flags(ticker, as_of=self.as_of)
+        return result["data"], result["evidence"], {
+            "data_ok": result["data_ok"], "limitations": result["limitations"],
+        }
+
+    def get_peer_context(self, ticker: str, max_peers: int = 5) -> Tuple[dict, list, dict]:
+        """Returns (peer_context, evidence, meta)."""
+        if self.mode == "mock":
+            result = FMPProvider._mock_peer_context(ticker, self.as_of, max_peers=max_peers)
+            return result["data"], result["evidence"], {
+                "data_ok": result["data_ok"], "limitations": result["limitations"],
+            }
+        result = self._fmp.get_peer_context(ticker, as_of=self.as_of, max_peers=max_peers)
+        return result["data"], result["evidence"], {
+            "data_ok": result["data_ok"], "limitations": result["limitations"],
+        }
+
+    def get_ownership_identity(self, ticker: str) -> Tuple[list, list, dict]:
+        """Returns (items, evidence, meta)."""
+        if self.mode == "mock":
+            return [], [], {"data_ok": False, "limitations": ["Mock mode — no ownership data"]}
+        result = self._sec.get_ownership_identity(ticker, as_of=self.as_of)
+        items = result.get("items", [])
+        return items, items, {
+            "data_ok": result["data_ok"], "limitations": result["limitations"],
+        }
+
+    def get_8k_exhibits(self, ticker: str) -> Tuple[list, list, dict]:
+        """Returns recent 8-K evidence items for catalyst/IR detection."""
+        if self.mode == "mock":
+            return [], [], {"data_ok": False, "limitations": ["Mock mode — no 8-K data"]}
+        result = self._sec.get_8k_exhibits(ticker, as_of=self.as_of)
+        items = result.get("items", [])
+        return items, items, {
+            "data_ok": result["data_ok"], "limitations": result["limitations"],
+        }
+
+    def get_ir_press_release_events(self, ticker: str) -> Tuple[list, list, dict]:
+        """Returns structured investor day / product launch events from wire/IR releases."""
+        if self.mode == "mock":
+            result = IRPressReleaseProvider(mode="mock").get_catalyst_events(ticker, as_of=self.as_of)
+            items = result.get("items", [])
+            return items, items, {"data_ok": result["data_ok"], "limitations": result["limitations"]}
+        result = self._irpr.get_catalyst_events(ticker, as_of=self.as_of)
+        items = result.get("items", [])
+        return items, items, {
+            "data_ok": result["data_ok"], "limitations": result["limitations"],
+        }
+
+    def get_estimate_revision(self, ticker: str) -> Tuple[dict, list, dict]:
+        """Returns structured estimate/revision snapshot."""
+        if self.mode == "mock":
+            result = YahooStructuredProvider._mock_estimate_revision(ticker, self.as_of)
+            evidence = YahooStructuredProvider._build_estimate_evidence(result, self.as_of, source_name="mock", quality=0.3)
+            return result, evidence, {"data_ok": False, "limitations": ["Mock mode — estimate revision snapshot"]}
+        result = self._yfs.get_estimate_revision_snapshot(ticker, as_of=self.as_of)
+        return result["data"], result["evidence"], {
+            "data_ok": result["data_ok"], "limitations": result["limitations"],
+        }
+
+    def get_structured_ownership(self, ticker: str) -> Tuple[dict, list, dict]:
+        """Returns structured holder concentration / insider summary."""
+        if self.mode == "mock":
+            result = YahooStructuredProvider._mock_ownership_snapshot(ticker, self.as_of)
+            evidence = YahooStructuredProvider._build_ownership_evidence(result, self.as_of, source_name="mock", quality=0.3)
+            return result, evidence, {"data_ok": False, "limitations": ["Mock mode — structured ownership snapshot"]}
+        result = self._yfs.get_ownership_snapshot(ticker, as_of=self.as_of)
+        return result["data"], result["evidence"], {
+            "data_ok": result["data_ok"], "limitations": result["limitations"],
+        }
+
+    def get_fundamental_history(self, ticker: str) -> Tuple[dict, list, dict]:
+        """Returns structured quarterly history / real valuation history."""
+        if self.mode == "mock":
+            result = YahooStructuredProvider._mock_fundamental_history_snapshot(ticker, self.as_of)
+            evidence = YahooStructuredProvider._build_history_evidence(result, self.as_of, source_name="mock", quality=0.3)
+            return result, evidence, {"data_ok": False, "limitations": ["Mock mode — fundamental history snapshot"]}
+        result = self._yfs.get_fundamental_history_snapshot(ticker, as_of=self.as_of)
         return result["data"], result["evidence"], {
             "data_ok": result["data_ok"], "limitations": result["limitations"],
         }
@@ -178,6 +279,18 @@ class DataHub:
         news_rate_limited = any(is_rate_limit_error(msg) for msg in result.get("limitations", []))
         if av_rate_limited and news_rate_limited:
             print("   [API Router] ⚠️ 모든 Sentiment API가 rate limit 상태입니다.", flush=True)
+        return result["data"], result["evidence"], {
+            "data_ok": result["data_ok"], "limitations": result["limitations"],
+        }
+
+    def get_sentiment_market_snapshot(self, ticker: str) -> Tuple[dict, list, dict]:
+        """Returns structured options/vol/short-interest sentiment snapshot."""
+        if self.mode == "mock":
+            result = SentimentMarketProvider(mode="mock").get_snapshot(ticker, as_of=self.as_of)
+            return result["data"], result["evidence"], {
+                "data_ok": result["data_ok"], "limitations": result["limitations"],
+            }
+        result = self._smp.get_snapshot(ticker, as_of=self.as_of)
         return result["data"], result["evidence"], {
             "data_ok": result["data_ok"], "limitations": result["limitations"],
         }

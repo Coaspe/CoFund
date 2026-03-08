@@ -188,6 +188,7 @@ def _build_orchestrator_human_msg(
     iteration: int,
     risk_feedback: Optional[dict] = None,
     portfolio_context: Optional[dict] = None,
+    book_context: Optional[dict] = None,
 ) -> str:
     """LLM에게 전달할 Human 메시지 조립."""
     parts = [
@@ -204,6 +205,11 @@ def _build_orchestrator_human_msg(
         parts.append(
             f"[Portfolio Context]\n```json\n"
             f"{json.dumps(portfolio_context, ensure_ascii=False, indent=2)}\n```"
+        )
+    if book_context:
+        parts.append(
+            f"[Book Context]\n```json\n"
+            f"{json.dumps(book_context, ensure_ascii=False, indent=2)}\n```"
         )
     return "\n".join(parts)
 
@@ -260,6 +266,34 @@ def _coerce_float(value: Any) -> Optional[float]:
         return float(value)
     except (TypeError, ValueError):
         return None
+
+
+def _clamp(value: float, low: float, high: float) -> float:
+    return max(low, min(high, float(value)))
+
+
+def _parse_iso_date(value: Any) -> Optional[datetime]:
+    text = str(value or "").strip()
+    if not text:
+        return None
+    try:
+        return datetime.fromisoformat(text.replace("Z", "+00:00"))
+    except ValueError:
+        pass
+    if len(text) >= 10:
+        try:
+            return datetime.fromisoformat(text[:10])
+        except ValueError:
+            return None
+    return None
+
+
+def _days_to_event(as_of: str, event_date: Any) -> Optional[int]:
+    base_dt = _parse_iso_date(as_of)
+    event_dt = _parse_iso_date(event_date)
+    if base_dt is None or event_dt is None:
+        return None
+    return int((event_dt.date() - base_dt.date()).days)
 
 
 def _coerce_int(value: Any) -> Optional[int]:
@@ -384,6 +418,813 @@ def _build_monitoring_plan(mandate: dict) -> dict:
         "review_frequency": mandate.get("review_frequency") or "event-driven",
         "review_triggers": review_triggers,
     }
+
+
+def _normalize_weight_map(raw: Any) -> dict[str, float]:
+    if not isinstance(raw, dict):
+        return {}
+    out: dict[str, float] = {}
+    for ticker, weight in raw.items():
+        symbol = str(ticker or "").strip().upper()
+        if not symbol:
+            continue
+        try:
+            out[symbol] = float(weight)
+        except (TypeError, ValueError):
+            continue
+    return out
+
+
+def _ordered_union(*groups: Any) -> list[str]:
+    out: list[str] = []
+    seen: set[str] = set()
+    for group in groups:
+        for item in group or []:
+            symbol = str(item or "").strip().upper()
+            if not symbol or symbol in seen:
+                continue
+            seen.add(symbol)
+            out.append(symbol)
+    return out
+
+
+def _build_book_context_summary(state: InvestmentState) -> dict:
+    current_positions = _normalize_weight_map(
+        state.get("positions_final") or state.get("positions_proposed") or {}
+    )
+    proposed_positions = _normalize_weight_map(state.get("positions_proposed") or {})
+    prior_active = state.get("active_ideas", {}) if isinstance(state.get("active_ideas"), dict) else {}
+    raw_backlog = state.get("monitoring_backlog", []) if isinstance(state.get("monitoring_backlog"), list) else []
+    open_backlog = [
+        item for item in raw_backlog
+        if isinstance(item, dict) and str(item.get("status", "open")).strip().lower() not in {"closed", "done", "archived"}
+    ]
+    active_position_weights = {
+        ticker: round(weight, 6)
+        for ticker, weight in current_positions.items()
+        if abs(weight) > 1e-6
+    }
+    proposed_nonzero = {
+        ticker: round(weight, 6)
+        for ticker, weight in proposed_positions.items()
+        if abs(weight) > 1e-6
+    }
+    tracked_ideas = _ordered_union(active_position_weights.keys(), prior_active.keys(), proposed_nonzero.keys())
+    summary = {
+        "current_positions": active_position_weights,
+        "proposed_positions": proposed_nonzero,
+        "tracked_ideas": tracked_ideas[:8],
+        "open_review_count": len(open_backlog),
+    }
+    event_calendar = state.get("event_calendar", []) if isinstance(state.get("event_calendar"), list) else []
+    if event_calendar:
+        summary["next_events_preview"] = [
+            {
+                "ticker": str(item.get("ticker", "")).strip().upper(),
+                "type": str(item.get("type", "")).strip(),
+                "status": str(item.get("status", "")).strip(),
+                "days_to_event": item.get("days_to_event"),
+            }
+            for item in event_calendar[:5]
+            if isinstance(item, dict)
+        ]
+    quality = state.get("decision_quality_scorecard", {}) if isinstance(state.get("decision_quality_scorecard"), dict) else {}
+    if quality:
+        summary["decision_quality_overall"] = quality.get("overall_score")
+        summary["weak_desks"] = list(quality.get("weak_desks", []) or [])
+    benchmark = str(
+        ((state.get("portfolio_context", {}) or {}).get("benchmark"))
+        or ((state.get("portfolio_context", {}) or {}).get("benchmark_ticker"))
+        or ""
+    ).strip().upper()
+    if benchmark:
+        summary["benchmark"] = benchmark
+    if open_backlog:
+        preview = []
+        for item in open_backlog[:5]:
+            preview.append({
+                "ticker": str(item.get("ticker", "")).strip().upper(),
+                "trigger": str(item.get("trigger", "")).strip(),
+                "priority": int(item.get("priority", 3) or 3),
+            })
+        summary["review_backlog_preview"] = preview
+    return summary
+
+
+def _derive_idea_status(ticker: str, universe: list[str], current_weight: float, previous_status: str) -> str:
+    if abs(current_weight) > 1e-6:
+        return "active_position"
+    if ticker in universe:
+        return "candidate"
+    if previous_status in {"active_position", "candidate", "monitor", "watchlist"}:
+        return "monitor"
+    return "inactive"
+
+
+def _build_active_ideas_registry(state: InvestmentState, decision: dict) -> dict[str, dict]:
+    brief = decision.get("investment_brief", {}) if isinstance(decision.get("investment_brief"), dict) else {}
+    universe = _normalize_ticker_list(brief.get("target_universe", []))
+    current_positions = _normalize_weight_map(
+        state.get("positions_final") or state.get("positions_proposed") or {}
+    )
+    proposed_positions = _normalize_weight_map(state.get("positions_proposed") or {})
+    prior_registry = state.get("active_ideas", {}) if isinstance(state.get("active_ideas"), dict) else {}
+    monitoring_plan = decision.get("monitoring_plan", {}) if isinstance(decision.get("monitoring_plan"), dict) else {}
+    mandate = decision.get("portfolio_mandate", {}) if isinstance(decision.get("portfolio_mandate"), dict) else {}
+    action_type = str(decision.get("action_type", "")).strip() or "initial_delegation"
+    intent = str(decision.get("intent", "")).strip() or str(state.get("intent", "")).strip()
+    as_of = str(state.get("as_of", "")).strip()
+    run_id = str(state.get("run_id", "")).strip()
+    benchmark = str(mandate.get("benchmark", "")).strip().upper()
+    review_frequency = str(monitoring_plan.get("review_frequency", "")).strip() or "event-driven"
+    review_triggers = [
+        str(item).strip()
+        for item in (monitoring_plan.get("review_triggers", []) or [])
+        if str(item).strip()
+    ][:3]
+
+    tracked = _ordered_union(universe, current_positions.keys(), prior_registry.keys())
+    out: dict[str, dict] = {}
+    for idx, ticker in enumerate(tracked):
+        prev = prior_registry.get(ticker, {}) if isinstance(prior_registry.get(ticker), dict) else {}
+        current_weight = float(current_positions.get(ticker, 0.0))
+        proposed_weight = float(proposed_positions.get(ticker, current_weight))
+        status = _derive_idea_status(ticker, universe, current_weight, str(prev.get("status", "")).strip())
+        if status == "inactive":
+            continue
+        if universe and ticker == universe[0]:
+            role = "main"
+        elif ticker in universe[1:]:
+            role = "hedge_candidate"
+        else:
+            role = str(prev.get("role", "")).strip() or "carry"
+        out[ticker] = {
+            "ticker": ticker,
+            "status": status,
+            "role": role,
+            "priority_rank": idx + 1,
+            "in_current_universe": ticker in universe,
+            "current_weight": round(current_weight, 6),
+            "proposed_weight": round(proposed_weight, 6),
+            "last_action_type": action_type if ticker in universe else str(prev.get("last_action_type", "")).strip(),
+            "last_intent": intent if ticker in universe else str(prev.get("last_intent", "")).strip() or intent,
+            "benchmark": benchmark or str(prev.get("benchmark", "")).strip().upper(),
+            "review_frequency": review_frequency if ticker in universe else str(prev.get("review_frequency", "")).strip() or review_frequency,
+            "review_triggers": review_triggers if ticker in universe else list(prev.get("review_triggers", []) or review_triggers),
+            "first_seen_at": str(prev.get("first_seen_at", "")).strip() or as_of,
+            "updated_at": as_of,
+            "source_run_id": run_id,
+        }
+    return out
+
+
+def _build_portfolio_memory(
+    state: InvestmentState,
+    decision: dict,
+    active_ideas: dict[str, dict],
+    conviction_by_ticker: Optional[dict[str, dict]] = None,
+    allocation_signals_by_ticker: Optional[dict[str, dict]] = None,
+) -> dict[str, dict]:
+    prior_memory = state.get("portfolio_memory", {}) if isinstance(state.get("portfolio_memory"), dict) else {}
+    as_of = str(state.get("as_of", "")).strip()
+    user_request = str(state.get("user_request", "")).strip()
+    action_type = str(decision.get("action_type", "")).strip() or "initial_delegation"
+    intent = str(decision.get("intent", "")).strip() or str(state.get("intent", "")).strip()
+    out: dict[str, dict] = {
+        str(ticker).strip().upper(): dict(value)
+        for ticker, value in prior_memory.items()
+        if str(ticker).strip() and isinstance(value, dict)
+    }
+
+    for ticker, idea in active_ideas.items():
+        prev = out.get(ticker, {})
+        conviction = (
+            conviction_by_ticker.get(ticker, {})
+            if isinstance(conviction_by_ticker, dict)
+            else {}
+        )
+        allocator_signals = (
+            allocation_signals_by_ticker.get(ticker, {})
+            if isinstance(allocation_signals_by_ticker, dict)
+            else {}
+        )
+        prior_count = prev.get("times_seen", 0)
+        try:
+            times_seen = int(prior_count) + 1
+        except (TypeError, ValueError):
+            times_seen = 1
+        out[ticker] = {
+            **prev,
+            "ticker": ticker,
+            "first_seen_at": str(prev.get("first_seen_at", "")).strip() or str(idea.get("first_seen_at", "")).strip() or as_of,
+            "last_seen_at": as_of,
+            "times_seen": times_seen,
+            "last_user_request": user_request,
+            "last_intent": str(idea.get("last_intent", "")).strip() or intent,
+            "last_action_type": str(idea.get("last_action_type", "")).strip() or action_type,
+            "current_weight": float(idea.get("current_weight", 0.0) or 0.0),
+            "proposed_weight": float(idea.get("proposed_weight", 0.0) or 0.0),
+            "thesis_status": str(idea.get("status", "")).strip() or "candidate",
+            "role": str(idea.get("role", "")).strip() or str(prev.get("role", "")).strip(),
+            "review_frequency": str(idea.get("review_frequency", "")).strip() or str(prev.get("review_frequency", "")).strip(),
+            "review_triggers": list(idea.get("review_triggers", []) or prev.get("review_triggers", [])),
+            "benchmark": str(idea.get("benchmark", "")).strip().upper() or str(prev.get("benchmark", "")).strip().upper(),
+            "conviction": conviction if conviction else dict(prev.get("conviction", {}) or {}),
+            "allocator_signals": allocator_signals if allocator_signals else dict(prev.get("allocator_signals", {}) or {}),
+        }
+    return out
+
+
+def _build_monitoring_backlog(
+    state: InvestmentState,
+    decision: dict,
+    active_ideas: dict[str, dict],
+) -> list[dict]:
+    prior_backlog = state.get("monitoring_backlog", []) if isinstance(state.get("monitoring_backlog"), list) else []
+    monitoring_plan = decision.get("monitoring_plan", {}) if isinstance(decision.get("monitoring_plan"), dict) else {}
+    review_frequency = str(monitoring_plan.get("review_frequency", "")).strip() or "event-driven"
+    review_triggers = [
+        str(item).strip()
+        for item in (monitoring_plan.get("review_triggers", []) or [])
+        if str(item).strip()
+    ]
+    as_of = str(state.get("as_of", "")).strip()
+    out: list[dict] = []
+    seen: set[tuple[str, str, str]] = set()
+
+    def _append(item: dict) -> None:
+        ticker = str(item.get("ticker", "__PORTFOLIO__")).strip().upper() or "__PORTFOLIO__"
+        trigger = str(item.get("trigger", "")).strip()
+        source = str(item.get("source", "monitoring_plan")).strip().lower()
+        if not trigger:
+            return
+        key = (ticker, trigger, source)
+        if key in seen:
+            return
+        seen.add(key)
+        payload = dict(item)
+        payload["ticker"] = ticker
+        payload["trigger"] = trigger
+        payload["source"] = source
+        payload["status"] = str(payload.get("status", "open")).strip().lower() or "open"
+        payload["updated_at"] = as_of
+        out.append(payload)
+
+    for item in prior_backlog:
+        if not isinstance(item, dict):
+            continue
+        if str(item.get("status", "open")).strip().lower() in {"closed", "done", "archived"}:
+            continue
+        _append(item)
+
+    for trigger in review_triggers:
+        _append({
+            "ticker": "__PORTFOLIO__",
+            "scope": "portfolio",
+            "priority": 1,
+            "trigger": trigger,
+            "source": "monitoring_plan",
+            "review_frequency": review_frequency,
+            "created_at": as_of,
+        })
+
+    for ticker, idea in active_ideas.items():
+        status = str(idea.get("status", "")).strip()
+        if status not in {"active_position", "candidate", "monitor"}:
+            continue
+        priority = 1 if status == "active_position" else (2 if status == "candidate" else 3)
+        _append({
+            "ticker": ticker,
+            "scope": "ticker",
+            "priority": priority,
+            "trigger": f"{ticker} thesis/status review ({status})",
+            "source": "active_ideas",
+            "review_frequency": str(idea.get("review_frequency", "")).strip() or review_frequency,
+            "created_at": str(idea.get("updated_at", "")).strip() or as_of,
+            "role": str(idea.get("role", "")).strip(),
+            "current_weight": float(idea.get("current_weight", 0.0) or 0.0),
+        })
+    return out
+
+
+def _decision_direction(decision: Any) -> float:
+    text = str(decision or "").strip().lower()
+    if text in {"bullish", "long", "buy", "allow"}:
+        return 1.0
+    if text in {"bearish", "short", "sell", "avoid", "reject"}:
+        return -1.0
+    return 0.0
+
+
+def _desk_conviction_component(output: Any, desk: str) -> dict:
+    if not isinstance(output, dict):
+        return {"score": 0.0, "direction": 0.0, "confidence": 0.0, "signal_strength": 0.0}
+    decision = output.get("primary_decision", output.get("decision", "neutral"))
+    direction = _decision_direction(decision)
+    try:
+        confidence = float(output.get("confidence", 0.0) or 0.0)
+    except (TypeError, ValueError):
+        confidence = 0.0
+    try:
+        signal_strength = float(output.get("signal_strength", 0.0) or 0.0)
+    except (TypeError, ValueError):
+        signal_strength = 0.0
+    if desk == "quant" and signal_strength <= 0.0:
+        try:
+            signal_strength = min(abs(float(output.get("final_allocation_pct", 0.0) or 0.0)) * 4.0, 1.0)
+        except (TypeError, ValueError):
+            signal_strength = 0.0
+    score = direction * max(0.0, confidence) * max(0.0, signal_strength or 0.5)
+    return {
+        "score": round(score, 6),
+        "direction": round(direction, 6),
+        "confidence": round(confidence, 6),
+        "signal_strength": round(signal_strength, 6),
+    }
+
+
+def _current_conviction_snapshot(state: InvestmentState, ticker: str, role: str) -> dict:
+    symbol = str(ticker or "").strip().upper()
+    target = str(state.get("target_ticker", "")).strip().upper()
+    memory = state.get("portfolio_memory", {}) if isinstance(state.get("portfolio_memory"), dict) else {}
+    prior = memory.get(symbol, {}) if isinstance(memory.get(symbol), dict) else {}
+    prior_conviction = prior.get("conviction", {}) if isinstance(prior.get("conviction"), dict) else {}
+
+    snapshot = {
+        "source": "memory" if prior_conviction else "neutral",
+        "macro": dict(prior_conviction.get("macro", {}) or {}),
+        "fundamental": dict(prior_conviction.get("fundamental", {}) or {}),
+        "sentiment": dict(prior_conviction.get("sentiment", {}) or {}),
+        "quant": dict(prior_conviction.get("quant", {}) or {}),
+        "hedge_lite": dict(prior_conviction.get("hedge_lite", {}) or {}),
+        "composite_score": float(prior_conviction.get("composite_score", 0.0) or 0.0),
+    }
+
+    if symbol == target:
+        macro = _desk_conviction_component(state.get("macro_analysis", {}), "macro")
+        funda = _desk_conviction_component(state.get("fundamental_analysis", {}), "fundamental")
+        senti = _desk_conviction_component(state.get("sentiment_analysis", {}), "sentiment")
+        quant = _desk_conviction_component(state.get("technical_analysis", {}), "quant")
+        scorecard = state.get("decision_quality_scorecard", {}) if isinstance(state.get("decision_quality_scorecard"), dict) else {}
+        quality_by_desk = scorecard.get("desks", {}) if isinstance(scorecard.get("desks"), dict) else {}
+        for desk_name, comp in {
+            "macro": macro,
+            "fundamental": funda,
+            "sentiment": senti,
+            "quant": quant,
+        }.items():
+            desk_quality = quality_by_desk.get(desk_name, {}) if isinstance(quality_by_desk.get(desk_name), dict) else {}
+            quality_score = _coerce_float(desk_quality.get("quality_score"))
+            if quality_score is None:
+                continue
+            multiplier = 0.5 + 0.5 * _clamp(float(quality_score), 0.0, 1.0)
+            comp["score"] = round(float(comp.get("score", 0.0) or 0.0) * multiplier, 6)
+            comp["quality_multiplier"] = round(multiplier, 6)
+        components = {"macro": macro, "fundamental": funda, "sentiment": senti, "quant": quant}
+        scores = [comp["score"] for comp in components.values()]
+        snapshot.update(components)
+        snapshot["source"] = "current_run"
+        snapshot["composite_score"] = round(sum(scores) / len(scores), 6)
+
+    hedge_lite = state.get("hedge_lite", {}) if isinstance(state.get("hedge_lite"), dict) else {}
+    hedge_rows = hedge_lite.get("hedges", {}) if isinstance(hedge_lite.get("hedges"), dict) else {}
+    if symbol in hedge_rows and isinstance(hedge_rows[symbol], dict):
+        row = hedge_rows[symbol]
+        raw_score = float(row.get("score", 0.0) or 0.0)
+        snapshot["hedge_lite"] = {
+            "score": round(raw_score, 6),
+            "selected": bool(row.get("selected")),
+            "status": str(row.get("status", "")).strip() or "unknown",
+        }
+        if role == "hedge_candidate":
+            base = float(snapshot.get("composite_score", 0.0) or 0.0)
+            blended = max(base, raw_score * 0.8)
+            snapshot["composite_score"] = round(blended, 6)
+            if snapshot.get("source") == "neutral":
+                snapshot["source"] = "hedge_lite"
+
+    return snapshot
+
+
+def _extract_allocator_signals_from_fundamental(output: Any, as_of: str) -> dict:
+    if not isinstance(output, dict):
+        return {
+            "source": "neutral",
+            "status": "insufficient_data",
+            "expected_return_pct": 0.0,
+            "downside_pct": 0.0,
+            "catalyst_proximity_score": 0.0,
+            "catalyst_days": None,
+            "catalyst_type": "",
+            "catalyst_source": "",
+        }
+
+    valuation_anchor = output.get("valuation_anchor", {}) if isinstance(output.get("valuation_anchor"), dict) else {}
+    model_pack = output.get("model_pack", {}) if isinstance(output.get("model_pack"), dict) else {}
+    scenario_targets = model_pack.get("scenario_targets", {}) if isinstance(model_pack.get("scenario_targets"), dict) else {}
+    base_target = scenario_targets.get("base", {}) if isinstance(scenario_targets.get("base"), dict) else {}
+    bear_target = scenario_targets.get("bear", {}) if isinstance(scenario_targets.get("bear"), dict) else {}
+    catalyst_calendar = output.get("catalyst_calendar", []) if isinstance(output.get("catalyst_calendar"), list) else []
+
+    street_upside = _coerce_float(valuation_anchor.get("price_target_upside_pct"))
+    model_upside = _coerce_float(base_target.get("upside_pct"))
+    if street_upside is not None and model_upside is not None:
+        expected_return_pct = round(model_upside * 0.6 + street_upside * 0.4, 4)
+        source = "fundamental_current_run_blended"
+    elif model_upside is not None:
+        expected_return_pct = round(model_upside, 4)
+        source = "fundamental_model_pack"
+    elif street_upside is not None:
+        expected_return_pct = round(street_upside, 4)
+        source = "fundamental_valuation_anchor"
+    else:
+        expected_return_pct = 0.0
+        source = "neutral"
+
+    raw_downside = _coerce_float(bear_target.get("downside_pct"))
+    downside_pct = round(abs(raw_downside) if raw_downside is not None and raw_downside < 0 else 0.0, 4)
+
+    catalyst = None
+    for item in catalyst_calendar:
+        if not isinstance(item, dict):
+            continue
+        status = str(item.get("status", "")).strip().lower()
+        if status == "stale":
+            continue
+        source_class = str(item.get("source_classification", "")).strip().lower()
+        days = _coerce_int(item.get("days_to_event"))
+        if days is None:
+            days = _days_to_event(as_of, item.get("date"))
+        if days is not None and days < 0:
+            continue
+        rank = 0 if source_class == "confirmed" else 1
+        candidate = (rank, days if days is not None else 10_000, item)
+        if catalyst is None or candidate < catalyst:
+            catalyst = candidate
+
+    catalyst_proximity_score = 0.0
+    catalyst_days = None
+    catalyst_type = ""
+    catalyst_source = ""
+    if catalyst is not None:
+        item = catalyst[2]
+        catalyst_days = _coerce_int(item.get("days_to_event"))
+        if catalyst_days is None:
+            catalyst_days = _days_to_event(as_of, item.get("date"))
+        catalyst_type = str(item.get("type", "")).strip()
+        catalyst_source = str(item.get("source_classification", "")).strip() or "unknown"
+        if catalyst_days is not None:
+            if catalyst_days <= 7:
+                catalyst_proximity_score = 1.0
+            elif catalyst_days <= 14:
+                catalyst_proximity_score = 0.8
+            elif catalyst_days <= 30:
+                catalyst_proximity_score = 0.55
+            elif catalyst_days <= 60:
+                catalyst_proximity_score = 0.25
+            else:
+                catalyst_proximity_score = 0.05
+
+    status = "ok" if source != "neutral" or downside_pct > 0 or catalyst_proximity_score > 0 else "insufficient_data"
+    return {
+        "source": source,
+        "status": status,
+        "expected_return_pct": expected_return_pct,
+        "downside_pct": downside_pct,
+        "catalyst_proximity_score": round(catalyst_proximity_score, 4),
+        "catalyst_days": catalyst_days,
+        "catalyst_type": catalyst_type,
+        "catalyst_source": catalyst_source,
+    }
+
+
+def _current_allocator_signal_snapshot(state: InvestmentState, ticker: str) -> dict:
+    symbol = str(ticker or "").strip().upper()
+    target = str(state.get("target_ticker", "")).strip().upper()
+    memory = state.get("portfolio_memory", {}) if isinstance(state.get("portfolio_memory"), dict) else {}
+    prior = memory.get(symbol, {}) if isinstance(memory.get(symbol), dict) else {}
+    prior_signals = prior.get("allocator_signals", {}) if isinstance(prior.get("allocator_signals"), dict) else {}
+
+    snapshot = {
+        "source": str(prior_signals.get("source", "neutral")).strip() or "neutral",
+        "status": str(prior_signals.get("status", "insufficient_data")).strip() or "insufficient_data",
+        "expected_return_pct": float(prior_signals.get("expected_return_pct", 0.0) or 0.0),
+        "downside_pct": float(prior_signals.get("downside_pct", 0.0) or 0.0),
+        "catalyst_proximity_score": float(prior_signals.get("catalyst_proximity_score", 0.0) or 0.0),
+        "catalyst_days": _coerce_int(prior_signals.get("catalyst_days")),
+        "catalyst_type": str(prior_signals.get("catalyst_type", "")).strip(),
+        "catalyst_source": str(prior_signals.get("catalyst_source", "")).strip(),
+    }
+
+    if symbol == target:
+        current = _extract_allocator_signals_from_fundamental(state.get("fundamental_analysis", {}), str(state.get("as_of", "")).strip())
+        if current.get("status") != "insufficient_data":
+            return current
+    return snapshot
+
+
+def _normalize_positive_weights(raw: dict[str, float]) -> dict[str, float]:
+    cleaned = {t: max(0.0, float(w)) for t, w in (raw or {}).items()}
+    total = float(sum(cleaned.values()))
+    if total <= 1e-12:
+        return {}
+    return {t: float(w) / total for t, w in cleaned.items()}
+
+
+def _derive_allocator_gross_target(action_type: str, current_gross: float, universe_size: int, mandate: dict) -> float:
+    mandate_cap = _coerce_float((mandate.get("constraints", {}) or {}).get("target_gross_exposure"))
+    if current_gross <= 1e-12:
+        base = 0.35 if universe_size <= 1 else 0.60
+    else:
+        base = min(current_gross, 1.0)
+    if action_type == "scale_down":
+        base *= 0.75
+    elif action_type == "pivot_strategy":
+        base *= 0.65
+    elif action_type == "fallback_abort":
+        base = min(base, 0.35)
+    elif action_type == "add_hedge":
+        base = min(max(base, 0.50), 0.90)
+    else:
+        floor = 0.35 if universe_size <= 1 else 0.60
+        base = min(max(base, floor), 1.0)
+    if mandate_cap is not None:
+        base = min(base, float(mandate_cap))
+    return round(max(0.10, min(base, 1.0)), 4)
+
+
+def _cap_book_weights(targets: dict[str, float], gross_target: float, single_name_cap: float) -> dict[str, float]:
+    capped = {t: max(0.0, float(w)) for t, w in (targets or {}).items()}
+    if not capped or gross_target <= 1e-12:
+        return {}
+    single_name_cap = max(0.0, min(float(single_name_cap), gross_target))
+    for _ in range(5):
+        overflow = 0.0
+        uncapped: list[str] = []
+        for ticker, weight in capped.items():
+            if weight > single_name_cap:
+                overflow += weight - single_name_cap
+                capped[ticker] = single_name_cap
+            else:
+                uncapped.append(ticker)
+        if overflow <= 1e-12 or not uncapped:
+            break
+        raw_room = {t: max(0.0, single_name_cap - capped[t]) for t in uncapped}
+        room_total = float(sum(raw_room.values()))
+        if room_total <= 1e-12:
+            break
+        for ticker in uncapped:
+            capped[ticker] += overflow * (raw_room[ticker] / room_total)
+    total = float(sum(capped.values()))
+    if total <= 1e-12:
+        return {}
+    scale = gross_target / total
+    return {t: round(max(0.0, w * scale), 6) for t, w in capped.items()}
+
+
+def _build_book_allocation_plan(
+    state: InvestmentState,
+    decision: dict,
+    active_ideas: dict[str, dict],
+) -> tuple[dict, list[dict]]:
+    if not active_ideas:
+        return {}, []
+
+    brief = decision.get("investment_brief", {}) if isinstance(decision.get("investment_brief"), dict) else {}
+    universe = _normalize_ticker_list(brief.get("target_universe", []))
+    main = universe[0] if universe else ""
+    action_type = str(decision.get("action_type", "")).strip() or "initial_delegation"
+    mandate = decision.get("portfolio_mandate", {}) if isinstance(decision.get("portfolio_mandate"), dict) else {}
+    current_positions = _normalize_weight_map(
+        state.get("positions_final") or state.get("positions_proposed") or {}
+    )
+    current_gross = float(sum(abs(float(v)) for v in current_positions.values()))
+    gross_target = _derive_allocator_gross_target(action_type, current_gross, len(universe), mandate)
+    single_name_cap = _coerce_float((mandate.get("constraints", {}) or {}).get("max_single_name_weight"))
+    if single_name_cap is None:
+        single_name_cap = min(0.35, gross_target)
+    single_name_cap = max(0.10, float(single_name_cap))
+    scorecard = state.get("decision_quality_scorecard", {}) if isinstance(state.get("decision_quality_scorecard"), dict) else {}
+    quality_overall = _coerce_float(scorecard.get("overall_score"))
+    weak_desks = sorted({
+        str(desk).strip().lower()
+        for desk in (scorecard.get("weak_desks", []) or [])
+        if str(desk).strip().lower()
+    })
+    quality_haircut = 1.0
+    quality_adjustments: list[str] = []
+    if quality_overall is not None:
+        if quality_overall < 0.35:
+            quality_haircut *= 0.65
+            quality_adjustments.append("overall_score_critical")
+        elif quality_overall < 0.50:
+            quality_haircut *= 0.80
+            quality_adjustments.append("overall_score_low")
+        elif quality_overall < 0.65:
+            quality_haircut *= 0.90
+            quality_adjustments.append("overall_score_soft")
+    if len(weak_desks) >= 3:
+        quality_haircut *= 0.85
+        quality_adjustments.append("multi_desk_weakness")
+    elif len(weak_desks) == 2:
+        quality_haircut *= 0.92
+        quality_adjustments.append("two_weak_desks")
+    quality_haircut = round(max(0.55, min(quality_haircut, 1.0)), 4)
+    gross_target = round(max(0.10, min(gross_target * quality_haircut, 1.0)), 4)
+    single_name_cap = round(min(gross_target, max(0.10, single_name_cap * min(1.0, quality_haircut + 0.05))), 4)
+
+    raw_scores: dict[str, float] = {}
+    rows: list[dict] = []
+    new_universe = set(universe)
+    conviction_by_ticker = {
+        ticker: _current_conviction_snapshot(state, ticker, str(idea.get("role", "")).strip())
+        for ticker, idea in active_ideas.items()
+    }
+    allocation_signals_by_ticker = {
+        ticker: _current_allocator_signal_snapshot(state, ticker)
+        for ticker in active_ideas.keys()
+    }
+    for ticker, idea in active_ideas.items():
+        current_weight = max(0.0, float(idea.get("current_weight", 0.0) or 0.0))
+        in_universe = bool(idea.get("in_current_universe"))
+        role = str(idea.get("role", "")).strip() or "carry"
+        status = str(idea.get("status", "")).strip() or "candidate"
+        conviction = conviction_by_ticker.get(ticker, {})
+        conviction_score = float(conviction.get("composite_score", 0.0) or 0.0)
+        allocator_signals = allocation_signals_by_ticker.get(ticker, {})
+        expected_return_pct = float(allocator_signals.get("expected_return_pct", 0.0) or 0.0)
+        downside_pct = float(allocator_signals.get("downside_pct", 0.0) or 0.0)
+        catalyst_proximity = float(allocator_signals.get("catalyst_proximity_score", 0.0) or 0.0)
+        expected_return_score = _clamp(expected_return_pct / 20.0, -1.0, 1.0)
+        downside_penalty = _clamp(downside_pct / 20.0, 0.0, 1.0)
+
+        score = 0.0
+        reasons: list[str] = []
+        if current_weight > 0:
+            score += 1.0 + min(current_weight, 0.5)
+            reasons.append("existing_position")
+        if ticker == main:
+            score += 2.0
+            reasons.append("main_candidate")
+        elif role == "hedge_candidate":
+            score += 1.0
+            reasons.append("hedge_candidate")
+        elif in_universe:
+            score += 0.75
+            reasons.append("in_universe")
+        if status == "monitor":
+            score -= 0.25
+        if action_type == "scale_down" and current_weight > 0:
+            score *= 0.85
+            reasons.append("scale_down_bias")
+        if action_type == "pivot_strategy" and ticker not in new_universe and current_weight > 0:
+            score *= 0.35
+            reasons.append("pivot_displacement")
+        if action_type == "fallback_abort" and ticker not in new_universe and current_weight > 0:
+            score *= 0.20
+            reasons.append("fallback_displacement")
+        if action_type == "add_hedge" and role == "hedge_candidate":
+            score += 0.75
+            reasons.append("hedge_budget_priority")
+        if conviction_score > 0:
+            score += min(conviction_score, 0.8) * (1.8 if ticker == main else 1.2)
+            reasons.append("positive_conviction")
+        elif conviction_score < 0:
+            score -= min(abs(conviction_score), 0.8) * (1.6 if current_weight > 0 else 1.0)
+            reasons.append("negative_conviction")
+        hedge_component = conviction.get("hedge_lite", {}) if isinstance(conviction.get("hedge_lite"), dict) else {}
+        if role == "hedge_candidate" and hedge_component.get("selected"):
+            score += 0.35
+            reasons.append("selected_hedge")
+        if expected_return_score > 0:
+            score += expected_return_score * (1.25 if ticker == main else 0.85)
+            reasons.append("expected_return_support")
+        elif expected_return_score < 0:
+            score += expected_return_score * (1.1 if current_weight > 0 else 0.8)
+            reasons.append("negative_expected_return")
+        if downside_penalty > 0:
+            score -= downside_penalty * (1.15 if current_weight > 0 else 0.9)
+            reasons.append("downside_risk")
+        if catalyst_proximity > 0:
+            catalyst_direction = 0.0
+            if conviction_score > 0.05 or expected_return_score > 0.15 or ticker == main:
+                catalyst_direction = 1.0
+            elif conviction_score < -0.05 or expected_return_score < -0.1:
+                catalyst_direction = -1.0
+            elif in_universe:
+                catalyst_direction = 0.4
+            score += catalyst_proximity * catalyst_direction * 0.65
+            reasons.append("catalyst_proximity")
+
+        raw_scores[ticker] = max(0.0, score)
+        rows.append({
+            "ticker": ticker,
+            "status": status,
+            "role": role,
+            "in_current_universe": in_universe,
+            "current_weight": round(current_weight, 6),
+            "score": round(max(0.0, score), 6),
+            "conviction_score": round(conviction_score, 6),
+            "conviction_source": str(conviction.get("source", "neutral")),
+            "expected_return_score": round(expected_return_score, 6),
+            "downside_penalty": round(downside_penalty, 6),
+            "catalyst_proximity_score": round(catalyst_proximity, 6),
+            "drivers": reasons,
+        })
+
+    mix_weights = _normalize_positive_weights(raw_scores)
+    target_book_weights = _cap_book_weights(
+        {t: mix * gross_target for t, mix in mix_weights.items()},
+        gross_target=gross_target,
+        single_name_cap=single_name_cap,
+    )
+    target_mix_weights = {
+        ticker: round(float(weight) / gross_target, 6)
+        for ticker, weight in target_book_weights.items()
+        if gross_target > 1e-12
+    }
+
+    enriched_rows: list[dict] = []
+    for row in rows:
+        ticker = row["ticker"]
+        current_weight = float(row["current_weight"])
+        target_book = float(target_book_weights.get(ticker, 0.0))
+        target_mix = float(target_mix_weights.get(ticker, 0.0))
+        delta = target_book - current_weight
+        displaced_by = universe[:2] if current_weight > target_book + 0.03 and ticker not in new_universe else []
+        if current_weight > 1e-12 and target_book < 0.01 and displaced_by:
+            book_action = "replace"
+        elif current_weight > 1e-12 and target_book < 0.01:
+            book_action = "exit"
+        elif current_weight <= 1e-12 and target_book >= 0.05:
+            book_action = "add"
+        elif current_weight <= 1e-12 and target_book < 0.03:
+            book_action = "ignore"
+        elif delta > 0.03:
+            book_action = "scale_up"
+        elif delta < -0.03:
+            book_action = "scale_down"
+        else:
+            book_action = "hold"
+        conviction = conviction_by_ticker.get(ticker, {})
+        allocator_signals = allocation_signals_by_ticker.get(ticker, {})
+        enriched_rows.append({
+            **row,
+            "target_mix_weight": round(target_mix, 6),
+            "target_book_weight": round(target_book, 6),
+            "delta_weight": round(delta, 6),
+            "book_action": book_action,
+            "displaced_by": displaced_by,
+            "conviction_components": {
+                "macro": float(((conviction.get("macro", {}) or {}).get("score", 0.0) or 0.0)),
+                "fundamental": float(((conviction.get("fundamental", {}) or {}).get("score", 0.0) or 0.0)),
+                "sentiment": float(((conviction.get("sentiment", {}) or {}).get("score", 0.0) or 0.0)),
+                "quant": float(((conviction.get("quant", {}) or {}).get("score", 0.0) or 0.0)),
+                "hedge_lite": float(((conviction.get("hedge_lite", {}) or {}).get("score", 0.0) or 0.0)),
+            },
+            "allocation_signal_components": {
+                "expected_return_pct": round(float(allocator_signals.get("expected_return_pct", 0.0) or 0.0), 4),
+                "downside_pct": round(float(allocator_signals.get("downside_pct", 0.0) or 0.0), 4),
+                "catalyst_proximity_score": round(float(allocator_signals.get("catalyst_proximity_score", 0.0) or 0.0), 4),
+                "catalyst_days": _coerce_int(allocator_signals.get("catalyst_days")),
+                "catalyst_type": str(allocator_signals.get("catalyst_type", "")).strip(),
+                "source": str(allocator_signals.get("source", "neutral")).strip() or "neutral",
+            },
+        })
+
+    capital_competition = sorted(
+        enriched_rows,
+        key=lambda item: (
+            -float(item.get("score", 0.0)),
+            -float(item.get("target_book_weight", 0.0)),
+            str(item.get("ticker", "")),
+        ),
+    )
+    for idx, row in enumerate(capital_competition, start=1):
+        row["rank"] = idx
+
+    plan = {
+        "status": "ok",
+        "action_type": action_type,
+        "current_gross": round(current_gross, 6),
+        "gross_target": gross_target,
+        "recommended_gross_delta": round(gross_target - current_gross, 6),
+        "single_name_cap": round(single_name_cap, 6),
+        "quality_haircut": quality_haircut,
+        "quality_overall_score": round(quality_overall, 4) if quality_overall is not None else None,
+        "quality_weak_desks": weak_desks,
+        "quality_adjustments": quality_adjustments,
+        "weights_relative": target_mix_weights,
+        "target_book_weights": target_book_weights,
+        "current_weights": {t: round(w, 6) for t, w in current_positions.items()},
+        "current_universe": universe,
+        "main_ticker": main,
+        "rebalances": capital_competition,
+        "allocator_source": "orchestrator_book_allocator_v1",
+        "conviction_by_ticker": conviction_by_ticker,
+        "allocation_signals_by_ticker": allocation_signals_by_ticker,
+    }
+    return plan, capital_competition
 
 
 def _apply_portfolio_mandate(decision: dict, portfolio_context: Optional[dict]) -> dict:
@@ -590,11 +1431,13 @@ def _plan_cache_key(
     iteration: int,
     risk_feedback: Optional[dict],
     portfolio_context: Optional[dict] = None,
+    book_context: Optional[dict] = None,
 ) -> str:
-    """(user_request + iteration + risk_feedback_hash + portfolio_context_hash) → md5 key."""
+    """(user_request + iteration + context hashes) → md5 key."""
     fb_str = json.dumps(risk_feedback or {}, sort_keys=True)
     ctx_str = json.dumps(portfolio_context or {}, sort_keys=True, ensure_ascii=False)
-    raw    = f"{user_request}::{iteration}::{fb_str}::{ctx_str}"
+    book_str = json.dumps(book_context or {}, sort_keys=True, ensure_ascii=False)
+    raw    = f"{user_request}::{iteration}::{fb_str}::{ctx_str}::{book_str}"
     return hashlib.md5(raw.encode()).hexdigest()
 
 
@@ -662,6 +1505,7 @@ def _call_llm(
     iteration: int,
     risk_feedback: Optional[dict] = None,
     portfolio_context: Optional[dict] = None,
+    book_context: Optional[dict] = None,
 ) -> dict:
     """
     LLM-first: LLM plan을 생성하고 Pydantic 검증.
@@ -676,7 +1520,7 @@ def _call_llm(
     _orch_trace(f"user_request={user_request}")
 
     # ── Plan cache check ──────────────────────────────────────────────
-    cache_key = _plan_cache_key(user_request, iteration, risk_feedback, portfolio_context)
+    cache_key = _plan_cache_key(user_request, iteration, risk_feedback, portfolio_context, book_context)
     if use_plan_cache and cache_key in _PLAN_CACHE:
         _orch_trace(f"plan cache hit key={cache_key[:10]}")
         print("   [LLM] plan cache hit")
@@ -702,6 +1546,7 @@ def _call_llm(
         iteration,
         risk_feedback,
         portfolio_context,
+        book_context,
     )
     human_msg_preview = human_msg if len(human_msg) <= 800 else (human_msg[:800] + " ...<truncated>")
     _orch_trace("human_msg:\n" + human_msg_preview)
@@ -1011,8 +1856,41 @@ def orchestrator_node(state: InvestmentState) -> dict:
     # LLM/Mock 호출
     print(f"   [LLM] CIO 의사결정 요청 중...")
     portfolio_context = state.get("portfolio_context", {})
-    decision = _call_llm(user_request, iteration, risk_feedback, portfolio_context)
+    book_context = _build_book_context_summary(state)
+    decision = _call_llm(user_request, iteration, risk_feedback, portfolio_context, book_context)
     decision = _apply_portfolio_mandate(decision, portfolio_context)
+    active_ideas = _build_active_ideas_registry(state, decision)
+    book_allocation_plan, capital_competition = _build_book_allocation_plan(state, decision, active_ideas)
+    conviction_by_ticker = (
+        book_allocation_plan.get("conviction_by_ticker", {})
+        if isinstance(book_allocation_plan, dict)
+        else {}
+    )
+    allocation_signals_by_ticker = (
+        book_allocation_plan.get("allocation_signals_by_ticker", {})
+        if isinstance(book_allocation_plan, dict)
+        else {}
+    )
+    portfolio_memory = _build_portfolio_memory(
+        state,
+        decision,
+        active_ideas,
+        conviction_by_ticker,
+        allocation_signals_by_ticker,
+    )
+    monitoring_backlog = _build_monitoring_backlog(state, decision, active_ideas)
+    current_book_exists = bool(_normalize_weight_map(state.get("positions_final") or state.get("positions_proposed") or {}))
+    decision["book_context_summary"] = book_context
+    decision["active_idea_count"] = len(active_ideas)
+    decision["open_review_count"] = len(monitoring_backlog)
+    if book_allocation_plan:
+        decision["allocator_guidance"] = {
+            "target_gross_exposure": book_allocation_plan.get("gross_target"),
+            "single_name_cap": book_allocation_plan.get("single_name_cap"),
+            "allocator_source": book_allocation_plan.get("allocator_source"),
+            "quality_haircut": book_allocation_plan.get("quality_haircut"),
+        }
+        decision["capital_competition_preview"] = capital_competition[:5]
 
     action = decision.get("action_type", "initial_delegation")
     brief = decision.get("investment_brief", {})
@@ -1031,6 +1909,20 @@ def orchestrator_node(state: InvestmentState) -> dict:
     if isinstance(mandate_meta, dict) and mandate_meta.get("applied"):
         print(f"   [mandate] changes={mandate_meta.get('changes', [])}")
         print(f"   [mandate] final_universe={mandate_meta.get('final_universe', universe)}")
+    if active_ideas:
+        print(f"   [book] active_ideas={len(active_ideas)} open_reviews={len(monitoring_backlog)}")
+    if book_allocation_plan:
+        print(
+            "   [allocator] gross_target="
+            f"{book_allocation_plan.get('gross_target')} top_mix={book_allocation_plan.get('weights_relative', {})}"
+        )
+
+    result_positions: dict[str, float] = {}
+    if current_book_exists and isinstance(book_allocation_plan, dict):
+        result_positions = {
+            str(t).strip().upper(): float(w)
+            for t, w in (book_allocation_plan.get("weights_relative", {}) or {}).items()
+        }
 
     if action == "fallback_abort":
         print(f"   ⚠️  FALLBACK: 신규 매수 포기. 현금 관망 또는 방어 대안 제시.")
@@ -1042,6 +1934,12 @@ def orchestrator_node(state: InvestmentState) -> dict:
         "analysis_tasks": tasks,
         "iteration_count": iteration + 1,
         "orchestrator_directives": decision,
+        "active_ideas": active_ideas,
+        "portfolio_memory": portfolio_memory,
+        "monitoring_backlog": monitoring_backlog,
+        "book_allocation_plan": book_allocation_plan,
+        "capital_competition": capital_competition,
+        "positions_proposed": result_positions,
     }
 
 

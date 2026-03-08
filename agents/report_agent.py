@@ -687,6 +687,174 @@ def _fmt_research_appendix(state: dict) -> str:
     return "\n".join(lines)
 
 
+def _build_positions_section(state: dict, *, lang: str = "ko") -> str:
+    proposed = state.get("positions_proposed", {}) if isinstance(state.get("positions_proposed"), dict) else {}
+    final = state.get("positions_final", {}) if isinstance(state.get("positions_final"), dict) else {}
+    tickers = [str(t).strip().upper() for t in (state.get("universe", []) or []) if str(t).strip()]
+    ordered = [t for t in tickers if t in proposed or t in final]
+    for t in list(proposed.keys()) + list(final.keys()):
+        tt = str(t).strip().upper()
+        if tt and tt not in ordered:
+            ordered.append(tt)
+    if not ordered:
+        return ""
+    lines = ["", "## Portfolio Weights", "", "| Ticker | Proposed | Final |", "|---|---:|---:|"]
+    for ticker in ordered:
+        lines.append(
+            f"| {ticker} | {_fmt_pct(proposed.get(ticker, 0.0))} | {_fmt_pct(final.get(ticker, proposed.get(ticker, 0.0)))} |"
+        )
+    return "\n".join(lines) + "\n"
+
+
+def _build_book_allocation_section(state: dict, *, lang: str = "ko") -> str:
+    plan = state.get("book_allocation_plan", {}) if isinstance(state.get("book_allocation_plan"), dict) else {}
+    rows = state.get("capital_competition", []) if isinstance(state.get("capital_competition"), list) else []
+    if not plan and not rows:
+        return ""
+    lines = ["", "## Book Allocation"]
+    if plan:
+        lines.extend(
+            [
+                "",
+                f"- Gross target: {plan.get('gross_target', 'n/a')}",
+                f"- Single-name cap: {plan.get('single_name_cap', 'n/a')}",
+                f"- Quality haircut: {plan.get('quality_haircut', 'n/a')}",
+            ]
+        )
+    if rows:
+        lines.extend(["", "| Ticker | Action | Conviction | ExpRet | Downside | Catalyst | Weight |", "|---|---|---:|---:|---:|---:|---:|"])
+        for row in rows[:8]:
+            if not isinstance(row, dict):
+                continue
+            lines.append(
+                "| {ticker} | {action} | {conv} | {exp_ret} | {downside} | {catalyst} | {weight} |".format(
+                    ticker=row.get("ticker", ""),
+                    action=row.get("book_action", ""),
+                    conv=row.get("conviction_score", "n/a"),
+                    exp_ret=row.get("expected_return_score", "n/a"),
+                    downside=row.get("downside_penalty", "n/a"),
+                    catalyst=row.get("catalyst_proximity_score", "n/a"),
+                    weight=_fmt_pct(row.get("target_weight", 0.0)),
+                )
+            )
+    return "\n".join(lines) + "\n"
+
+
+def _desk_provenance_row(label: str, desk: dict) -> str | None:
+    if not isinstance(desk, dict) or not desk:
+        return None
+    prov = desk.get("data_provenance", {}) if isinstance(desk.get("data_provenance"), dict) else {}
+    quality = prov.get("quality", "n/a")
+    raw = prov.get("raw_components", prov.get("raw_backed_layers", "n/a"))
+    coverage = prov.get("coverage_score", "n/a")
+    confidence = desk.get("confidence", "n/a")
+    recommendation = desk.get("recommendation", desk.get("decision", "n/a"))
+    return f"| {label} | {quality} | {raw} | {coverage} | {confidence} | {recommendation} |"
+
+
+def _build_provenance_section(state: dict, *, lang: str = "ko") -> str:
+    rows = []
+    for label, key in (
+        ("Macro", "macro_analysis"),
+        ("Fundamental", "fundamental_analysis"),
+        ("Sentiment", "sentiment_analysis"),
+        ("Quant", "technical_analysis"),
+    ):
+        row = _desk_provenance_row(label, state.get(key, {}) or {})
+        if row:
+            rows.append(row)
+    scorecard = state.get("decision_quality_scorecard", {}) if isinstance(state.get("decision_quality_scorecard"), dict) else {}
+    if not rows and not scorecard:
+        return ""
+    lines = ["", "## Evidence & Decision Quality", "", "| Desk | Provenance | Raw-backed | Coverage | Confidence | Output |", "|---|---|---:|---:|---:|---|"]
+    lines.extend(rows or ["| (none) | n/a | n/a | n/a | n/a | n/a |"])
+    if scorecard:
+        lines.extend(
+            [
+                "",
+                f"- Overall decision quality score: {scorecard.get('overall_score', 'n/a')}",
+                f"- Weak desks: {scorecard.get('weak_desks', [])}",
+            ]
+        )
+    return "\n".join(lines) + "\n"
+
+
+def _build_event_monitoring_section(state: dict, *, lang: str = "ko") -> str:
+    event_calendar = state.get("event_calendar", []) if isinstance(state.get("event_calendar"), list) else []
+    monitoring_actions = state.get("monitoring_actions", {}) if isinstance(state.get("monitoring_actions"), dict) else {}
+    desk_triggers: list[tuple[str, dict]] = []
+    for label, key in (
+        ("macro", "macro_analysis"),
+        ("fundamental", "fundamental_analysis"),
+        ("sentiment", "sentiment_analysis"),
+        ("quant", "technical_analysis"),
+    ):
+        desk = state.get(key, {}) if isinstance(state.get(key), dict) else {}
+        for trigger in (desk.get("monitoring_triggers", []) or [])[:3]:
+            if isinstance(trigger, dict):
+                desk_triggers.append((label, trigger))
+    if not event_calendar and not monitoring_actions and not desk_triggers:
+        return ""
+    lines = ["", "## Event Calendar & Monitoring"]
+    if event_calendar:
+        lines.extend(["", "| Desk | Type | Status | Date/Trigger | Source |", "|---|---|---|---|---|"])
+        for item in event_calendar[:10]:
+            if not isinstance(item, dict):
+                continue
+            lines.append(
+                "| {desk} | {type} | {status} | {dt} | {source} |".format(
+                    desk=item.get("desk", ""),
+                    type=item.get("type", ""),
+                    status=item.get("status", ""),
+                    dt=item.get("date", item.get("trigger", item.get("days_to_event", ""))),
+                    source=item.get("source", ""),
+                )
+            )
+    if desk_triggers:
+        lines.extend(["", "- Desk monitoring triggers:"])
+        for desk, trigger in desk_triggers[:10]:
+            lines.append(
+                f"  - {desk}: {trigger.get('name', '')} / {trigger.get('metric', '')} {trigger.get('trigger', '')} (current={trigger.get('current_value', 'n/a')})"
+            )
+    if monitoring_actions:
+        lines.extend(
+            [
+                "",
+                f"- Monitoring escalation: force_research={monitoring_actions.get('force_research', False)}",
+                f"- Selected desks: {monitoring_actions.get('selected_desks', [])}",
+                f"- Risk refresh required: {monitoring_actions.get('risk_refresh_required', False)}",
+            ]
+        )
+    return "\n".join(lines) + "\n"
+
+
+def _build_report_limitations_section(state: dict, *, lang: str = "ko") -> str:
+    limitations: list[str] = []
+    for label, key in (
+        ("Macro", "macro_analysis"),
+        ("Fundamental", "fundamental_analysis"),
+        ("Sentiment", "sentiment_analysis"),
+        ("Quant", "technical_analysis"),
+    ):
+        desk = state.get(key, {}) if isinstance(state.get(key), dict) else {}
+        desk_limits = [str(x).strip() for x in (desk.get("limitations", []) or []) if str(x).strip()]
+        if desk_limits:
+            limitations.append(f"{label}: {'; '.join(desk_limits[:2])}")
+    weak_desks = []
+    scorecard = state.get("decision_quality_scorecard", {}) if isinstance(state.get("decision_quality_scorecard"), dict) else {}
+    if scorecard:
+        weak_desks = scorecard.get("weak_desks", []) or []
+    if not limitations and not weak_desks:
+        return ""
+    lines = ["", "## Limits & Open Risks"]
+    if limitations:
+        for item in limitations[:8]:
+            lines.append(f"- {item}")
+    if weak_desks:
+        lines.append(f"- Weak desks requiring follow-up: {weak_desks}")
+    return "\n".join(lines) + "\n"
+
+
 def _output_language(state: dict) -> str:
     lang = str(state.get("output_language", "")).strip().lower()
     if lang in {"ko", "en"}:
@@ -835,6 +1003,11 @@ def _build_fidelity_report(state: dict) -> str:
             f"- risk_decision.per_ticker_decisions[{ticker}].flags: {risk_flags}\n"
             f"- risk_decision.per_ticker_decisions[{ticker}].rationale_short: {risk_rationale or '(empty)'}\n"
             f"- portfolio_cvar_1d(state): {portfolio_cvar} / limit(state): {cvar_limit}\n"
+            f"{_build_positions_section(state, lang='en')}"
+            f"{_build_book_allocation_section(state, lang='en')}"
+            f"{_build_provenance_section(state, lang='en')}"
+            f"{_build_event_monitoring_section(state, lang='en')}"
+            f"{_build_report_limitations_section(state, lang='en')}"
             f"{_build_hedge_lite_summary_en()}"
         )
 
@@ -856,6 +1029,11 @@ def _build_fidelity_report(state: dict) -> str:
         f"- `fundamental_analysis.analysis_mode`: {funda.get('analysis_mode', 'n/a')} / `asset_type`: {funda.get('asset_type', 'n/a')}\n"
         f"- `sentiment_analysis.data_quality.warnings`: {senti.get('data_quality', {}).get('warnings', [])}\n"
         f"- `research_stop_reason`: {state.get('research_stop_reason', '')}\n\n"
+        f"{_build_positions_section(state, lang='ko')}"
+        f"{_build_book_allocation_section(state, lang='ko')}"
+        f"{_build_provenance_section(state, lang='ko')}"
+        f"{_build_event_monitoring_section(state, lang='ko')}"
+        f"{_build_report_limitations_section(state, lang='ko')}"
         f"{_build_hedge_lite_summary_ko()}"
         f"## 감사 메모\n"
         f"- 본 보고서는 state 값만 사용해 생성되며, state에 없는 인과는 추가하지 않음.\n"

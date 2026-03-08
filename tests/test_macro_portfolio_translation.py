@@ -36,6 +36,9 @@ def test_macro_output_includes_portfolio_translation_fields():
     assert "transmission_map" in out and isinstance(out["transmission_map"], dict)
     assert "portfolio_implications" in out and isinstance(out["portfolio_implications"], dict)
     assert "monitoring_triggers" in out and isinstance(out["monitoring_triggers"], list)
+    assert "pricing_divergence" in out and isinstance(out["pricing_divergence"], dict)
+    assert "scenario_stress_grid" in out and isinstance(out["scenario_stress_grid"], dict)
+    assert "macro_event_calendar" in out and isinstance(out["macro_event_calendar"], list)
     assert set(out["transmission_map"]) >= {"growth_beta", "policy_rates", "credit", "inflation_real_assets", "liquidity"}
     assert out["portfolio_implications"]["context"]["main_ticker"] == "SPY"
     assert len(out["portfolio_implications"]["targets"]) == 5
@@ -177,3 +180,65 @@ def test_macro_dualizes_rates_pricing_with_sofr_and_basis():
     assert rates["basis_bp"] == 15.0
     assert policy_trigger["metric"] == "sofr_futures_implied_change_6m_bp"
     assert basis_trigger["metric"] == "sofr_ff_6m_basis_bp"
+
+
+def test_macro_flags_hawkish_surprise_risk_when_hot_macro_meets_easing_pricing():
+    state = _build_state(["SPY", "QQQ", "GLD", "TLT", "XLE"])
+    ind = {
+        "yield_curve_spread": 0.45,
+        "hy_oas": 260,
+        "cpi_yoy": 3.2,
+        "pmi": 57,
+        "fed_funds_rate": 4.5,
+        "sofr_futures_implied_change_6m_bp": -45.0,
+        "vix_level": 16.0,
+        "wti_spot": 84.0,
+    }
+
+    out = macro_analyst_run("SPY", ind, state=state, focus_areas=["Fed policy path", "WTI/Brent"])
+    divergence = out["pricing_divergence"]
+
+    assert divergence["overall_signal"] == "hawkish_surprise_risk"
+    assert divergence["policy_path"]["signal"] == "hawkish_surprise_risk"
+    assert out["recommendation"] == "allow_with_limits"
+
+
+def test_macro_event_calendar_marks_imminent_and_feeds_scenario_grid():
+    state = _build_state(["SPY", "QQQ", "GLD", "TLT", "XLE"])
+    ind = {
+        "yield_curve_spread": -0.25,
+        "hy_oas": 520,
+        "cpi_yoy": 2.7,
+        "pmi": 47,
+        "fed_funds_rate": 4.0,
+        "vix_level": 27.0,
+    }
+    macro_events = [
+        {
+            "type": "fomc",
+            "subtype": "policy_decision",
+            "title": "FOMC Meeting (March 17-18, 2026)",
+            "date": "2026-03-18T18:00:00+00:00",
+            "source": "federalreserve.gov",
+            "source_url": "https://www.federalreserve.gov/monetarypolicy/fomccalendars.htm",
+            "source_classification": "confirmed",
+            "event_origin": "official_macro_calendar",
+        }
+    ]
+
+    out = macro_analyst_run(
+        "SPY",
+        ind,
+        state=state,
+        as_of="2026-03-08T00:00:00+00:00",
+        macro_events=macro_events,
+    )
+    events = out["macro_event_calendar"]
+    grid = out["scenario_stress_grid"]
+
+    assert events[0]["type"] == "fomc"
+    assert events[0]["status"] == "upcoming"
+    assert events[0]["days_to_event"] == 10
+    assert grid["status"] == "ok"
+    assert len(grid["scenarios"]) == 3
+    assert any(item["ticker"] == "TLT" for item in grid["scenarios"][2]["asset_impacts"])

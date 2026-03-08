@@ -310,6 +310,147 @@ def test_risk_manager_node_enforces_portfolio_context_mandate(monkeypatch):
     assert "mandate_violation" in decision["orchestrator_feedback"]["reasons"]
 
 
+def test_compute_risk_decision_reads_allocator_guidance_gross_cap():
+    from agents.risk_agent import compute_risk_decision
+
+    payload = {
+        "risk_limits": {"max_portfolio_cvar_1d": 0.015, "max_leverage": 2.0,
+                        "max_net_exposure": 0.8, "max_gross_exposure": 2.0,
+                        "max_single_name_weight": 0.15, "max_sector_weight": 0.35,
+                        "max_hhi": 0.25, "max_quant_weight_anomaly": 0.20,
+                        "conservative_fallback_weight": 0.03, "liquidity_days_warning": 5},
+        "portfolio_risk_summary": {
+            "component_var_by_ticker": {"SPY": 0.01, "TLT": 0.006, "GLD": 0.004},
+            "portfolio_cvar_1d": 0.005,
+            "leverage_ratio": 1.0,
+            "herfindahl_index": 0.20,
+            "sector_exposure": {"Broad Market": 0.7, "Fixed Income": 0.2, "Commodities": 0.1},
+            "total_net_exposure": 1.0,
+        },
+        "positions_proposed": {"SPY": 0.6, "TLT": 0.25, "GLD": 0.15},
+        "allocator_guidance": {
+            "target_gross_exposure": 0.4,
+            "single_name_cap": 0.3,
+            "allocator_source": "orchestrator_book_allocator_v1",
+        },
+        "analyst_reports": {
+            "macro": {"macro_regime": "expansion", "regime": "expansion", "evidence": [1], "data_ok": True},
+            "fundamental": {"risk_flags": [], "evidence": [1], "data_ok": True},
+            "sentiment": {"evidence": [1], "data_ok": True},
+            "quant": {"decision": "LONG", "final_allocation_pct": 0.10, "evidence": [1], "data_ok": True},
+            "_target_ticker": "SPY",
+        },
+    }
+
+    decision = compute_risk_decision(payload)
+    total_gross = sum(abs(v["final_weight"]) for v in decision["per_ticker_decisions"].values())
+
+    assert total_gross <= 0.4001
+    assert "mandate_violation" in decision["orchestrator_feedback"]["reasons"]
+
+
+def test_compute_risk_decision_stress_and_liquidity_trigger_kill_switch():
+    from agents.risk_agent import compute_risk_decision
+
+    payload = {
+        "risk_limits": {"max_portfolio_cvar_1d": 0.015, "max_leverage": 2.0,
+                        "max_net_exposure": 0.8, "max_gross_exposure": 2.0,
+                        "max_single_name_weight": 0.15, "max_sector_weight": 0.35,
+                        "max_hhi": 0.25, "max_quant_weight_anomaly": 0.20,
+                        "conservative_fallback_weight": 0.03, "liquidity_days_warning": 5},
+        "portfolio_risk_summary": {
+            "component_var_by_ticker": {"SPY": 0.02, "QQQ": 0.015, "TLT": 0.005},
+            "portfolio_cvar_1d": 0.022,
+            "leverage_ratio": 1.3,
+            "herfindahl_index": 0.41,
+            "sector_exposure": {"Broad Market": 0.6, "Technology": 0.25, "Fixed Income": 0.15},
+            "total_net_exposure": 1.0,
+            "total_gross_exposure": 1.0,
+            "liquidity_score_by_ticker": {"SPY": 8.0, "QQQ": 6.0, "TLT": 4.0},
+        },
+        "positions_proposed": {"SPY": 0.6, "QQQ": 0.25, "TLT": 0.15},
+        "positions_metadata": {
+            "SPY": {"sector": "Broad Market"},
+            "QQQ": {"sector": "Technology"},
+            "TLT": {"sector": "Fixed Income"},
+        },
+        "event_calendar": [
+            {"ticker": "__GLOBAL__", "status": "imminent", "priority": 1, "confirmed": True, "type": "fomc"},
+            {"ticker": "SPY", "status": "triggered", "priority": 1, "confirmed": True, "type": "macro_monitor"},
+        ],
+        "monitoring_actions": {
+            "risk_refresh_required": True,
+            "selected_desks": ["macro", "quant"],
+            "reason": "new_triggered_events",
+        },
+        "analyst_reports": {
+            "macro": {
+                "macro_regime": "recession",
+                "regime": "recession",
+                "evidence": [1],
+                "data_ok": True,
+                "raw_market_inputs": {"vix_level": 31.0},
+            },
+            "fundamental": {"risk_flags": [], "evidence": [1], "data_ok": True},
+            "sentiment": {"evidence": [1], "data_ok": True},
+            "quant": {"decision": "LONG", "final_allocation_pct": 0.20, "evidence": [1], "data_ok": True},
+            "_target_ticker": "SPY",
+        },
+    }
+
+    decision = compute_risk_decision(payload)
+    kill_switch = decision["portfolio_actions"]["kill_switch"]
+    escalation = decision["portfolio_actions"]["escalation"]
+
+    assert decision["stress_test_summary"]["severity"] in {"high", "critical"}
+    assert decision["liquidity_risk"]["severity"] == "critical"
+    assert kill_switch["active"] is True
+    assert escalation["freeze_new_risk"] is True
+    assert "stress_test_breach" in decision["orchestrator_feedback"]["reasons"]
+    assert "liquidity_stress" in decision["orchestrator_feedback"]["reasons"]
+    assert "kill_switch_active" in decision["orchestrator_feedback"]["reasons"]
+    total_gross = sum(abs(v["final_weight"]) for v in decision["per_ticker_decisions"].values())
+    assert total_gross <= kill_switch["target_gross_exposure"] + 1e-6
+
+
+def test_risk_manager_node_includes_escalation_and_risk_objects(monkeypatch):
+    from agents import risk_agent as risk
+    from schemas.common import create_initial_state
+
+    monkeypatch.setattr(risk, "_call_llm", lambda payload: risk.compute_risk_decision(payload))
+
+    state = create_initial_state(user_request="시장 리스크 점검", mode="mock", seed=11)
+    state["iteration_count"] = 1
+    state["target_ticker"] = "SPY"
+    state["positions_proposed"] = {"SPY": 0.55, "QQQ": 0.25, "TLT": 0.20}
+    state["event_calendar"] = [
+        {"ticker": "__GLOBAL__", "status": "imminent", "priority": 1, "confirmed": True, "type": "fomc"},
+    ]
+    state["monitoring_actions"] = {
+        "risk_refresh_required": True,
+        "selected_desks": ["macro"],
+        "reason": "new_triggered_events",
+    }
+    state["macro_analysis"] = {
+        "macro_regime": "recession",
+        "regime": "recession",
+        "evidence": [1],
+        "data_ok": True,
+        "raw_market_inputs": {"vix_level": 28.0},
+    }
+    state["fundamental_analysis"] = {"sector": "Broad Market", "risk_flags": [], "evidence": [1], "data_ok": True}
+    state["sentiment_analysis"] = {"evidence": [1], "data_ok": True}
+    state["technical_analysis"] = {"decision": "LONG", "final_allocation_pct": 0.12, "evidence": [1], "data_ok": True}
+
+    out = risk.risk_manager_node(state)
+    decision = out["risk_assessment"]["risk_decision"]
+
+    assert "stress_test_summary" in decision
+    assert "liquidity_risk" in decision
+    assert decision["portfolio_actions"]["escalation"]["status"] == "ok"
+    assert "macro" in decision["portfolio_actions"]["escalation"]["rerun_desks"]
+
+
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 # Item 8: Disagreement score
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━

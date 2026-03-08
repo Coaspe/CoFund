@@ -37,6 +37,25 @@ _FLAG_KEYWORDS = {
     ],
 }
 
+_EIGHT_K_ITEM_RE = re.compile(r"\bitem\s+([1-9]\.\d{2})\b", re.IGNORECASE)
+_EIGHT_K_EXHIBIT_RE = re.compile(r"\b(?:exhibit|ex)\s+(99(?:\.\d+)?)\b", re.IGNORECASE)
+_EIGHT_K_LEGAL_RE = re.compile(
+    r"\b(antitrust|lawsuit|litigation|court|doj|ftc|subpoena|investigation|settlement|consent decree|regulator(?:y)?)\b",
+    re.IGNORECASE,
+)
+_EIGHT_K_CONTRACT_RE = re.compile(
+    r"\b(agreement|contract|renewal|customer|supplier|strategic partnership|commercial agreement|master services agreement)\b",
+    re.IGNORECASE,
+)
+_EIGHT_K_PRICING_RE = re.compile(
+    r"\b(pricing|price increase|price cut|discount|repricing|tariff|rate change)\b",
+    re.IGNORECASE,
+)
+
+
+def _strip_html(raw: str) -> str:
+    return re.sub(r"<[^>]+>", " ", raw or "")
+
 
 class SECEdgarProvider(BaseProvider):
     PROVIDER_NAME = "sec_edgar"
@@ -52,10 +71,10 @@ class SECEdgarProvider(BaseProvider):
     def _headers(self) -> dict:
         return {"User-Agent": self._user_agent, "Accept-Encoding": "gzip, deflate"}
 
-    def _search_filings(self, ticker: str, forms: str, startdt: str = "2023-01-01", size: int = 5) -> list[dict]:
+    def _search_filings(self, ticker: str, forms: str, startdt: str = "2023-01-01", size: int = 5, query: str | None = None) -> list[dict]:
         url = f"{_SEC_BASE}/search-index"
         params = {
-            "q": f'"{ticker}"',
+            "q": query or f'"{ticker}"',
             "forms": forms,
             "dateRange": "custom",
             "startdt": startdt,
@@ -193,7 +212,12 @@ class SECEdgarProvider(BaseProvider):
         forms = "4,13F-HR,SC 13D,SC 13G"
         limitations: list[str] = []
         try:
-            hits = self._search_filings(ticker, forms=forms, startdt="2023-01-01", size=8)
+            cik = self._resolve_cik(ticker)
+            hits = []
+            if cik:
+                hits = self._search_filings(ticker, forms=forms, startdt="2023-01-01", size=12, query=f'"{cik}"')
+            if not hits:
+                hits = self._search_filings(ticker, forms=forms, startdt="2023-01-01", size=12)
         except ProviderError as exc:
             limitations.append(f"SEC ownership search error: {exc}")
             return {"items": [], "data_ok": False, "limitations": limitations, "as_of": as_of}
@@ -216,11 +240,56 @@ class SECEdgarProvider(BaseProvider):
         except ProviderError as exc:
             limitations.append(f"SEC 8-K search error: {exc}")
             return {"items": [], "data_ok": False, "limitations": limitations, "as_of": as_of}
-        items = [
-            self._hit_to_evidence_item(h, kind="press_release_or_ir", ticker=ticker, resolver_path="sec_8k")
-            for h in hits
-        ]
+        items = []
+        for hit in hits:
+            item = self._hit_to_evidence_item(hit, kind="press_release_or_ir", ticker=ticker, resolver_path="sec_8k")
+            filing_text = self._fetch_filing_text(item.get("url", ""))
+            item_numbers = sorted(set(_EIGHT_K_ITEM_RE.findall(filing_text)))
+            exhibit_codes = sorted(set(_EIGHT_K_EXHIBIT_RE.findall(filing_text)))
+            catalyst_type = self._classify_8k_catalyst(item, filing_text, item_numbers, exhibit_codes)
+            if filing_text:
+                item["snippet"] = " ".join(_strip_html(filing_text).split())[:600]
+            item["filing_items"] = item_numbers
+            item["exhibit_codes"] = exhibit_codes
+            item["catalyst_type"] = catalyst_type
+            item["source_classification"] = "confirmed"
+            item["event_origin"] = "sec_8k"
+            items.append(item)
         return {"items": items, "data_ok": bool(items), "limitations": limitations, "as_of": as_of}
+
+    def _fetch_filing_text(self, filing_url: str) -> str:
+        if not filing_url:
+            return ""
+        try:
+            resp = self._session.get(filing_url, headers=self._headers(), timeout=self._timeout)
+            record_api_request(self.PROVIDER_NAME, success=True, category="data")
+            return resp.text[:200_000]
+        except Exception:
+            record_api_request(self.PROVIDER_NAME, success=False, category="data")
+            return ""
+
+    @staticmethod
+    def _classify_8k_catalyst(item: dict, filing_text: str, item_numbers: list[str], exhibit_codes: list[str]) -> str | None:
+        text = " ".join(
+            [
+                str(item.get("title", "")),
+                str(item.get("snippet", "")),
+                _strip_html(filing_text),
+            ]
+        )
+        if _EIGHT_K_PRICING_RE.search(text):
+            return "pricing_reset"
+        if _EIGHT_K_LEGAL_RE.search(text):
+            return "legal_reg"
+        if any(x in {"1.01", "1.02"} for x in item_numbers) and _EIGHT_K_CONTRACT_RE.search(text):
+            return "contract_renewal"
+        if "investor day" in text.lower() or "capital markets day" in text.lower() or "analyst day" in text.lower():
+            return "investor_day"
+        if any(k in text.lower() for k in ("launch", "unveil", "release", "new product", "approval", "shipment")):
+            return "product_cycle"
+        if "99.1" in exhibit_codes and _EIGHT_K_CONTRACT_RE.search(text):
+            return "contract_renewal"
+        return None
 
 
 if __name__ == "__main__":

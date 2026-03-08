@@ -25,7 +25,183 @@ from schemas.common import make_evidence, make_risk_flag
 
 # ── Template helpers ──────────────────────────────────────────────────────────
 
-def _build_key_drivers(features: dict, news_info: dict, catalyst: dict, vol_info: dict) -> list[str]:
+def _safe_float(value: Any) -> float | None:
+    try:
+        if value in (None, ""):
+            return None
+        return float(value)
+    except (TypeError, ValueError):
+        return None
+
+
+def _build_confirmed_events(events: list) -> list[dict]:
+    out: list[dict] = []
+    for raw in events or []:
+        if not isinstance(raw, dict):
+            continue
+        confirmed = bool(raw.get("confirmed")) or str(raw.get("source_classification", "")).strip().lower() == "confirmed"
+        status = str(raw.get("status", "")).strip().lower()
+        days = raw.get("days_to_event")
+        try:
+            days_i = int(days) if days is not None else None
+        except (TypeError, ValueError):
+            days_i = None
+        if not confirmed and status not in {"imminent", "triggered"}:
+            continue
+        out.append(
+            {
+                "type": str(raw.get("type", "")).strip().lower() or "event",
+                "subtype": str(raw.get("subtype", "")).strip() or str(raw.get("title", "")).strip(),
+                "date": str(raw.get("date", "")).strip(),
+                "days_to_event": days_i,
+                "status": status or ("imminent" if days_i is not None and 0 <= days_i <= 7 else "upcoming"),
+                "source": str(raw.get("source", "")).strip() or "event_calendar",
+                "source_classification": str(raw.get("source_classification", "")).strip().lower() or ("confirmed" if confirmed else "inferred"),
+            }
+        )
+    out.sort(key=lambda item: (item.get("days_to_event") is None, item.get("days_to_event") if item.get("days_to_event") is not None else 9999))
+    return out[:6]
+
+
+def _build_options_vol_structure(indicators: dict, vol_info: dict) -> dict:
+    vix = _safe_float(indicators.get("vix_level"))
+    vvix = _safe_float(indicators.get("vvix_level"))
+    skew = _safe_float(indicators.get("skew_index"))
+    pcr_oi = _safe_float(indicators.get("put_call_oi_ratio", indicators.get("put_call_ratio")))
+    pcr_vol = _safe_float(indicators.get("put_call_volume_ratio"))
+    term = str(indicators.get("vix_term_structure", "")).strip().lower() or "unknown"
+    slope = _safe_float(
+        indicators.get("vix_term_structure_slope_9d_3m", indicators.get("vix_term_structure_slope_1m_3m"))
+    )
+    if vol_info.get("vol_regime") in {"crisis", "high"} or term == "backwardation":
+        structure_risk = "elevated"
+    elif vix is not None and vix < 15 and term == "contango":
+        structure_risk = "calm"
+    else:
+        structure_risk = "normal"
+    return {
+        "vix_level": vix,
+        "vvix_level": vvix,
+        "skew_index": skew,
+        "vix_term_structure": term,
+        "term_structure_slope": slope,
+        "put_call_oi_ratio": pcr_oi,
+        "put_call_volume_ratio": pcr_vol,
+        "vol_surface_risk": structure_risk,
+        "source": vol_info.get("source", "sentiment_market"),
+    }
+
+
+def _build_positioning_snapshot(indicators: dict, features: dict) -> dict:
+    held_inst = _safe_float(indicators.get("held_percent_institutions", indicators.get("institutions_percent_held")))
+    top10 = _safe_float(indicators.get("institutional_top10_pct"))
+    short_interest_pct = _safe_float(indicators.get("short_interest_pct"))
+    short_change = _safe_float(indicators.get("short_interest_change_pct"))
+    concentration_level = "unknown"
+    if top10 is not None:
+        concentration_level = "high" if top10 >= 45 else ("elevated" if top10 >= 30 else "normal")
+    elif held_inst is not None:
+        concentration_level = "elevated" if held_inst >= 75 else "normal"
+    return {
+        "positioning_crowding": features.get("positioning_crowding", "balanced"),
+        "ownership_crowding": features.get("ownership_crowding", "normal"),
+        "institutional_concentration_level": concentration_level,
+        "held_percent_institutions": held_inst,
+        "institutional_top10_pct": top10,
+        "short_interest_pct": short_interest_pct,
+        "short_interest_change_pct": short_change,
+        "insider_activity": str(features.get("insider_activity", "neutral")).strip().lower() or "neutral",
+        "incremental_buyer_seller_map": indicators.get("incremental_buyer_seller_map", {}),
+    }
+
+
+def _build_data_provenance(indicators: dict, confirmed_events: list[dict], *, source_name: str, no_articles: bool) -> dict:
+    sources = {
+        "news_articles": not no_articles,
+        "options_snapshot": any(indicators.get(key) is not None for key in ("put_call_oi_ratio", "put_call_volume_ratio", "put_call_ratio")),
+        "vol_snapshot": any(indicators.get(key) is not None for key in ("vix_level", "vvix_level", "skew_index", "vix_term_structure")),
+        "short_interest": any(indicators.get(key) is not None for key in ("short_interest_pct", "short_interest_change_pct")),
+        "ownership": any(indicators.get(key) is not None for key in ("held_percent_institutions", "institutions_percent_held", "institutional_top10_pct")),
+        "confirmed_events": bool(confirmed_events),
+    }
+    raw_components = sum(1 for present in sources.values() if present)
+    total_components = len(sources)
+    coverage_score = round(raw_components / total_components, 3)
+    quality = "high" if coverage_score >= 0.80 else ("medium" if coverage_score >= 0.50 else "low")
+    return {
+        "source_name": source_name,
+        "raw_components": raw_components,
+        "total_components": total_components,
+        "coverage_score": coverage_score,
+        "quality": quality,
+        "sources": sources,
+    }
+
+
+def _build_monitoring_triggers(indicators: dict, confirmed_events: list[dict], vol_info: dict) -> list[dict]:
+    triggers: list[dict] = []
+    vix = _safe_float(indicators.get("vix_level"))
+    if vix is not None:
+        triggers.append(
+            {
+                "name": "VIX regime",
+                "metric": "vix_level",
+                "current_value": round(vix, 2),
+                "trigger": ">=25 high-risk / >=30 crisis",
+                "action": "sentiment+risk rerun",
+                "priority": 1 if vix >= 25 else 2,
+            }
+        )
+    term = str(indicators.get("vix_term_structure", "")).strip().lower()
+    if term:
+        triggers.append(
+            {
+                "name": "VIX term structure",
+                "metric": "vix_term_structure",
+                "current_value": term,
+                "trigger": "backwardation persists",
+                "action": "reduce tactical long tilt",
+                "priority": 1 if term == "backwardation" else 3,
+            }
+        )
+    pcr = _safe_float(indicators.get("put_call_oi_ratio", indicators.get("put_call_ratio")))
+    if pcr is not None:
+        triggers.append(
+            {
+                "name": "Options put/call crowding",
+                "metric": "put_call_oi_ratio",
+                "current_value": round(pcr, 3),
+                "trigger": ">=1.20 fear / <=0.60 greed",
+                "action": "retime entry or trim crowding",
+                "priority": 2,
+            }
+        )
+    for event in confirmed_events[:3]:
+        triggers.append(
+            {
+                "name": f"Confirmed event: {event.get('type', 'event')}",
+                "metric": "event_calendar",
+                "current_value": event.get("days_to_event"),
+                "trigger": "D-7 to D+1 review window",
+                "action": "sentiment rerun around event",
+                "priority": 1 if event.get("status") in {"imminent", "triggered"} else 2,
+            }
+        )
+    if vol_info.get("vol_regime") in {"crisis", "high"} and not triggers:
+        triggers.append(
+            {
+                "name": "Volatility regime",
+                "metric": "vol_regime",
+                "current_value": vol_info.get("vol_regime"),
+                "trigger": "high/crisis",
+                "action": "risk review",
+                "priority": 1,
+            }
+        )
+    return triggers[:6]
+
+
+def _build_key_drivers(features: dict, news_info: dict, catalyst: dict, vol_info: dict, indicators: dict) -> list[str]:
     drivers = []
     vol_z = news_info.get("news_volume_z")
     if vol_z is not None and abs(vol_z) >= 1.5:
@@ -40,18 +216,29 @@ def _build_key_drivers(features: dict, news_info: dict, catalyst: dict, vol_info
 
     if catalyst.get("catalyst_present"):
         ctypes = ", ".join(catalyst.get("catalyst_type", []))
-        drivers.append(f"Catalyst: {ctypes} (risk={catalyst.get('catalyst_risk_level', '?')})")
+        drivers.append(
+            f"Catalyst: {ctypes} (risk={catalyst.get('catalyst_risk_level', '?')}, confirmed={catalyst.get('confirmed_count', 0)})"
+        )
 
     vr = vol_info.get("vol_regime", "normal")
     if vr in ("crisis", "high"):
         src = vol_info.get("source", "")
         drivers.append(f"Vol regime {vr} (via {src})")
+    term = str(indicators.get("vix_term_structure", "")).strip().lower()
+    if term == "backwardation":
+        drivers.append("Vol term structure backwardation: near-term stress priced")
+    vvix = _safe_float(indicators.get("vvix_level"))
+    if vvix is not None and vvix >= 95:
+        drivers.append(f"VVIX elevated ({vvix:.1f})")
 
     pos = features.get("positioning_crowding", "balanced")
     if pos == "short_crowded":
         drivers.append("Short squeeze risk: crowded short interest")
     elif pos == "long_crowded":
         drivers.append("Long crowding: potential unwind risk")
+    inst = _safe_float(indicators.get("held_percent_institutions", indicators.get("institutions_percent_held")))
+    if inst is not None and inst >= 75:
+        drivers.append(f"Institutional concentration elevated ({inst:.1f}%)")
 
     vel = features.get("_velocity", {}) or {}
     if vel.get("sharp_reversal"):
@@ -60,17 +247,21 @@ def _build_key_drivers(features: dict, news_info: dict, catalyst: dict, vol_info
     return drivers[:6]
 
 
-def _build_what_to_watch(features: dict, catalyst: dict) -> list[str]:
+def _build_what_to_watch(features: dict, catalyst: dict, indicators: dict) -> list[str]:
     items = []
     if catalyst.get("catalyst_present"):
         win = catalyst.get("event_window_days", 7)
-        items.append(f"실적 발표 전후 {win}일 변동성 확대 — 분할 진입 권고")
+        items.append(f"Confirmed event D-{win}~D+1 구간 변동성 확대 — 비중/헤지 재점검")
     if features.get("vol_regime_from_inference") in ("crisis", "high"):
         items.append("VIX/vol 정상화(≤20) 확인 후 비중 확대 재고")
+    if str(indicators.get("vix_term_structure", "")).strip().lower() == "backwardation":
+        items.append("VIX term structure contango 복귀 여부 확인")
     if features.get("sentiment_regime") in ("euphoria", "greed"):
         items.append("뉴스 볼륨 정상화 시까지 tilt 상향 금지")
     if features.get("positioning_crowding") == "short_crowded":
         items.append("Short squeeze 발생 시 급등 후 역방향 반전 주의")
+    if _safe_float(indicators.get("put_call_oi_ratio", indicators.get("put_call_ratio"))) is not None:
+        items.append("PCR / term structure / VVIX 조합으로 crowding 재확인")
     items.append("PCR / VIX / 뉴스 볼륨 주 1회 이상 모니터링")
     return items[:5]
 
@@ -429,17 +620,42 @@ def sentiment_analyst_run(
     events = sentiment_indicators.get("upcoming_events", [])
     catalyst = detect_catalyst_risk(events, news_volume_z)
     catalyst_level = catalyst.get("catalyst_risk_level", "low")
+    confirmed_events = _build_confirmed_events(events)
+    options_vol_structure = _build_options_vol_structure(sentiment_indicators, vol_info)
+    positioning_snapshot = _build_positioning_snapshot(sentiment_indicators, features)
+    data_provenance = _build_data_provenance(
+        sentiment_indicators,
+        confirmed_events,
+        source_name=source_name,
+        no_articles=no_articles,
+    )
+    monitoring_triggers = _build_monitoring_triggers(sentiment_indicators, confirmed_events, vol_info)
 
     tilt = features["base_tilt_factor"]
-    if catalyst_level == "high":
+    if catalyst_level == "high" and tilt > 1.0:
         tilt = 1.0
+    if catalyst_level == "high" and len(confirmed_events) > 0:
+        tilt = 1.0 if abs(tilt - 1.0) <= 0.10 else round((tilt + 1.0) / 2.0, 2)
     if vol_regime == "crisis" and tilt > 0.9:
         tilt = 0.9
     tilt = round(max(0.7, min(1.3, tilt)), 2)
 
     q = 0.3 if source_name == "mock" else 0.7
     evidence = []
-    for key in ["put_call_ratio", "pcr_percentile_90d", "vix_level", "short_interest_pct", "news_sentiment_score"]:
+    for key in [
+        "put_call_ratio",
+        "put_call_oi_ratio",
+        "put_call_volume_ratio",
+        "pcr_percentile_90d",
+        "vix_level",
+        "vvix_level",
+        "skew_index",
+        "short_interest_pct",
+        "short_interest_change_pct",
+        "held_percent_institutions",
+        "institutional_top10_pct",
+        "news_sentiment_score",
+    ]:
         val = sentiment_indicators.get(key)
         if val is not None:
             evidence.append(make_evidence(metric=key, value=val, source_name=source_name, quality=q, as_of=as_of))
@@ -481,9 +697,9 @@ def sentiment_analyst_run(
     sr = features["sentiment_regime"]
     pos = features["positioning_crowding"]
 
-    if sr in ("panic", "fear") and pos == "short_crowded":
+    if sr in ("panic", "fear") and pos == "short_crowded" and catalyst_level != "high":
         timing = "favorable_for_gradual_entry"
-    elif sr == "euphoria" or (vol_regime == "crisis" and sr != "panic"):
+    elif sr == "euphoria" or (vol_regime in ("crisis", "high") and catalyst_level == "high"):
         timing = "unfavorable_for_new_longs"
     elif vol_regime == "crisis":
         timing = "avoid_trading"
@@ -496,12 +712,16 @@ def sentiment_analyst_run(
         else ("bullish" if timing == "favorable_for_gradual_entry" else "neutral")
     )
 
-    data_ok = bool([e for e in evidence if e.get("source_name") != "sentiment_engine"])
+    data_ok = data_provenance["raw_components"] >= 2
     warnings = list(news_info.get("data_quality", {}).get("warnings", []))
     if no_articles:
         warnings.append("fallback_to_vol_flow_options")
     if vol_info.get("warnings"):
         warnings.extend(vol_info["warnings"])
+    if not data_provenance["sources"].get("short_interest"):
+        warnings.append("short_interest_snapshot_missing")
+    if not data_provenance["sources"].get("confirmed_events"):
+        warnings.append("confirmed_catalysts_missing")
 
     limitations = []
     if source_name == "mock":
@@ -509,6 +729,8 @@ def sentiment_analyst_run(
     limitations.append("Sentiment는 tactical overlay만 — 단독 방향성 결정 불가 (R5)")
     if not articles:
         limitations.append("뉴스 기사 미제공 — news_volume_z 계산 불가")
+    if data_provenance["sources"].get("short_interest"):
+        limitations.append("Short interest는 지연 공시 스냅샷 — 실시간 crowding 대체 불가")
 
     ev_reqs = _generate_evidence_requests(
         ticker,
@@ -521,8 +743,8 @@ def sentiment_analyst_run(
     )
 
     features["_velocity"] = velocity
-    key_drivers = _build_key_drivers(features, news_info, catalyst, vol_info)
-    what_to_watch = _build_what_to_watch(features, catalyst)
+    key_drivers = _build_key_drivers(features, news_info, catalyst, vol_info, sentiment_indicators)
+    what_to_watch = _build_what_to_watch(features, catalyst, sentiment_indicators)
     scenario_notes = _build_scenario_notes(features, tilt, catalyst)
     evidence_digest = _build_evidence_digest(state, ticker)
     if evidence_digest:
@@ -550,8 +772,21 @@ def sentiment_analyst_run(
     followups = _default_followups()
     react_trace = _default_react_trace(bool(evidence_digest))
 
-    missing_fields = [] if data_ok else ["news_articles", "vix_level"]
-    missing_pct = round(len(missing_fields) / 2.0, 3)
+    source_timestamps = {
+        str(k[:-6]): str(v)
+        for k, v in sentiment_indicators.items()
+        if str(k).endswith("_as_of") and v
+    }
+    missing_fields = [
+        field for field, present in {
+            "news_articles": data_provenance["sources"].get("news_articles"),
+            "options_snapshot": data_provenance["sources"].get("options_snapshot"),
+            "vol_snapshot": data_provenance["sources"].get("vol_snapshot"),
+            "confirmed_events": data_provenance["sources"].get("confirmed_events"),
+        }.items()
+        if not present
+    ]
+    missing_pct = round(len(missing_fields) / 4.0, 3)
     data_quality = {
         "missing_pct": missing_pct,
         "freshness_days": 0.0,
@@ -560,8 +795,22 @@ def sentiment_analyst_run(
         "anomaly_flags": warnings,
         "is_mock": source_name == "mock",
         "risk_from_missing_data": no_articles,
-        "source_timestamps": {},
+        "source_timestamps": source_timestamps,
     }
+    confidence = 0.18 if source_name == "mock" else round(
+        max(
+            0.25,
+            min(
+                0.7,
+                0.22
+                + data_provenance["coverage_score"] * 0.35
+                + (0.05 if confirmed_events else 0.0)
+                + (0.04 if vol_info.get("source") != "default_fallback" else -0.04)
+                - (0.05 if catalyst_level == "high" and not confirmed_events else 0.0),
+            ),
+        ),
+        2,
+    )
 
     output = {
         "agent_type": "sentiment",
@@ -573,7 +822,7 @@ def sentiment_analyst_run(
         "focus_areas": focus_areas,
         "primary_decision": primary_decision,
         "recommendation": "allow_with_limits",
-        "confidence": (0.20 if no_articles else (0.45 if data_ok else 0.30)),
+        "confidence": confidence,
         "signal_strength": abs(tilt - 1.0) / 0.3,
         "risk_flags": risk_flags,
         "evidence": evidence,
@@ -592,6 +841,11 @@ def sentiment_analyst_run(
         "news_analysis": news_info,
         "velocity": velocity,
         "catalyst_risk": catalyst,
+        "confirmed_events": confirmed_events,
+        "options_vol_structure": options_vol_structure,
+        "positioning_snapshot": positioning_snapshot,
+        "data_provenance": data_provenance,
+        "monitoring_triggers": monitoring_triggers,
         "key_drivers": key_drivers,
         "what_to_watch": what_to_watch,
         "scenario_notes": scenario_notes,
@@ -605,8 +859,8 @@ def sentiment_analyst_run(
         # Backward compat
         "overall_sentiment": primary_decision,
         "sentiment_score": sentiment_indicators.get("news_sentiment_score", 0),
-        "catalysts": [f"Upcoming: {', '.join(events[:3])}"] if events else ["Contrarian signal" if sr in ("panic", "fear") else ""],
-        "tactical_notes": f"Tilt {tilt:.2f}. Vol {vol_regime}. Catalyst: {catalyst_level}.",
+        "catalysts": [f"{item.get('type')}:{item.get('status')}" for item in confirmed_events[:3]] if confirmed_events else ["Contrarian signal" if sr in ("panic", "fear") else ""],
+        "tactical_notes": f"Tilt {tilt:.2f}. Vol {vol_regime}/{options_vol_structure.get('vix_term_structure')}. Catalyst: {catalyst_level}.",
     }
 
     patch = apply_llm_overlay_sentiment(output, state, focus_areas, evidence_digest)

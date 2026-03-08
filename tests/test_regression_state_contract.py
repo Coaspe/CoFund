@@ -6,6 +6,8 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
+import numpy as np
+
 import investment_team
 from agents import orchestrator_agent as orch
 from agents.fundamental_agent import fundamental_analyst_run
@@ -44,7 +46,7 @@ def test_ac1b_orchestrator_applies_portfolio_context_mandate(monkeypatch):
     monkeypatch.setattr(
         orch,
         "_call_llm",
-        lambda user_request, iteration, risk_feedback=None, portfolio_context=None: orch._mock_orchestrator_decision(
+        lambda user_request, iteration, risk_feedback=None, portfolio_context=None, book_context=None: orch._mock_orchestrator_decision(
             user_request, iteration, risk_feedback
         ),
     )
@@ -82,7 +84,7 @@ def test_ac1c_investment_team_trace_records_portfolio_mandate(monkeypatch):
     monkeypatch.setattr(
         orch,
         "_call_llm",
-        lambda user_request, iteration, risk_feedback=None, portfolio_context=None: orch._mock_orchestrator_decision(
+        lambda user_request, iteration, risk_feedback=None, portfolio_context=None, book_context=None: orch._mock_orchestrator_decision(
             user_request, iteration, risk_feedback
         ),
     )
@@ -102,6 +104,381 @@ def test_ac1c_investment_team_trace_records_portfolio_mandate(monkeypatch):
     assert out.get("universe") == ["SPY", "TLT", "GLD"]
     assert out.get("analysis_execution_mode", "").startswith("B_")
     assert out.get("trace", [{}])[0].get("portfolio_mandate_applied") is True
+
+
+def test_ac1d_initial_state_has_book_memory_fields():
+    state = create_initial_state(user_request="테스트", mode="mock", seed=21)
+    assert state.get("active_ideas") == {}
+    assert state.get("portfolio_memory") == {}
+    assert state.get("monitoring_backlog") == []
+    assert state.get("book_allocation_plan") == {}
+    assert state.get("capital_competition") == []
+    assert state.get("event_calendar") == []
+    assert state.get("monitoring_actions") == {}
+    assert state.get("decision_quality_scorecard") == {}
+
+
+def test_ac1e_orchestrator_book_context_affects_prompt_and_cache_key():
+    book_a = {"current_positions": {"SPY": 0.4}, "open_review_count": 1}
+    book_b = {"current_positions": {"QQQ": 0.4}, "open_review_count": 2}
+    msg = orch._build_orchestrator_human_msg(
+        "미국 시장 점검",
+        0,
+        None,
+        {"benchmark": "SPY"},
+        book_a,
+    )
+    key_a = orch._plan_cache_key("미국 시장 점검", 0, None, {"benchmark": "SPY"}, book_a)
+    key_b = orch._plan_cache_key("미국 시장 점검", 0, None, {"benchmark": "SPY"}, book_b)
+
+    assert "[Book Context]" in msg
+    assert "\"SPY\"" in msg
+    assert key_a != key_b
+
+
+def test_ac1f_orchestrator_builds_active_ideas_memory_and_backlog(monkeypatch):
+    monkeypatch.setattr(
+        orch,
+        "_call_llm",
+        lambda user_request, iteration, risk_feedback=None, portfolio_context=None, book_context=None: orch._mock_orchestrator_decision(
+            user_request, iteration, risk_feedback
+        ),
+    )
+
+    state = create_initial_state(user_request="미국 시장 단기/장기 전망", mode="mock", seed=31)
+    state["positions_final"] = {"SPY": 0.45, "TLT": 0.10}
+    state["positions_proposed"] = {"SPY": 0.45, "TLT": 0.10}
+    state["active_ideas"] = {
+        "SPY": {
+            "status": "active_position",
+            "role": "main",
+            "first_seen_at": "2026-03-01T00:00:00+00:00",
+            "last_action_type": "initial_delegation",
+            "last_intent": "market_outlook",
+            "review_frequency": "weekly",
+            "review_triggers": ["기존 트리거"],
+        }
+    }
+    state["portfolio_memory"] = {
+        "SPY": {
+            "first_seen_at": "2026-03-01T00:00:00+00:00",
+            "times_seen": 2,
+            "role": "main",
+        }
+    }
+    state["monitoring_backlog"] = [
+        {
+            "ticker": "SPY",
+            "trigger": "기존 포지션 재점검",
+            "source": "manual",
+            "status": "open",
+            "created_at": "2026-03-01T00:00:00+00:00",
+        }
+    ]
+    state["portfolio_context"] = {
+        "benchmark": "SPY",
+        "target_gross_exposure": 1.0,
+        "rebalance_frequency": "weekly",
+    }
+
+    out = orch.orchestrator_node(state)
+    ideas = out.get("active_ideas", {})
+    memory = out.get("portfolio_memory", {})
+    backlog = out.get("monitoring_backlog", [])
+    directives = out.get("orchestrator_directives", {})
+
+    assert ideas.get("SPY", {}).get("status") == "active_position"
+    assert ideas.get("TLT", {}).get("status") == "active_position"
+    assert memory.get("SPY", {}).get("times_seen", 0) >= 3
+    assert any(item.get("ticker") == "__PORTFOLIO__" for item in backlog)
+    assert any(item.get("ticker") == "SPY" for item in backlog)
+    assert directives.get("book_context_summary", {}).get("current_positions", {}).get("SPY") == 0.45
+    assert directives.get("active_idea_count") == len(ideas)
+    assert directives.get("open_review_count") == len(backlog)
+
+
+def test_ac1g_orchestrator_builds_book_allocation_plan_for_existing_book(monkeypatch):
+    monkeypatch.setattr(
+        orch,
+        "_call_llm",
+        lambda user_request, iteration, risk_feedback=None, portfolio_context=None, book_context=None: {
+            "current_iteration": iteration,
+            "action_type": "pivot_strategy",
+            "intent": "market_outlook",
+            "investment_brief": {
+                "rationale": "기존 북을 방어형으로 전환",
+                "target_universe": ["TLT", "GLD", "SPY"],
+            },
+            "desk_tasks": orch._default_desk_tasks(30, "Conservative"),
+        },
+    )
+
+    state = create_initial_state(user_request="기존 북을 방어형으로 재배치", mode="mock", seed=41)
+    state["positions_final"] = {"QQQ": 0.55, "SPY": 0.25, "TLT": 0.20}
+    state["portfolio_context"] = {
+        "max_single_name_weight": 0.4,
+    }
+
+    out = orch.orchestrator_node(state)
+    plan = out.get("book_allocation_plan", {})
+    competition = out.get("capital_competition", [])
+    weights = out.get("positions_proposed", {})
+    directives = out.get("orchestrator_directives", {})
+
+    assert plan.get("status") == "ok"
+    assert plan.get("gross_target", 0.0) > 0.0
+    assert competition and competition[0].get("rank") == 1
+    assert set(weights.keys()) >= {"TLT", "GLD", "SPY", "QQQ"}
+    assert abs(sum(weights.values()) - 1.0) < 1e-6
+    assert directives.get("allocator_guidance", {}).get("target_gross_exposure") == plan.get("gross_target")
+    assert any(row.get("ticker") == "QQQ" and row.get("book_action") in {"scale_down", "exit"} for row in competition)
+
+
+def test_ac1h_allocator_uses_desk_conviction_for_replace_scale_ignore(monkeypatch):
+    monkeypatch.setattr(
+        orch,
+        "_call_llm",
+        lambda user_request, iteration, risk_feedback=None, portfolio_context=None, book_context=None: {
+            "current_iteration": iteration,
+            "action_type": "initial_delegation",
+            "intent": "market_outlook",
+            "investment_brief": {
+                "rationale": "SPY 중심으로 북 재구성",
+                "target_universe": ["SPY", "TLT"],
+            },
+            "desk_tasks": orch._default_desk_tasks(30, "Moderate"),
+        },
+    )
+
+    state = create_initial_state(user_request="SPY 중심으로 북 재구성", mode="mock", seed=43)
+    state["target_ticker"] = "SPY"
+    state["positions_final"] = {"SPY": 0.20, "QQQ": 0.45, "TLT": 0.15}
+    state["macro_analysis"] = {"primary_decision": "bullish", "confidence": 0.7, "signal_strength": 0.7}
+    state["fundamental_analysis"] = {
+        "primary_decision": "bullish",
+        "confidence": 0.65,
+        "signal_strength": 0.6,
+        "valuation_anchor": {"price_target_upside_pct": 18.0},
+        "model_pack": {
+            "scenario_targets": {
+                "base": {"upside_pct": 22.0},
+                "bear": {"downside_pct": -12.0},
+            }
+        },
+        "catalyst_calendar": [
+            {
+                "type": "earnings",
+                "date": "2026-03-12",
+                "days_to_event": 4,
+                "status": "upcoming",
+                "source_classification": "confirmed",
+            }
+        ],
+    }
+    state["sentiment_analysis"] = {"primary_decision": "neutral", "confidence": 0.45, "signal_strength": 0.1}
+    state["technical_analysis"] = {"primary_decision": "bullish", "confidence": 0.6, "signal_strength": 0.7}
+    state["portfolio_memory"] = {
+        "QQQ": {
+            "conviction": {
+                "source": "memory",
+                "composite_score": -0.55,
+                "macro": {"score": -0.20},
+                "fundamental": {"score": -0.15},
+                "sentiment": {"score": -0.05},
+                "quant": {"score": -0.15},
+            },
+            "allocator_signals": {
+                "source": "memory",
+                "status": "ok",
+                "expected_return_pct": -6.0,
+                "downside_pct": 18.0,
+                "catalyst_proximity_score": 0.8,
+                "catalyst_days": 6,
+                "catalyst_type": "earnings",
+            },
+        }
+    }
+
+    out = orch.orchestrator_node(state)
+    plan = out.get("book_allocation_plan", {})
+    competition = out.get("capital_competition", [])
+    rows = {row.get("ticker"): row for row in competition}
+
+    assert plan.get("conviction_by_ticker", {}).get("SPY", {}).get("source") == "current_run"
+    assert plan.get("allocation_signals_by_ticker", {}).get("SPY", {}).get("source") == "fundamental_current_run_blended"
+    assert rows["SPY"]["conviction_score"] > 0
+    assert rows["SPY"]["expected_return_score"] > 0
+    assert rows["SPY"]["allocation_signal_components"]["downside_pct"] == 12.0
+    assert rows["SPY"]["allocation_signal_components"]["catalyst_type"] == "earnings"
+    assert rows["SPY"]["book_action"] in {"hold", "scale_up"}
+    assert rows["QQQ"]["conviction_score"] < 0
+    assert rows["QQQ"]["expected_return_score"] < 0
+    assert rows["QQQ"]["downside_penalty"] > 0
+    assert rows["QQQ"]["allocation_signal_components"]["catalyst_proximity_score"] == 0.8
+    assert rows["QQQ"]["book_action"] in {"scale_down", "replace", "exit"}
+    assert rows["SPY"]["score"] > rows["QQQ"]["score"]
+
+
+def test_ac1h_allocator_applies_quality_haircut_to_gross_and_caps(monkeypatch):
+    monkeypatch.setattr(
+        orch,
+        "_call_llm",
+        lambda user_request, iteration, risk_feedback=None, portfolio_context=None, book_context=None: {
+            "current_iteration": iteration,
+            "action_type": "initial_delegation",
+            "intent": "market_outlook",
+            "investment_brief": {
+                "rationale": "기존 북 유지 여부 점검",
+                "target_universe": ["SPY", "TLT"],
+            },
+            "desk_tasks": orch._default_desk_tasks(30, "Moderate"),
+        },
+    )
+
+    state = create_initial_state(user_request="북 점검", mode="mock", seed=44)
+    state["target_ticker"] = "SPY"
+    state["positions_final"] = {"SPY": 0.40, "TLT": 0.20}
+    state["macro_analysis"] = {"primary_decision": "bullish", "confidence": 0.8, "signal_strength": 0.8}
+    state["fundamental_analysis"] = {"primary_decision": "bullish", "confidence": 0.75, "signal_strength": 0.7}
+    state["sentiment_analysis"] = {"primary_decision": "neutral", "confidence": 0.4, "signal_strength": 0.2}
+    state["technical_analysis"] = {"primary_decision": "bullish", "confidence": 0.65, "signal_strength": 0.65}
+    state["decision_quality_scorecard"] = {
+        "overall_score": 0.34,
+        "weak_desks": ["macro", "fundamental", "sentiment"],
+        "desks": {
+            "macro": {"quality_score": 0.20},
+            "fundamental": {"quality_score": 0.25},
+            "sentiment": {"quality_score": 0.40},
+            "quant": {"quality_score": 0.55},
+        },
+    }
+
+    out = orch.orchestrator_node(state)
+    plan = out.get("book_allocation_plan", {})
+    rows = {row.get("ticker"): row for row in out.get("capital_competition", [])}
+    guidance = (out.get("orchestrator_directives", {}) or {}).get("allocator_guidance", {})
+
+    assert plan.get("quality_haircut", 1.0) < 1.0
+    assert plan.get("gross_target", 1.0) < 0.60
+    assert plan.get("single_name_cap", 1.0) <= plan.get("gross_target", 0.0)
+    assert plan.get("quality_adjustments")
+    assert guidance.get("quality_haircut") == plan.get("quality_haircut")
+    assert rows["SPY"]["conviction_score"] < 0.50
+
+
+def test_ac1i_monitoring_router_builds_event_calendar_and_escalation():
+    state = create_initial_state(user_request="실적과 변동성 촉매 점검", mode="mock", seed=45)
+    state["as_of"] = "2026-03-08T00:00:00+00:00"
+    state["target_ticker"] = "SPY"
+    state["universe"] = ["SPY", "TLT", "GLD"]
+    state["macro_analysis"] = {
+        "confidence": 0.65,
+        "data_ok": True,
+        "evidence": [{}],
+        "macro_event_calendar": [
+            {
+                "type": "fomc",
+                "title": "FOMC Meeting (March 12, 2026)",
+                "date": "2026-03-12T18:00:00+00:00",
+                "status": "upcoming",
+                "source": "federalreserve.gov",
+                "source_classification": "confirmed",
+                "event_origin": "official_macro_calendar",
+            }
+        ],
+        "monitoring_triggers": [
+            {
+                "name": "Volatility regime shift",
+                "metric": "vix_level",
+                "current_value": 29.4,
+                "trigger": "> 20 / > 30",
+                "action": "beta 조정",
+                "priority": 1,
+            }
+        ],
+    }
+    state["fundamental_analysis"] = {
+        "ticker": "SPY",
+        "confidence": 0.62,
+        "data_ok": True,
+        "evidence": [{}],
+        "catalyst_calendar": [
+            {
+                "type": "earnings",
+                "date": "2026-03-12",
+                "days_to_event": 4,
+                "importance": "high",
+                "status": "upcoming",
+                "source_classification": "confirmed",
+                "source_title": "Structured earnings calendar",
+            }
+        ],
+    }
+    state["sentiment_analysis"] = {"confidence": 0.45, "data_ok": True, "evidence": [{}]}
+    state["technical_analysis"] = {"confidence": 0.58, "data_ok": True, "evidence": [{}]}
+
+    out = investment_team.monitoring_router_node(state)
+    event_calendar = out.get("event_calendar", [])
+    actions = out.get("monitoring_actions", {})
+    scorecard = out.get("decision_quality_scorecard", {})
+
+    assert any(item.get("desk") == "macro" and item.get("status") == "triggered" for item in event_calendar)
+    assert any(item.get("desk") == "macro" and item.get("type") == "fomc" and item.get("status") == "imminent" for item in event_calendar)
+    assert any(item.get("desk") == "fundamental" and item.get("status") == "imminent" for item in event_calendar)
+    assert actions.get("force_research") is True
+    assert set(actions.get("selected_desks", [])) >= {"macro", "fundamental", "sentiment"}
+    assert actions.get("risk_refresh_required") is True
+    assert actions.get("monitoring_requests")
+    assert scorecard.get("overall_score", 0) > 0
+
+
+def test_ac1j_research_router_respects_monitoring_escalation():
+    state = create_initial_state(user_request="실적 점검", mode="mock", seed=47)
+    state["target_ticker"] = "AAPL"
+    state["macro_analysis"] = {"evidence": [{}], "confidence": 0.5, "data_ok": True}
+    state["fundamental_analysis"] = {"evidence": [{}], "confidence": 0.6, "data_ok": True}
+    state["sentiment_analysis"] = {"evidence": [{}], "confidence": 0.4, "data_ok": True}
+    state["technical_analysis"] = {"evidence": [{}], "confidence": 0.5, "data_ok": True}
+    state["monitoring_actions"] = {
+        "force_research": True,
+        "reason": "new_triggered_events",
+        "selected_desks": ["fundamental", "sentiment"],
+        "monitoring_requests": [
+            {
+                "desk": "fundamental",
+                "kind": "press_release_or_ir",
+                "ticker": "AAPL",
+                "query": "AAPL earnings latest official update",
+                "priority": 1,
+                "recency_days": 14,
+                "max_items": 3,
+                "rationale": "monitoring_event:earnings",
+                "source_tag": "monitoring",
+                "impacted_desks": ["fundamental", "sentiment"],
+            }
+        ],
+    }
+
+    out = investment_team.research_router_node(state)
+
+    assert out.get("_run_research") is True
+    assert out.get("_monitoring_forced_desks") == ["fundamental", "sentiment"]
+    assert any(req.get("source_tag") == "monitoring" for req in out.get("_research_plan", []))
+    assert out.get("trace", [{}])[0].get("monitoring_force_research") is True
+
+
+def test_ac1k_research_executor_forces_monitoring_rerun_without_queries():
+    state = create_initial_state(user_request="desk rerun", mode="mock", seed=49)
+    state["_research_plan"] = []
+    state["_monitoring_forced_desks"] = ["macro"]
+    state["completed_tasks"] = {"macro": True, "fundamental": True, "sentiment": True, "quant": True}
+    state["evidence_store"] = {}
+
+    out = investment_team.research_executor_node(state)
+
+    assert out.get("completed_tasks", {}).get("macro") is False
+    assert "macro" in (out.get("_rerun_plan", {}) or {}).get("selected_desks", [])
+    assert "macro" in (out.get("trace", [{}])[0] or {}).get("forced_rerun_desks", [])
 
 
 def test_ac2_etf_fundamental_no_insider_form4_requests():
@@ -204,6 +581,52 @@ def test_ac5_korean_request_produces_korean_report():
     assert re.search(r"[가-힣]", report)
 
 
+def test_ac5b_report_includes_book_quality_and_monitoring_sections():
+    state = create_initial_state(user_request="SPY와 GLD 포지션 검토", mode="mock", seed=63)
+    state["target_ticker"] = "SPY"
+    state["universe"] = ["SPY", "GLD"]
+    state["positions_proposed"] = {"SPY": 0.7, "GLD": 0.3}
+    state["positions_final"] = {"SPY": 0.65, "GLD": 0.35}
+    state["book_allocation_plan"] = {"gross_target": 0.9, "single_name_cap": 0.65, "quality_haircut": 0.85}
+    state["capital_competition"] = [
+        {
+            "ticker": "SPY",
+            "book_action": "hold",
+            "conviction_score": 0.62,
+            "expected_return_score": 0.55,
+            "downside_penalty": 0.18,
+            "catalyst_proximity_score": 0.10,
+            "target_weight": 0.65,
+        }
+    ]
+    state["decision_quality_scorecard"] = {"overall_score": 0.58, "weak_desks": ["sentiment"]}
+    state["event_calendar"] = [
+        {
+            "desk": "macro",
+            "type": "fomc",
+            "status": "imminent",
+            "date": "2026-03-18T18:00:00+00:00",
+            "source": "federalreserve.gov",
+        }
+    ]
+    state["monitoring_actions"] = {
+        "force_research": True,
+        "selected_desks": ["macro", "quant"],
+        "risk_refresh_required": True,
+    }
+    state["macro_analysis"] = {"confidence": 0.6, "data_provenance": {"quality": "high", "raw_components": 5, "coverage_score": 0.83}}
+    state["fundamental_analysis"] = {"confidence": 0.62, "recommendation": "allow", "data_provenance": {"quality": "high", "raw_backed_layers": 6, "coverage_score": 1.0}}
+    state["sentiment_analysis"] = {"confidence": 0.45, "recommendation": "allow_with_limits", "data_provenance": {"quality": "medium", "raw_components": 4, "coverage_score": 0.67}}
+    state["technical_analysis"] = {"confidence": 0.63, "decision": "HOLD", "data_provenance": {"quality": "high", "raw_components": 5, "coverage_score": 0.83}}
+    state["risk_assessment"] = {"risk_decision": {"per_ticker_decisions": {"SPY": {"flags": [], "decision": "approve", "final_weight": 0.65}}}}
+
+    report = report_writer_node(state)["final_report"]
+    assert "Portfolio Weights" in report
+    assert "Book Allocation" in report
+    assert "Evidence & Decision Quality" in report
+    assert "Event Calendar & Monitoring" in report
+
+
 def test_ac6_market_outlook_quant_uses_event_regime_indicators():
     state = create_initial_state(user_request="시장 전망 점검", mode="mock", seed=42)
     state["target_ticker"] = "SPY"
@@ -215,6 +638,57 @@ def test_ac6_market_outlook_quant_uses_event_regime_indicators():
     assert out.get("analysis_mode") == "event_regime"
     assert any(k in out.get("quant_indicators", []) for k in ("event_return_5d", "trend_20d", "vol_shift_20d_vs_60d"))
     assert "Event/Regime" in str((out.get("llm_decision") or {}).get("cot_reasoning", ""))
+    assert "signal_stack" in out and "total_score" in out["signal_stack"]
+    assert "execution_plan" in out and out["execution_plan"]["action"] == out["decision"]
+    assert "monitoring_triggers" in out and isinstance(out["monitoring_triggers"], list)
+    assert "data_provenance" in out and out["data_provenance"]["quality"] in {"medium", "high"}
+
+
+def test_ac6b_quant_event_and_drawdown_risk_force_hold(monkeypatch):
+    state = create_initial_state(user_request="시장 변동성 이벤트 점검", mode="mock", seed=52)
+    state["as_of"] = "2026-03-08T00:00:00+00:00"
+    state["target_ticker"] = "SPY"
+    state["intent"] = "market_outlook"
+    state["asset_type_by_ticker"] = {"SPY": "ETF"}
+    state["event_calendar"] = [
+        {
+            "desk": "macro",
+            "ticker": "__GLOBAL__",
+            "type": "fomc",
+            "subtype": "FOMC",
+            "status": "imminent",
+            "days_to_event": 2,
+            "source_classification": "confirmed",
+        }
+    ]
+
+    up_leg = np.linspace(100.0, 128.0, 220)
+    down_leg = np.linspace(128.0, 84.0, 80)
+    stress_prices = np.concatenate([up_leg, down_leg])
+    pair_prices = np.linspace(100.0, 104.0, len(stress_prices))
+    market_prices = np.concatenate([np.linspace(100.0, 122.0, 230), np.linspace(122.0, 90.0, 70)])
+
+    class DummyHub:
+        def __init__(self, *args, **kwargs):
+            pass
+
+        def get_price_series(self, ticker, seed=None, lookback_days=None):
+            if ticker == "SPY":
+                return stress_prices, [], {"data_ok": True, "limitations": []}
+            return pair_prices, [], {"data_ok": True, "limitations": []}
+
+        def get_market_series(self, ticker, seed=None, lookback_days=None):
+            return market_prices, [], {"data_ok": True, "limitations": []}
+
+    monkeypatch.setattr(investment_team, "DataHub", DummyHub)
+    out = investment_team.quant_analyst_node(state)["technical_analysis"]
+    trigger_names = {item["name"] for item in out["monitoring_triggers"]}
+
+    assert out["event_regime_signals"]["imminent_event_count"] == 1
+    assert out["decision"] == "HOLD"
+    assert out["final_allocation_pct"] == 0.0
+    assert "Event proximity" in trigger_names
+    assert "Drawdown breach" in trigger_names
 
 
 def test_rerun_decision_change_log_records_unchanged_with_evidence_refs():
@@ -280,3 +754,77 @@ def test_ac_b2_positions_proposed_include_main_plus_hedge_and_sum_to_one():
     if not hedge_positive:
         assert hedge_lite.get("status") == "insufficient_data"
         assert hedge_lite.get("reason")
+
+
+def test_ac1l_sentiment_node_merges_market_snapshot_and_confirmed_events(monkeypatch):
+    state = create_initial_state(user_request="SPY sentiment check", mode="mock", seed=81)
+    state["as_of"] = "2026-03-08T00:00:00+00:00"
+    state["target_ticker"] = "SPY"
+    state["macro_analysis"] = {
+        "macro_event_calendar": [
+            {
+                "type": "macro_event",
+                "title": "FOMC",
+                "date": "2026-03-10T18:00:00+00:00",
+                "days_to_event": 2,
+                "status": "imminent",
+                "source": "federalreserve.gov",
+                "source_classification": "confirmed",
+            }
+        ]
+    }
+
+    class DummyHub:
+        def __init__(self, *args, **kwargs):
+            pass
+
+        def get_news_sentiment(self, ticker, seed=None):
+            return (
+                {
+                    "news_sentiment_score": -0.10,
+                    "news_articles": [
+                        {
+                            "title": "SPY hedging demand rises before Fed",
+                            "source": "Reuters",
+                            "published_at": "2026-03-08T00:00:00+00:00",
+                        }
+                    ],
+                },
+                [],
+                {"data_ok": True, "limitations": []},
+            )
+
+        def get_sentiment_market_snapshot(self, ticker):
+            return (
+                {
+                    "vix_level": 27.0,
+                    "vvix_level": 103.0,
+                    "vix_term_structure": "backwardation",
+                    "put_call_oi_ratio": 1.18,
+                },
+                [],
+                {"data_ok": True, "limitations": []},
+            )
+
+        def get_structured_ownership(self, ticker):
+            return (
+                {
+                    "institutions_percent_held": 81.0,
+                    "institutional_top10_pct": 39.0,
+                    "crowding_risk": "elevated",
+                    "insider_net_activity": "neutral",
+                },
+                [],
+                {"data_ok": True, "limitations": []},
+            )
+
+    monkeypatch.setattr(investment_team, "DataHub", DummyHub)
+
+    out = investment_team.sentiment_analyst_node(state)
+    senti = out["sentiment_analysis"]
+
+    assert senti["options_vol_structure"]["vix_term_structure"] == "backwardation"
+    assert senti["confirmed_events"]
+    assert senti["confirmed_events"][0]["type"] == "macro_event"
+    assert senti["data_provenance"]["sources"]["options_snapshot"] is True
+    assert senti["provider_meta"]["sentiment_market"]["data_ok"] is True

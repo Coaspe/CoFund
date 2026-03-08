@@ -728,6 +728,9 @@ def orchestrator_node(state: InvestmentState) -> dict:
         "execution_mode": execution_mode,
         "universe_size": len(universe),
         "portfolio_mandate_applied": bool(((directives.get("portfolio_mandate") or {}) if isinstance(directives, dict) else {}).get("applied")),
+        "active_idea_count": len(result.get("active_ideas", {}) or {}),
+        "open_review_count": len(result.get("monitoring_backlog", []) or []),
+        "capital_competition_count": len(result.get("capital_competition", []) or []),
     }
     result["trace"] = [trace_entry]
 
@@ -740,6 +743,8 @@ def orchestrator_node(state: InvestmentState) -> dict:
             f"action={trace_entry.get('action_type')} targets={_list_preview(brief.get('target_universe', []), max_items=7, max_len=160) or 'n/a'}",
             f"intent={intent} mode={execution_mode} language={output_language}",
             f"mandate_applied={trace_entry.get('portfolio_mandate_applied')}",
+            f"active_ideas={trace_entry.get('active_idea_count')} open_reviews={trace_entry.get('open_review_count')}",
+            f"capital_candidates={trace_entry.get('capital_competition_count')}",
             f"tasks={','.join(result.get('analysis_tasks', []))}",
             f"rationale={_short_text(brief.get('rationale', ''), max_len=180) or 'n/a'}",
         ],
@@ -860,12 +865,14 @@ def macro_analyst_node(state: InvestmentState) -> dict:
 
     hub = DataHub(run_id=state.get("run_id", ""), as_of=as_of, mode=mode)
     indicators, _, meta = hub.get_macro_indicators(ticker, seed=seed)
+    macro_events, macro_event_evidence, event_meta = hub.get_macro_event_calendar()
     output = macro_analyst_run(
         ticker, indicators,
         run_id=state.get("run_id", ""), as_of=as_of,
         horizon_days=horizon_days,
         focus_areas=focus_areas,
         state=state,
+        macro_events=macro_events,
         source_name="mock" if mode == "mock" else "FRED",
     )
     rerun_reason = _rerun_reason_for_desk(state, "macro")
@@ -873,7 +880,9 @@ def macro_analyst_node(state: InvestmentState) -> dict:
     output["limitations"] = _merge_limitations(
         output.get("limitations", []),
         meta.get("limitations", []) if isinstance(meta, dict) else [],
+        event_meta.get("limitations", []) if isinstance(event_meta, dict) else [],
     )
+    output["evidence"] = list(output.get("evidence", [])) + list(macro_event_evidence or [])
     output = _attach_decision_change_log(
         desk="macro",
         output=output,
@@ -884,6 +893,8 @@ def macro_analyst_node(state: InvestmentState) -> dict:
     )
     if isinstance(meta, dict):
         output.setdefault("provider_meta", {})["macro"] = meta
+    if isinstance(event_meta, dict):
+        output.setdefault("provider_meta", {})["macro_event_calendar"] = event_meta
 
     print(f"\n② MACRO ANALYST  (iter #{state.get('iteration_count', 1)})")
     print(f"   Regime: {output['macro_regime']}, GDP: {indicators.get('gdp_growth')}")
@@ -928,12 +939,42 @@ def fundamental_analyst_node(state: InvestmentState) -> dict:
     hub = DataHub(run_id=state.get("run_id", ""), as_of=as_of, mode=mode)
     financials, _, fmeta = hub.get_fundamentals(ticker, seed=seed)
     sec_data, _, smeta = hub.get_sec_flags(ticker)
+    peer_context, _, pmeta = hub.get_peer_context(ticker)
+    ownership_items, _, ometa = hub.get_ownership_identity(ticker)
+    catalyst_items, _, ckmeta = hub.get_8k_exhibits(ticker)
+    ir_events, _, irmeta = hub.get_ir_press_release_events(ticker)
+    estimate_revision, _, ermeta = hub.get_estimate_revision(ticker)
+    ownership_snapshot, _, ysmeta = hub.get_structured_ownership(ticker)
+    history_snapshot, _, yhmeta = hub.get_fundamental_history(ticker)
+    if isinstance(estimate_revision, dict):
+        financials = {**financials, **estimate_revision}
+        yahoo_targets = estimate_revision.get("analyst_price_targets_yahoo") or {}
+        if financials.get("price_target_consensus") is None and yahoo_targets.get("mean") is not None:
+            financials["price_target_consensus"] = yahoo_targets.get("mean")
+            financials["price_target_median"] = yahoo_targets.get("median")
+            financials["price_target_high"] = yahoo_targets.get("high")
+            financials["price_target_low"] = yahoo_targets.get("low")
+            current_price = financials.get("current_price")
+            target = financials.get("price_target_consensus")
+            if current_price not in (None, 0) and target is not None:
+                financials["price_target_upside_pct"] = round((target / current_price - 1) * 100, 2)
+        if financials.get("next_earnings_date") is None and estimate_revision.get("next_earnings_date_yahoo"):
+            financials["next_earnings_date"] = estimate_revision.get("next_earnings_date_yahoo")
+    if isinstance(ownership_snapshot, dict):
+        financials = {**financials, **ownership_snapshot}
+    if isinstance(history_snapshot, dict):
+        financials = {**financials, **history_snapshot}
     output = fundamental_analyst_run(
         ticker, financials, sec_data=sec_data,
         run_id=state.get("run_id", ""), as_of=as_of,
         horizon_days=horizon_days,
         focus_areas=focus_areas,
         state=state,
+        history=(history_snapshot or {}).get("valuation_history_real"),
+        peers=(peer_context or {}).get("peers"),
+        ownership_items=ownership_items,
+        ownership_snapshot=ownership_snapshot,
+        catalyst_items=list(catalyst_items or []) + list(ir_events or []),
         asset_type=asset_type,
         source_name="mock" if mode == "mock" else "FMP/SEC",
     )
@@ -949,6 +990,13 @@ def fundamental_analyst_node(state: InvestmentState) -> dict:
         output.get("limitations", []),
         fmeta.get("limitations", []) if isinstance(fmeta, dict) else [],
         smeta.get("limitations", []) if isinstance(smeta, dict) else [],
+        pmeta.get("limitations", []) if isinstance(pmeta, dict) else [],
+        ometa.get("limitations", []) if isinstance(ometa, dict) else [],
+        ckmeta.get("limitations", []) if isinstance(ckmeta, dict) else [],
+        irmeta.get("limitations", []) if isinstance(irmeta, dict) else [],
+        ermeta.get("limitations", []) if isinstance(ermeta, dict) else [],
+        ysmeta.get("limitations", []) if isinstance(ysmeta, dict) else [],
+        yhmeta.get("limitations", []) if isinstance(yhmeta, dict) else [],
     )
     output = _attach_decision_change_log(
         desk="fundamental",
@@ -960,6 +1008,13 @@ def fundamental_analyst_node(state: InvestmentState) -> dict:
     )
     output.setdefault("provider_meta", {})["fundamentals"] = fmeta
     output.setdefault("provider_meta", {})["sec"] = smeta
+    output.setdefault("provider_meta", {})["peers"] = pmeta
+    output.setdefault("provider_meta", {})["ownership"] = ometa
+    output.setdefault("provider_meta", {})["sec_8k"] = ckmeta
+    output.setdefault("provider_meta", {})["ir_press_release"] = irmeta
+    output.setdefault("provider_meta", {})["estimate_revision"] = ermeta
+    output.setdefault("provider_meta", {})["structured_ownership"] = ysmeta
+    output.setdefault("provider_meta", {})["fundamental_history"] = yhmeta
 
     print(f"\n③ FUNDAMENTAL ANALYST  (iter #{state.get('iteration_count', 1)})")
     print(f"   Structural Risk: {output['structural_risk_flag']}, Decision: {output['primary_decision']}")
@@ -988,6 +1043,50 @@ def fundamental_analyst_node(state: InvestmentState) -> dict:
     }
 
 
+def _collect_sentiment_upcoming_events(state: InvestmentState, ticker: str, as_of: str) -> list[dict]:
+    ticker = str(ticker).strip().upper()
+    if isinstance(state.get("event_calendar"), list) and state.get("event_calendar"):
+        raw_events = state.get("event_calendar", []) or []
+    else:
+        raw_events = []
+        macro = state.get("macro_analysis", {}) if isinstance(state.get("macro_analysis"), dict) else {}
+        raw_events.extend(macro.get("macro_event_calendar", []) or [])
+        fundamental = state.get("fundamental_analysis", {}) if isinstance(state.get("fundamental_analysis"), dict) else {}
+        raw_events.extend(fundamental.get("catalyst_calendar", []) or [])
+
+    out: list[dict] = []
+    for raw in raw_events:
+        if not isinstance(raw, dict):
+            continue
+        raw_ticker = str(raw.get("ticker", "")).strip().upper()
+        if raw_ticker and raw_ticker not in {ticker, "__GLOBAL__"}:
+            continue
+        days = raw.get("days_to_event")
+        if not isinstance(days, int):
+            days = _event_days_to(as_of, raw.get("date"))
+        status = str(raw.get("status", "")).strip().lower() or "upcoming"
+        if days is not None and 0 <= days <= 7:
+            status = "imminent"
+        elif days is not None and days < 0:
+            status = "stale"
+        out.append(
+            {
+                "type": str(raw.get("type", "")).strip().lower() or "event",
+                "subtype": str(raw.get("subtype", "")).strip() or str(raw.get("title", "")).strip(),
+                "title": str(raw.get("title", "")).strip() or str(raw.get("subtype", "")).strip(),
+                "date": str(raw.get("date", "")).strip(),
+                "days_to_event": days,
+                "status": status,
+                "confirmed": bool(raw.get("confirmed")) or str(raw.get("source_classification", "")).strip().lower() == "confirmed",
+                "source_classification": str(raw.get("source_classification", "")).strip().lower() or ("confirmed" if raw.get("confirmed") else "inferred"),
+                "source": str(raw.get("source", "")).strip() or str(raw.get("resolver_path", "")).strip() or "event_calendar",
+                "notes": str(raw.get("notes", "")).strip() or str(raw.get("expected_scenario", "")).strip(),
+            }
+        )
+    out.sort(key=lambda item: (item.get("days_to_event") is None, item.get("days_to_event") if item.get("days_to_event") is not None else 9999))
+    return out[:8]
+
+
 def sentiment_analyst_node(state: InvestmentState) -> dict:
     """④ Sentiment Analyst."""
     if state.get("completed_tasks", {}).get("sentiment", False):
@@ -1001,21 +1100,40 @@ def sentiment_analyst_node(state: InvestmentState) -> dict:
     horizon_days, focus_areas, _ = _get_desk_task(state, "sentiment", 7)
 
     hub = DataHub(run_id=state.get("run_id", ""), as_of=as_of, mode=mode)
-    indicators, _, meta = hub.get_news_sentiment(ticker, seed=seed)
+    indicators, news_evidence, meta = hub.get_news_sentiment(ticker, seed=seed)
+    market_snapshot, market_evidence, market_meta = hub.get_sentiment_market_snapshot(ticker)
+    ownership_snapshot, ownership_evidence, ownership_meta = hub.get_structured_ownership(ticker)
+    merged_indicators = dict(indicators or {})
+    merged_indicators.update({k: v for k, v in (market_snapshot or {}).items() if v is not None})
+    if isinstance(ownership_snapshot, dict):
+        for src_key, dst_key in (
+            ("institutions_percent_held", "institutions_percent_held"),
+            ("institutional_top10_pct", "institutional_top10_pct"),
+            ("crowding_risk", "ownership_crowding_risk"),
+            ("insider_net_activity", "insider_net_activity"),
+            ("incremental_buyer_seller_map", "incremental_buyer_seller_map"),
+        ):
+            value = ownership_snapshot.get(src_key)
+            if value not in (None, "", [], {}):
+                merged_indicators[dst_key] = value
+    merged_indicators["upcoming_events"] = _collect_sentiment_upcoming_events(state, ticker, as_of)
     output = sentiment_analyst_run(
-        ticker, indicators,
+        ticker, merged_indicators,
         run_id=state.get("run_id", ""), as_of=as_of,
         horizon_days=horizon_days,
         focus_areas=focus_areas,
         state=state,
-        source_name="mock" if mode == "mock" else "NewsAPI",
+        source_name="mock" if mode == "mock" else "multi_source",
     )
     rerun_reason = _rerun_reason_for_desk(state, "sentiment")
     prev_sentiment = state.get("sentiment_analysis", {}) if isinstance(state.get("sentiment_analysis"), dict) else {}
     output["limitations"] = _merge_limitations(
         output.get("limitations", []),
         meta.get("limitations", []) if isinstance(meta, dict) else [],
+        market_meta.get("limitations", []) if isinstance(market_meta, dict) else [],
+        ownership_meta.get("limitations", []) if isinstance(ownership_meta, dict) else [],
     )
+    output["evidence"] = list(output.get("evidence", [])) + list(news_evidence or []) + list(market_evidence or []) + list(ownership_evidence or [])
     output = _attach_decision_change_log(
         desk="sentiment",
         output=output,
@@ -1025,7 +1143,24 @@ def sentiment_analyst_node(state: InvestmentState) -> dict:
         ticker=ticker,
     )
     if isinstance(meta, dict):
-        output.setdefault("provider_meta", {})["sentiment"] = meta
+        output.setdefault("provider_meta", {})["sentiment_news"] = meta
+    if isinstance(market_meta, dict):
+        output.setdefault("provider_meta", {})["sentiment_market"] = market_meta
+    if isinstance(ownership_meta, dict):
+        output.setdefault("provider_meta", {})["sentiment_ownership"] = ownership_meta
+    output.setdefault("provider_meta", {})["sentiment"] = {
+        "data_ok": bool(
+            (meta or {}).get("data_ok")
+            or (market_meta or {}).get("data_ok")
+            or (ownership_meta or {}).get("data_ok")
+        ),
+        "limitations": _merge_limitations(
+            [],
+            meta.get("limitations", []) if isinstance(meta, dict) else [],
+            market_meta.get("limitations", []) if isinstance(market_meta, dict) else [],
+            ownership_meta.get("limitations", []) if isinstance(ownership_meta, dict) else [],
+        ),
+    }
 
     print(f"\n④ SENTIMENT ANALYST  (iter #{state.get('iteration_count', 1)})")
     print(f"   Regime: {output['sentiment_regime']}, Tilt: {output['tilt_factor']}")
@@ -1172,6 +1307,332 @@ def _safe_tail_proxy(prices: Any, window: int = 60) -> float | None:
         return float(np.percentile(tail, 5))
     except Exception:
         return None
+
+
+def _safe_max_drawdown(prices: Any, window: int = 60) -> float | None:
+    if not hasattr(prices, "__len__") or len(prices) < window + 2:
+        return None
+    try:
+        p = np.asarray(prices, dtype=float)[-window:]
+        running_max = np.maximum.accumulate(p)
+        drawdowns = (p / np.where(running_max == 0, np.nan, running_max)) - 1.0
+        worst = np.nanmin(drawdowns)
+        if np.isnan(worst):
+            return None
+        return abs(float(worst))
+    except Exception:
+        return None
+
+
+def _safe_downside_beta(prices: Any, market_prices: Any, window: int = 60) -> float | None:
+    if not hasattr(prices, "__len__") or not hasattr(market_prices, "__len__"):
+        return None
+    n = min(len(prices), len(market_prices))
+    if n < window + 2:
+        return None
+    try:
+        p = np.asarray(prices, dtype=float)[-n:]
+        m = np.asarray(market_prices, dtype=float)[-n:]
+        rp = np.diff(np.log(p))[-window:]
+        rm = np.diff(np.log(m))[-window:]
+        if len(rp) == 0 or len(rm) == 0:
+            return None
+        mask = rm < 0
+        if int(np.sum(mask)) < 5:
+            return None
+        rm_down = rm[mask]
+        rp_down = rp[mask]
+        var_down = float(np.var(rm_down, ddof=0))
+        if var_down < 1e-12:
+            return None
+        cov = float(np.cov(rp_down, rm_down, ddof=0)[0, 1])
+        return cov / var_down
+    except Exception:
+        return None
+
+
+def _safe_realized_skew(prices: Any, window: int = 60) -> float | None:
+    if not hasattr(prices, "__len__") or len(prices) < window + 2:
+        return None
+    try:
+        p = np.asarray(prices, dtype=float)
+        rets = np.diff(np.log(p))[-window:]
+        if len(rets) < 10:
+            return None
+        mean = float(np.mean(rets))
+        std = float(np.std(rets, ddof=0))
+        if std < 1e-12:
+            return None
+        centered = rets - mean
+        skew = float(np.mean(centered ** 3) / (std ** 3))
+        if np.isnan(skew):
+            return None
+        return skew
+    except Exception:
+        return None
+
+
+def _safe_vol_forecast_gap(payload: dict, realized_vol: float | None) -> float | None:
+    try:
+        forecast = (
+            (payload.get("market_regime_context", {}) or {})
+            .get("volatility_forecast", {})
+            .get("t_plus_1_volatility")
+        )
+        if forecast is None or realized_vol is None:
+            return None
+        return float(forecast) - float(realized_vol)
+    except (TypeError, ValueError):
+        return None
+
+
+def _extract_quant_event_context(state: InvestmentState, ticker: str) -> dict:
+    ticker = str(ticker or "").strip().upper()
+    raw_calendar = list(state.get("event_calendar", []) or [])
+    if not raw_calendar:
+        macro = state.get("macro_analysis", {}) if isinstance(state.get("macro_analysis"), dict) else {}
+        for raw in macro.get("macro_event_calendar", []) or []:
+            if not isinstance(raw, dict):
+                continue
+            raw_calendar.append(
+                {
+                    "ticker": "__GLOBAL__",
+                    "type": raw.get("type", "macro_event"),
+                    "subtype": raw.get("title", raw.get("subtype", "")),
+                    "status": raw.get("status", "upcoming"),
+                    "days_to_event": raw.get("days_to_event"),
+                    "source_classification": raw.get("source_classification", "confirmed"),
+                    "confirmed": str(raw.get("source_classification", "")).strip().lower() == "confirmed",
+                }
+            )
+        fundamental = state.get("fundamental_analysis", {}) if isinstance(state.get("fundamental_analysis"), dict) else {}
+        fundamental_ticker = str(fundamental.get("ticker", "")).strip().upper() or ticker
+        for raw in fundamental.get("catalyst_calendar", []) or []:
+            if not isinstance(raw, dict):
+                continue
+            raw_calendar.append(
+                {
+                    "ticker": fundamental_ticker,
+                    "type": raw.get("type", "catalyst"),
+                    "subtype": raw.get("source_title", raw.get("type", "")),
+                    "status": raw.get("status", "upcoming"),
+                    "days_to_event": raw.get("days_to_event"),
+                    "source_classification": raw.get("source_classification", "confirmed"),
+                    "confirmed": str(raw.get("source_classification", "")).strip().lower() == "confirmed",
+                }
+            )
+    events: list[dict] = []
+    for raw in raw_calendar:
+        if not isinstance(raw, dict):
+            continue
+        event_ticker = str(raw.get("ticker", "")).strip().upper()
+        affected = {
+            str(item).strip().upper()
+            for item in (raw.get("affected_tickers", []) or [])
+            if str(item).strip()
+        }
+        if event_ticker not in {"", "__GLOBAL__", ticker} and ticker not in affected:
+            continue
+        events.append(raw)
+
+    nearest_days: int | None = None
+    confirmed = 0
+    imminent = 0
+    triggered = 0
+    labels: list[str] = []
+    for event in events:
+        days = event.get("days_to_event")
+        if isinstance(days, int) and days >= 0 and (nearest_days is None or days < nearest_days):
+            nearest_days = days
+        status = str(event.get("status", "")).strip().lower()
+        if status == "imminent":
+            imminent += 1
+        if status == "triggered":
+            triggered += 1
+        source_class = str(event.get("source_classification", "")).strip().lower()
+        if source_class == "confirmed" or bool(event.get("confirmed")):
+            confirmed += 1
+        label = str(event.get("subtype", "")).strip() or str(event.get("type", "")).strip()
+        if label and label not in labels:
+            labels.append(label)
+
+    return {
+        "event_count": len(events),
+        "confirmed_event_count": confirmed,
+        "imminent_event_count": imminent,
+        "triggered_event_count": triggered,
+        "nearest_event_days": nearest_days,
+        "event_labels": labels[:5],
+    }
+
+
+def _build_quant_data_provenance(payload: dict, signals: dict, event_context: dict) -> dict:
+    sources = {
+        "price_history": signals.get("event_return_5d") is not None and signals.get("trend_60d") is not None,
+        "pair_history": signals.get("pair_relative_strength_20d") is not None,
+        "market_history": signals.get("corr_with_market_60d") is not None and signals.get("beta_to_market_60d") is not None,
+        "regime_engine": bool((payload.get("market_regime_context", {}) or {}).get("state_probabilities")),
+        "risk_engine": (payload.get("portfolio_risk_parameters", {}) or {}).get("asset_cvar_99_daily") is not None,
+        "event_calendar": event_context.get("event_count", 0) > 0,
+    }
+    raw_components = sum(1 for v in sources.values() if v)
+    if raw_components >= 5:
+        quality = "high"
+    elif raw_components >= 3:
+        quality = "medium"
+    else:
+        quality = "low"
+    return {
+        "sources": sources,
+        "raw_components": raw_components,
+        "coverage_score": round(raw_components / len(sources), 4),
+        "quality": quality,
+    }
+
+
+def _build_quant_relative_value_views(
+    ticker: str,
+    pair_ticker: str,
+    signals: dict,
+    decision: dict,
+) -> list[dict]:
+    views: list[dict] = []
+    rel = signals.get("pair_relative_strength_20d")
+    if rel is not None:
+        stance = "outperform" if float(rel) > 0.02 else ("underperform" if float(rel) < -0.02 else "neutral")
+        views.append(
+            {
+                "pair": f"{ticker}/{pair_ticker}",
+                "stance": stance,
+                "metric": "pair_relative_strength_20d",
+                "value": round(float(rel), 6),
+                "confidence": decision.get("confidence", 0.5),
+            }
+        )
+    beta = signals.get("beta_to_market_60d")
+    if beta is not None:
+        market_tilt = "high_beta" if float(beta) > 1.1 else ("defensive" if float(beta) < 0.8 else "market_like")
+        views.append(
+            {
+                "pair": f"{ticker}/SPY",
+                "stance": market_tilt,
+                "metric": "beta_to_market_60d",
+                "value": round(float(beta), 6),
+                "confidence": decision.get("confidence", 0.5),
+            }
+        )
+    return views
+
+
+def _build_quant_execution_plan(
+    decision: dict,
+    signals: dict,
+    event_context: dict,
+    *,
+    horizon_days: int,
+    pair_ticker: str,
+    risk_budget: str,
+) -> dict:
+    vol_shift = signals.get("vol_shift_20d_vs_60d")
+    nearest_days = event_context.get("nearest_event_days")
+    staged = bool((vol_shift is not None and float(vol_shift) > 1.15) or (nearest_days is not None and nearest_days <= 7))
+    review_drawdown = signals.get("drawdown_60d")
+    review_drawdown_pct = round(float(review_drawdown) * 100, 2) if review_drawdown is not None else None
+    return {
+        "action": decision.get("decision"),
+        "allocation_pct": decision.get("final_allocation_pct"),
+        "sizing_mode": "risk_scaled_event_aware",
+        "entry_style": "staggered" if staged else "standard",
+        "holding_horizon_days": horizon_days,
+        "pair_reference": pair_ticker,
+        "risk_budget": risk_budget,
+        "review_thresholds": {
+            "drawdown_pct": review_drawdown_pct,
+            "vol_shift_trigger": 1.25,
+            "event_window_days": 7,
+        },
+    }
+
+
+def _build_quant_monitoring_triggers(signals: dict, event_context: dict, payload: dict) -> list[dict]:
+    triggers: list[dict] = []
+    regime_prob = (
+        (payload.get("market_regime_context", {}) or {})
+        .get("state_probabilities", {})
+        .get("regime_2_high_vol", 0.0)
+    )
+    if float(regime_prob or 0.0) >= 0.35:
+        triggers.append(
+            {
+                "name": "High-vol regime probability",
+                "metric": "regime_2_high_vol",
+                "current_value": round(float(regime_prob), 4),
+                "trigger": "> 0.50",
+                "action": "gross exposure 감축 또는 HOLD 유지",
+                "priority": 1,
+            }
+        )
+    vol_shift = signals.get("vol_shift_20d_vs_60d")
+    if vol_shift is not None and float(vol_shift) >= 1.20:
+        triggers.append(
+            {
+                "name": "Volatility expansion",
+                "metric": "vol_shift_20d_vs_60d",
+                "current_value": round(float(vol_shift), 4),
+                "trigger": "> 1.25",
+                "action": "allocation 축소 및 risk refresh",
+                "priority": 1,
+            }
+        )
+    downside_beta = signals.get("downside_beta_60d")
+    if downside_beta is not None and float(downside_beta) >= 1.10:
+        triggers.append(
+            {
+                "name": "Downside beta spike",
+                "metric": "downside_beta_60d",
+                "current_value": round(float(downside_beta), 4),
+                "trigger": "> 1.20",
+                "action": "beta 노출 재검토",
+                "priority": 2,
+            }
+        )
+    drawdown = signals.get("drawdown_60d")
+    if drawdown is not None and float(drawdown) >= 0.08:
+        triggers.append(
+            {
+                "name": "Drawdown breach",
+                "metric": "drawdown_60d",
+                "current_value": round(float(drawdown), 4),
+                "trigger": "> 0.10",
+                "action": "signal reset 여부 재평가",
+                "priority": 1,
+            }
+        )
+    nearest_days = event_context.get("nearest_event_days")
+    if nearest_days is not None and nearest_days <= 7:
+        triggers.append(
+            {
+                "name": "Event proximity",
+                "metric": "nearest_event_days",
+                "current_value": nearest_days,
+                "trigger": "<= 7",
+                "action": "event window 동안 sizing 보수화",
+                "priority": 1,
+            }
+        )
+    forecast_gap = signals.get("vol_forecast_gap")
+    if forecast_gap is not None and float(forecast_gap) >= 0.02:
+        triggers.append(
+            {
+                "name": "Forecast vol repricing",
+                "metric": "vol_forecast_gap",
+                "current_value": round(float(forecast_gap), 4),
+                "trigger": "> 0.03",
+                "action": "변동성 재가격 반영 여부 점검",
+                "priority": 2,
+            }
+        )
+    return triggers
 
 
 def _liquidity_proxy_score(ticker: str, asset_type_by_ticker: dict | None = None) -> float:
@@ -1391,11 +1852,19 @@ def hedge_lite_builder_node(state: InvestmentState) -> dict:
 
 def _event_regime_quant_decision(payload: dict) -> dict:
     sig = dict(payload.get("event_regime_signals", {}) or {})
-    trend20 = sig.get("trend_20d")
     trend5 = sig.get("event_return_5d")
+    trend20 = sig.get("trend_20d")
+    trend60 = sig.get("trend_60d")
     vol_shift = sig.get("vol_shift_20d_vs_60d")
     corr_market = sig.get("corr_with_market_60d")
+    beta_market = sig.get("beta_to_market_60d")
+    downside_beta = sig.get("downside_beta_60d")
     rel = sig.get("pair_relative_strength_20d")
+    drawdown = sig.get("drawdown_60d")
+    vol_gap = sig.get("vol_forecast_gap")
+    imminent_events = int(sig.get("imminent_event_count") or 0)
+    confirmed_events = int(sig.get("confirmed_event_count") or 0)
+    triggered_events = int(sig.get("triggered_event_count") or 0)
     regime_prob = (
         (payload.get("market_regime_context", {}) or {})
         .get("state_probabilities", {})
@@ -1403,31 +1872,88 @@ def _event_regime_quant_decision(payload: dict) -> dict:
     )
 
     cot = [
-        f"[Event/Regime] 5d={trend5}, 20d={trend20}, vol_shift={vol_shift}, corr60={corr_market}, rel20={rel}",
+        (
+            "[Event/Regime] "
+            f"5d={trend5}, 20d={trend20}, 60d={trend60}, "
+            f"vol_shift={vol_shift}, corr60={corr_market}, beta60={beta_market}, "
+            f"down_beta={downside_beta}, dd60={drawdown}, rel20={rel}, vol_gap={vol_gap}"
+        ),
+        (
+            "[Events] "
+            f"confirmed={confirmed_events}, imminent={imminent_events}, triggered={triggered_events}"
+        ),
         f"[RegimeProb] regime_2_high_vol={regime_prob}",
     ]
 
-    risk_off = (regime_prob or 0.0) > 0.5 or ((vol_shift or 0.0) > 1.25 and (trend5 or 0.0) < 0)
-    bullish = ((trend20 or 0.0) > 0.01 and (trend5 or 0.0) >= 0 and (rel or 0.0) >= -0.02 and not risk_off)
-    bearish = ((trend20 or 0.0) < -0.01 and (trend5 or 0.0) < 0 and (vol_shift or 0.0) > 1.1)
+    def _s(value: Any, scale: float) -> float:
+        if value is None:
+            return 0.0
+        try:
+            return _clip(float(value) * scale)
+        except (TypeError, ValueError):
+            return 0.0
 
-    if bullish:
+    trend_score = (
+        0.30 * _s(trend5, 12.0)
+        + 0.40 * _s(trend20, 10.0)
+        + 0.30 * _s(trend60, 6.0)
+    )
+    beta_component = 0.25 * _clip(1.0 - abs(float(beta_market) - 1.0), -1.0, 1.0) if beta_market is not None else 0.0
+    corr_component = 0.15 * _clip(-abs(float(corr_market) - 0.6), -1.0, 0.0) if corr_market is not None else 0.0
+    relative_value_score = (
+        0.60 * _s(rel, 14.0)
+        + beta_component
+        + corr_component
+    )
+    risk_penalty = (
+        0.35 * _clip(float(regime_prob or 0.0) * 2.0)
+        + 0.20 * _clip(max((float(vol_shift or 1.0) - 1.0), 0.0) * 2.5)
+        + 0.20 * _clip(float(drawdown or 0.0) * 6.0)
+        + 0.15 * _clip(max((float(downside_beta or 1.0) - 1.0), 0.0) * 2.0)
+        + 0.10 * _clip(max((float(vol_gap or 0.0)), 0.0) * 12.0)
+    )
+    event_penalty = min(0.35, 0.07 * confirmed_events + 0.08 * imminent_events + 0.12 * triggered_events)
+    total_score = 0.55 * trend_score + 0.45 * relative_value_score - risk_penalty - event_penalty
+
+    cot.append(
+        f"[Score] trend={round(trend_score, 4)}, rv={round(relative_value_score, 4)}, "
+        f"risk_penalty={round(risk_penalty, 4)}, event_penalty={round(event_penalty, 4)}, "
+        f"total={round(total_score, 4)}"
+    )
+
+    risk_off = bool(
+        (regime_prob or 0.0) > 0.55
+        or (vol_shift or 0.0) > 1.35
+        or (drawdown or 0.0) > 0.12
+        or triggered_events > 0
+    )
+    if total_score >= 0.25 and not risk_off:
         decision = "LONG"
-        alloc = 0.06
-        cot.append("[Decision] trend/relative strength 우호 + 고변동 리스크 제한적 → LONG")
-    elif bearish or risk_off:
-        decision = "HOLD"
-        alloc = 0.0
-        cot.append("[Decision] 이벤트/변동성 리스크 우세 → HOLD")
+        alloc = min(0.10, max(0.02, round(0.10 * min(total_score, 1.0), 4)))
+        cot.append("[Decision] trend/rv 우위가 리스크를 상회 → LONG")
+    elif total_score <= -0.30 and not risk_off:
+        decision = "SHORT"
+        alloc = min(0.08, max(0.02, round(0.08 * min(abs(total_score), 1.0), 4)))
+        cot.append("[Decision] 하방 trend/rv 열위가 명확 → SHORT")
     else:
         decision = "HOLD"
         alloc = 0.0
-        cot.append("[Decision] 신호 혼조 → HOLD")
+        cot.append("[Decision] 이벤트/리스크 우세 또는 신호 혼조 → HOLD")
+
+    confidence = round(max(0.35, min(0.8, 0.55 + 0.20 * abs(total_score) - 0.10 * event_penalty)), 2)
 
     return {
         "cot_reasoning": " ".join(cot),
         "decision": decision,
         "final_allocation_pct": alloc,
+        "confidence": confidence,
+        "signal_stack": {
+            "trend_score": round(trend_score, 4),
+            "relative_value_score": round(relative_value_score, 4),
+            "risk_penalty": round(risk_penalty, 4),
+            "event_penalty": round(event_penalty, 4),
+            "total_score": round(total_score, 4),
+        },
     }
 
 
@@ -1463,9 +1989,15 @@ def quant_analyst_node(state: InvestmentState) -> dict:
     event_regime_signals = {
         "event_return_5d": _safe_pct_change(prices, 5),
         "trend_20d": _safe_pct_change(prices, 20),
+        "trend_60d": _safe_pct_change(prices, 60),
         "vol_20d_ann": _safe_ann_vol(prices, window=20),
         "vol_60d_ann": _safe_ann_vol(prices, window=60),
         "corr_with_market_60d": _safe_corr(prices, market_prices, window=60),
+        "beta_to_market_60d": _safe_beta_to_main(prices, market_prices, window=60),
+        "downside_beta_60d": _safe_downside_beta(prices, market_prices, window=60),
+        "drawdown_60d": _safe_max_drawdown(prices, window=60),
+        "realized_skew_60d": _safe_realized_skew(prices, window=60),
+        "tail_proxy_5pct_60d": _safe_tail_proxy(prices, window=60),
         "pair_relative_strength_20d": None,
     }
     if event_regime_signals["trend_20d"] is not None:
@@ -1480,6 +2012,9 @@ def quant_analyst_node(state: InvestmentState) -> dict:
         event_regime_signals["vol_shift_20d_vs_60d"] = float(v20) / float(v60)
     else:
         event_regime_signals["vol_shift_20d_vs_60d"] = None
+    event_regime_signals["vol_forecast_gap"] = _safe_vol_forecast_gap(payload, event_regime_signals.get("vol_60d_ann"))
+    event_context = _extract_quant_event_context(state, ticker)
+    event_regime_signals.update(event_context)
     payload["event_regime_signals"] = event_regime_signals
 
     # Intent-aware decision mode:
@@ -1492,6 +2027,18 @@ def quant_analyst_node(state: InvestmentState) -> dict:
     z = ((payload.get("alpha_signals", {}).get("statistical_arbitrage", {})
           .get("execution", {})).get("current_z_score"))
     cvar = (payload.get("portfolio_risk_parameters", {}).get("asset_cvar_99_daily"))
+    signal_stack = dict(decision.get("signal_stack", {}) or {})
+    data_provenance = _build_quant_data_provenance(payload, event_regime_signals, event_context)
+    execution_plan = _build_quant_execution_plan(
+        decision,
+        event_regime_signals,
+        event_context,
+        horizon_days=horizon_days,
+        pair_ticker=pair_ticker,
+        risk_budget=risk_budget,
+    )
+    monitoring_triggers = _build_quant_monitoring_triggers(event_regime_signals, event_context, payload)
+    relative_value_views = _build_quant_relative_value_views(ticker, pair_ticker, event_regime_signals, decision)
 
     print(f"   Decision: {decision['decision']} | Alloc: {decision['final_allocation_pct']}")
     print(f"   Why called: {rerun_reason}")
@@ -1508,7 +2055,8 @@ def quant_analyst_node(state: InvestmentState) -> dict:
                 "event_regime="
                 f"ret5={event_regime_signals.get('event_return_5d')} "
                 f"trend20={event_regime_signals.get('trend_20d')} "
-                f"vol_shift={event_regime_signals.get('vol_shift_20d_vs_60d')}"
+                f"vol_shift={event_regime_signals.get('vol_shift_20d_vs_60d')} "
+                f"events={event_regime_signals.get('imminent_event_count')}"
             ),
         ],
     )
@@ -1519,7 +2067,16 @@ def quant_analyst_node(state: InvestmentState) -> dict:
         evidence.append(make_evidence(metric="z_score", value=z, source_name="quant_engine", source_type="model", quality=0.9, as_of=as_of))
     if cvar is not None:
         evidence.append(make_evidence(metric="asset_cvar_99_daily", value=cvar, source_name="quant_engine", source_type="model", quality=0.9, as_of=as_of))
-    for k in ("event_return_5d", "trend_20d", "vol_shift_20d_vs_60d"):
+    for k in (
+        "event_return_5d",
+        "trend_20d",
+        "trend_60d",
+        "vol_shift_20d_vs_60d",
+        "beta_to_market_60d",
+        "downside_beta_60d",
+        "drawdown_60d",
+        "vol_forecast_gap",
+    ):
         v = event_regime_signals.get(k)
         if v is None:
             continue
@@ -1543,6 +2100,11 @@ def quant_analyst_node(state: InvestmentState) -> dict:
         "z_score": z,
         "asset_cvar_99_daily": cvar,
         "event_regime_signals": event_regime_signals,
+        "signal_stack": signal_stack,
+        "execution_plan": execution_plan,
+        "monitoring_triggers": monitoring_triggers,
+        "relative_value_views": relative_value_views,
+        "data_provenance": data_provenance,
         "quant_payload": payload,
         "llm_decision": decision,
         "evidence": evidence,
@@ -1551,9 +2113,18 @@ def quant_analyst_node(state: InvestmentState) -> dict:
             f"Z={z}, ret5={event_regime_signals.get('event_return_5d')}"
         ),
         "status": "ok",
-        "data_ok": payload.get("_data_ok", True),
+        "data_ok": payload.get("_data_ok", True) and data_provenance.get("quality") != "low",
         "quant_indicators": (
-            ["event_return_5d", "trend_20d", "vol_shift_20d_vs_60d", "corr_with_market_60d"]
+            [
+                "event_return_5d",
+                "trend_20d",
+                "trend_60d",
+                "vol_shift_20d_vs_60d",
+                "corr_with_market_60d",
+                "beta_to_market_60d",
+                "downside_beta_60d",
+                "drawdown_60d",
+            ]
             if analysis_mode == "event_regime"
             else ["adf_pvalue", "z_score", "asset_cvar_99_daily"]
         ),
@@ -1562,7 +2133,7 @@ def quant_analyst_node(state: InvestmentState) -> dict:
             "HOLD": "hold", "CLEAR": "neutral",
         }.get(decision["decision"], "hold"),
         "recommendation": "allow" if decision["decision"] in ("LONG", "SHORT") else "allow_with_limits",
-        "confidence": 0.6 if payload.get("_data_ok") else 0.35,
+        "confidence": decision.get("confidence", 0.6 if payload.get("_data_ok") else 0.35),
         "risk_flags": [],
         "limitations": ["Mock data" if mode == "mock" else ""],
     }
@@ -1971,6 +2542,456 @@ def _bounded_swarm_plan_step(
     }
 
 
+def _parse_event_datetime(value: Any) -> datetime | None:
+    text = str(value or "").strip()
+    if not text:
+        return None
+    try:
+        return datetime.fromisoformat(text.replace("Z", "+00:00"))
+    except ValueError:
+        pass
+    if len(text) >= 10:
+        try:
+            return datetime.fromisoformat(text[:10])
+        except ValueError:
+            return None
+    return None
+
+
+def _event_days_to(as_of: str, value: Any) -> int | None:
+    base_dt = _parse_event_datetime(as_of)
+    event_dt = _parse_event_datetime(value)
+    if base_dt is None or event_dt is None:
+        return None
+    return int((event_dt.date() - base_dt.date()).days)
+
+
+def _macro_trigger_breached(trigger: dict) -> bool:
+    if not isinstance(trigger, dict):
+        return False
+    metric = str(trigger.get("metric", "")).strip().lower()
+    value = trigger.get("current_value")
+    try:
+        current = float(value)
+    except (TypeError, ValueError):
+        return False
+
+    if metric == "hy_oas":
+        bp = current * 100.0 if abs(current) < 50 else current
+        return bp >= 500
+    if metric == "pmi":
+        return current < 48
+    if metric in {"inflation_proxy", "core_cpi_yoy", "cpi_yoy"}:
+        return current > 3.0
+    if metric == "vix_level":
+        return current > 20
+    if metric == "yield_curve_spread":
+        return current < -0.20 or current > 0.30
+    if metric == "sofr_ff_6m_basis_bp":
+        return abs(current) > 10
+    if metric in {"wti/brent", "wti", "brent"}:
+        return current >= 80
+    return False
+
+
+def _event_priority_rank(item: dict) -> tuple[int, int, int, str, str]:
+    priority = int(item.get("priority", 3) or 3)
+    status = str(item.get("status", "")).strip().lower()
+    status_rank = 0 if status in {"triggered", "imminent"} else (1 if status == "upcoming" else 2)
+    days = item.get("days_to_event")
+    days_rank = int(days) if isinstance(days, int) else 10_000
+    return priority, status_rank, days_rank, str(item.get("desk", "")), str(item.get("ticker", ""))
+
+
+def _event_key(item: dict) -> str:
+    desk = str(item.get("desk", "")).strip().lower()
+    ticker = str(item.get("ticker", "")).strip().upper()
+    event_type = str(item.get("type", "")).strip().lower()
+    subtype = str(item.get("subtype", "")).strip().lower()
+    date = str(item.get("date", "")).strip()
+    trigger = str(item.get("trigger", "")).strip().lower()
+    return "::".join(part for part in [desk, ticker, event_type, subtype, date, trigger] if part)
+
+
+def _build_event_calendar(state: InvestmentState) -> list[dict]:
+    as_of = str(state.get("as_of", "")).strip()
+    target = str(state.get("target_ticker", "")).strip().upper()
+    universe = [
+        str(t).strip().upper()
+        for t in (state.get("universe", []) or [])
+        if str(t).strip()
+    ]
+    events: list[dict] = []
+
+    macro = state.get("macro_analysis", {}) if isinstance(state.get("macro_analysis"), dict) else {}
+    for trigger in macro.get("monitoring_triggers", []) or []:
+        if not isinstance(trigger, dict):
+            continue
+        breached = _macro_trigger_breached(trigger)
+        item = {
+            "desk": "macro",
+            "ticker": "__GLOBAL__",
+            "type": "macro_monitor",
+            "subtype": str(trigger.get("name", "")).strip() or str(trigger.get("metric", "")).strip(),
+            "metric": str(trigger.get("metric", "")).strip(),
+            "priority": int(trigger.get("priority", 3) or 3),
+            "status": "triggered" if breached else "watch",
+            "current_value": trigger.get("current_value"),
+            "trigger": str(trigger.get("trigger", "")).strip(),
+            "action": str(trigger.get("action", "")).strip(),
+            "source": "macro_monitoring_triggers",
+            "confirmed": False,
+            "affected_tickers": universe[:6],
+            "breached": breached,
+        }
+        item["event_key"] = _event_key(item)
+        events.append(item)
+    for raw_event in macro.get("macro_event_calendar", []) or []:
+        if not isinstance(raw_event, dict):
+            continue
+        days = raw_event.get("days_to_event")
+        if not isinstance(days, int):
+            days = _event_days_to(as_of, raw_event.get("date"))
+        status = str(raw_event.get("status", "")).strip().lower() or "upcoming"
+        if days is not None and days <= 7 and days >= 0:
+            status = "imminent"
+        elif days is not None and days < 0:
+            status = "stale"
+        event = {
+            "desk": "macro",
+            "ticker": "__GLOBAL__",
+            "type": str(raw_event.get("type", "")).strip().lower() or "macro_event",
+            "subtype": str(raw_event.get("title", "")).strip() or str(raw_event.get("subtype", "")).strip(),
+            "date": str(raw_event.get("date", "")).strip(),
+            "days_to_event": days,
+            "priority": 1 if status == "imminent" else 2,
+            "status": status,
+            "source": str(raw_event.get("source", "")).strip() or "macro_event_calendar",
+            "confirmed": str(raw_event.get("source_classification", "")).strip().lower() == "confirmed",
+            "source_classification": str(raw_event.get("source_classification", "")).strip().lower() or "confirmed",
+            "event_origin": str(raw_event.get("event_origin", "")).strip() or "macro_event_calendar",
+            "notes": str(raw_event.get("notes", "")).strip(),
+        }
+        event["event_key"] = _event_key(event)
+        events.append(event)
+
+    fundamental = state.get("fundamental_analysis", {}) if isinstance(state.get("fundamental_analysis"), dict) else {}
+    fundamental_ticker = str(fundamental.get("ticker", "")).strip().upper() or target
+    for item in fundamental.get("catalyst_calendar", []) or []:
+        if not isinstance(item, dict):
+            continue
+        days = item.get("days_to_event")
+        if not isinstance(days, int):
+            days = _event_days_to(as_of, item.get("date"))
+        status = str(item.get("status", "")).strip().lower() or "upcoming"
+        if days is not None and days <= 7:
+            status = "imminent"
+        elif days is not None and days < 0:
+            status = "stale"
+        event = {
+            "desk": "fundamental",
+            "ticker": fundamental_ticker,
+            "type": str(item.get("type", "")).strip().lower() or "catalyst",
+            "subtype": str(item.get("source_title", "")).strip() or str(item.get("type", "")).strip(),
+            "date": str(item.get("date", "")).strip(),
+            "days_to_event": days,
+            "priority": 1 if str(item.get("importance", "")).strip().lower() == "high" else 2,
+            "status": status,
+            "source": str(item.get("source_title", "")).strip() or str(item.get("resolver_path", "")).strip() or "fundamental_catalyst",
+            "confirmed": str(item.get("source_classification", "")).strip().lower() == "confirmed",
+            "source_classification": str(item.get("source_classification", "")).strip().lower() or "inferred",
+            "expected_scenario": str(item.get("expected_scenario", "")).strip(),
+            "thesis_change_trigger": str(item.get("thesis_change_trigger", "")).strip(),
+        }
+        event["event_key"] = _event_key(event)
+        events.append(event)
+
+    sentiment = state.get("sentiment_analysis", {}) if isinstance(state.get("sentiment_analysis"), dict) else {}
+    catalyst_risk = sentiment.get("catalyst_risk", {}) if isinstance(sentiment.get("catalyst_risk"), dict) else {}
+    if catalyst_risk.get("catalyst_present") or str(sentiment.get("volatility_regime", "")).strip().lower() in {"high", "elevated"}:
+        event = {
+            "desk": "sentiment",
+            "ticker": target or "__GLOBAL__",
+            "type": "sentiment_regime",
+            "subtype": "catalyst_risk" if catalyst_risk.get("catalyst_present") else "volatility_regime",
+            "priority": 2,
+            "status": "triggered" if catalyst_risk.get("catalyst_present") else "watch",
+            "source": "sentiment_overlay",
+            "confirmed": False,
+            "catalyst_type": list(catalyst_risk.get("catalyst_type", []) or []),
+            "volatility_regime": str(sentiment.get("volatility_regime", "")).strip(),
+        }
+        event["event_key"] = _event_key(event)
+        events.append(event)
+
+    quant = state.get("technical_analysis", {}) if isinstance(state.get("technical_analysis"), dict) else {}
+    quant_payload = quant.get("quant_payload", {}) if isinstance(quant.get("quant_payload"), dict) else {}
+    regime_probs = (quant_payload.get("market_regime_context", {}) or {}).get("state_probabilities", {}) or {}
+    high_vol_prob = float(regime_probs.get("regime_2_high_vol", 0.0) or 0.0)
+    asset_cvar = float(quant.get("asset_cvar_99_daily", 0.0) or 0.0)
+    if high_vol_prob >= 0.20 or asset_cvar >= 0.05:
+        event = {
+            "desk": "quant",
+            "ticker": target or "__GLOBAL__",
+            "type": "quant_risk",
+            "subtype": "high_vol_regime" if high_vol_prob >= 0.20 else "asset_cvar",
+            "priority": 1,
+            "status": "triggered",
+            "source": "quant_payload",
+            "confirmed": True,
+            "high_vol_prob": round(high_vol_prob, 4),
+            "asset_cvar_99_daily": round(asset_cvar, 6),
+        }
+        event["event_key"] = _event_key(event)
+        events.append(event)
+
+    deduped: dict[str, dict] = {}
+    for item in events:
+        key = str(item.get("event_key", "")).strip()
+        if not key:
+            continue
+        prev = deduped.get(key)
+        if prev is None or _event_priority_rank(item) < _event_priority_rank(prev):
+            deduped[key] = item
+    return sorted(deduped.values(), key=_event_priority_rank)[:16]
+
+
+def _build_decision_quality_scorecard(state: InvestmentState) -> dict:
+    desk_map = {
+        "macro": state.get("macro_analysis", {}),
+        "fundamental": state.get("fundamental_analysis", {}),
+        "sentiment": state.get("sentiment_analysis", {}),
+        "quant": state.get("technical_analysis", {}),
+    }
+    weights = {"macro": 0.30, "fundamental": 0.35, "sentiment": 0.15, "quant": 0.20}
+    desks: dict[str, dict] = {}
+    weak_desks: list[str] = []
+    overall = 0.0
+    for desk, output in desk_map.items():
+        if not isinstance(output, dict) or not output:
+            score = 0.15
+            desks[desk] = {
+                "status": "missing",
+                "quality_score": score,
+                "confidence": 0.0,
+                "evidence_count": 0,
+                "needs_more_data": True,
+                "warning_count": 1,
+            }
+            weak_desks.append(desk)
+            overall += score * weights[desk]
+            continue
+        evidence_count = len(output.get("evidence", []) or []) + len(output.get("evidence_digest", []) or [])
+        warnings = len(((output.get("data_quality", {}) or {}).get("warnings", []) or []))
+        confidence = float(output.get("confidence", 0.0) or 0.0)
+        signal_strength = abs(float(output.get("signal_strength", 0.0) or 0.0))
+        data_ok = bool(output.get("data_ok", output.get("status") == "ok"))
+        needs_more_data = bool(output.get("needs_more_data", False))
+        score = (
+            (0.25 if data_ok else 0.05)
+            + 0.20 * min(evidence_count / 5.0, 1.0)
+            + 0.20 * min(confidence, 1.0)
+            + 0.10 * min(signal_strength, 1.0)
+            + (0.15 if not needs_more_data else 0.02)
+            - 0.05 * min(warnings, 3)
+        )
+        score = max(0.0, min(round(score, 4), 1.0))
+        desks[desk] = {
+            "status": "ok" if data_ok else "weak",
+            "quality_score": score,
+            "confidence": round(confidence, 4),
+            "evidence_count": evidence_count,
+            "needs_more_data": needs_more_data,
+            "warning_count": warnings,
+        }
+        if score < 0.50 or needs_more_data:
+            weak_desks.append(desk)
+        overall += score * weights[desk]
+
+    return {
+        "status": "ok",
+        "overall_score": round(overall, 4),
+        "desks": desks,
+        "weak_desks": sorted(set(weak_desks)),
+    }
+
+
+def _monitoring_request_from_event(item: dict) -> dict | None:
+    if not isinstance(item, dict):
+        return None
+    desk = str(item.get("desk", "")).strip().lower()
+    ticker = str(item.get("ticker", "")).strip().upper()
+    event_type = str(item.get("type", "")).strip().lower()
+    subtype = str(item.get("subtype", "")).strip()
+    priority = 1 if str(item.get("status", "")).strip().lower() in {"triggered", "imminent"} else 2
+    if desk == "macro":
+        return {
+            "desk": "macro",
+            "kind": "macro_headline_context",
+            "ticker": "__GLOBAL__",
+            "query": f"{subtype or event_type} macro update market impact",
+            "priority": priority,
+            "recency_days": 7,
+            "max_items": 3,
+            "rationale": f"monitoring_event:{event_type}",
+            "source_tag": "monitoring",
+            "impacted_desks": ["macro", "sentiment"],
+        }
+    if desk == "fundamental":
+        kind = "press_release_or_ir"
+        if event_type in {"legal_reg", "contract_renewal"}:
+            kind = "sec_filing"
+        return {
+            "desk": "fundamental",
+            "kind": kind,
+            "ticker": ticker,
+            "query": f"{ticker} {event_type or subtype} latest official update",
+            "priority": priority,
+            "recency_days": 14,
+            "max_items": 3,
+            "rationale": f"monitoring_event:{event_type}",
+            "source_tag": "monitoring",
+            "impacted_desks": ["fundamental", "sentiment"] if event_type in {"earnings", "street_rating"} else ["fundamental"],
+        }
+    if desk == "sentiment":
+        return {
+            "desk": "sentiment",
+            "kind": "catalyst_event_detail",
+            "ticker": ticker or "__GLOBAL__",
+            "query": f"{ticker or 'market'} sentiment catalyst volatility positioning update",
+            "priority": priority,
+            "recency_days": 7,
+            "max_items": 3,
+            "rationale": f"monitoring_event:{event_type}",
+            "source_tag": "monitoring",
+            "impacted_desks": ["sentiment"],
+        }
+    return None
+
+
+def _build_monitoring_actions(
+    state: InvestmentState,
+    event_calendar: list[dict],
+    scorecard: dict,
+) -> dict:
+    prior_actions = state.get("monitoring_actions", {}) if isinstance(state.get("monitoring_actions"), dict) else {}
+    handled = {
+        str(key).strip()
+        for key in (prior_actions.get("handled_event_keys", []) or [])
+        if str(key).strip()
+    }
+    weak_desks = set(scorecard.get("weak_desks", []) or [])
+
+    triggered_events = [
+        item for item in event_calendar
+        if isinstance(item, dict) and str(item.get("status", "")).strip().lower() in {"triggered", "imminent"}
+    ]
+    new_triggered = [item for item in triggered_events if str(item.get("event_key", "")).strip() not in handled]
+
+    selected_desks: set[str] = set()
+    risk_refresh_required = False
+    for item in new_triggered:
+        desk = str(item.get("desk", "")).strip().lower()
+        event_type = str(item.get("type", "")).strip().lower()
+        if desk in {"macro", "fundamental", "sentiment", "quant"}:
+            selected_desks.add(desk)
+        if desk == "fundamental" and event_type in {"earnings", "street_rating"}:
+            selected_desks.add("sentiment")
+        if desk in {"macro", "quant"}:
+            risk_refresh_required = True
+
+    if new_triggered and weak_desks:
+        selected_desks.update(weak_desks)
+
+    monitoring_requests = []
+    for item in new_triggered:
+        req = _monitoring_request_from_event(item)
+        if req:
+            sanitized = _sanitize_swarm_request(req, default_source_tag="monitoring")
+            if sanitized:
+                monitoring_requests.append(sanitized)
+    monitoring_requests = _dedupe_requests(monitoring_requests)
+
+    task_actions = []
+    for desk in sorted(selected_desks):
+        task_actions.append({
+            "type": "rerun_desk",
+            "detail": f"{desk} desk rerun for monitoring escalation",
+            "params": {"desk": desk},
+        })
+    if risk_refresh_required:
+        task_actions.append({
+            "type": "rerun_risk",
+            "detail": "risk refresh for monitoring escalation",
+            "params": {"source": "monitoring_router"},
+        })
+
+    handled_event_keys = sorted(handled | {str(item.get("event_key", "")).strip() for item in new_triggered if str(item.get("event_key", "")).strip()})
+    return {
+        "status": "ok",
+        "triggered_events": triggered_events[:8],
+        "new_triggered_events": new_triggered[:8],
+        "selected_desks": sorted(selected_desks),
+        "risk_refresh_required": risk_refresh_required,
+        "monitoring_requests": monitoring_requests[:MAX_WEB_QUERIES_PER_RUN],
+        "force_research": bool(monitoring_requests or selected_desks),
+        "reason": "new_triggered_events" if new_triggered else ("weak_desk_monitoring" if weak_desks else "no_escalation"),
+        "handled_event_keys": handled_event_keys[-64:],
+        "weak_desks": sorted(weak_desks),
+        "task_actions": task_actions,
+    }
+
+
+def monitoring_router_node(state: InvestmentState) -> dict:
+    _log(state, "monitoring_router", "enter")
+    event_calendar = _build_event_calendar(state)
+    scorecard = _build_decision_quality_scorecard(state)
+    actions = _build_monitoring_actions(state, event_calendar, scorecard)
+    backlog = _merge_actions(state.get("task_backlog", []), actions.get("task_actions", []))
+
+    print(f"\n🕒 MONITORING ROUTER  (iter #{state.get('iteration_count', 1)})")
+    print(
+        "   Events: "
+        f"total={len(event_calendar)} triggered={len(actions.get('triggered_events', []))} "
+        f"new={len(actions.get('new_triggered_events', []))}"
+    )
+    print(
+        "   Escalation: "
+        f"desks={actions.get('selected_desks', []) if actions.get('selected_desks') else '[]'} "
+        f"risk_refresh={actions.get('risk_refresh_required', False)} "
+        f"force_research={actions.get('force_research', False)}"
+    )
+    _ops_log(
+        state,
+        "monitoring_router",
+        "monitoring escalation",
+        [
+            f"events_total={len(event_calendar)} triggered={len(actions.get('triggered_events', []))} new={len(actions.get('new_triggered_events', []))}",
+            f"selected_desks={actions.get('selected_desks', [])}",
+            f"risk_refresh_required={actions.get('risk_refresh_required', False)}",
+            f"decision_quality_overall={scorecard.get('overall_score')}",
+        ],
+    )
+    out = {
+        "event_calendar": event_calendar,
+        "decision_quality_scorecard": scorecard,
+        "monitoring_actions": actions,
+        "_monitoring_forced_desks": list(actions.get("selected_desks", [])),
+        "task_backlog": backlog,
+        "trace": [{
+            "node": "monitoring_router",
+            "events_total": len(event_calendar),
+            "triggered_events": len(actions.get("triggered_events", [])),
+            "new_triggered_events": len(actions.get("new_triggered_events", [])),
+            "selected_desks": list(actions.get("selected_desks", [])),
+            "risk_refresh_required": bool(actions.get("risk_refresh_required", False)),
+            "quality_overall": scorecard.get("overall_score"),
+        }],
+    }
+    _log(state, "monitoring_router", "exit", {"selected_desks": actions.get("selected_desks", []), "force_research": actions.get("force_research", False)})
+    return out
+
+
 def _select_rerun_desks(
     *,
     executed_requests: list[dict],
@@ -2254,6 +3275,12 @@ def research_router_node(state: InvestmentState) -> dict:
     _log(state, "research_router", "enter")
     desk_outputs = _desk_outputs_for_policy(state)
     raw_requests = _merge_request_sources(state)
+    monitoring_actions = state.get("monitoring_actions", {}) if isinstance(state.get("monitoring_actions"), dict) else {}
+    monitoring_requests = []
+    for req in (monitoring_actions.get("monitoring_requests", []) or []):
+        sreq = _sanitize_swarm_request(req, default_source_tag="monitoring")
+        if sreq:
+            monitoring_requests.append(sreq)
     question_requests = _open_questions_to_requests(state, desk_outputs)
     followup_actions = _desk_followups_to_actions(desk_outputs)
     disagreement = compute_disagreement_score(desk_outputs)
@@ -2284,7 +3311,7 @@ def research_router_node(state: InvestmentState) -> dict:
         desk_outputs=desk_outputs,
         raw_requests=raw_requests,
         question_requests=question_requests,
-        recovery_requests=list(recovery.get("evidence_requests", [])),
+        recovery_requests=list(recovery.get("evidence_requests", [])) + monitoring_requests,
         disagreement_score=disagreement,
     )
     swarm_candidates = list(swarm.get("candidates", []))[:_MAX_SWARM_CANDIDATES]
@@ -2360,7 +3387,15 @@ def research_router_node(state: InvestmentState) -> dict:
     need_score = decision.get("research_need_score")
     impact_score = decision.get("impact_score")
     uncertainty_score = decision.get("uncertainty_score")
-    allowed_count = len(decision.get("allowed_requests", []) or [])
+    allowed_requests = list(decision.get("allowed_requests", []) or [])
+
+    if monitoring_actions.get("force_research"):
+        run_research = True
+        decision_reason = f"monitoring_escalation:{monitoring_actions.get('reason', 'event_trigger')}"
+        if monitoring_requests:
+            allowed_requests = _dedupe_requests(allowed_requests + monitoring_requests)[:MAX_WEB_QUERIES_PER_RUN]
+
+    allowed_count = len(allowed_requests)
 
     print(f"\n🧭 RESEARCH ROUTER  (iter #{state.get('iteration_count', 1)})")
     print(
@@ -2396,6 +3431,7 @@ def research_router_node(state: InvestmentState) -> dict:
                 f"plan=candidates:{len(swarm_candidates)} planned:{len(planned)} allowed:{allowed_count} "
                 f"missing_buckets={missing_buckets}"
             ),
+            f"monitoring_force_research={monitoring_actions.get('force_research', False)} monitoring_desks={monitoring_actions.get('selected_desks', [])}",
             f"selected_kinds={_list_preview(sorted({str(req.get('kind', '')) for req in planned if req.get('kind')}), max_items=6, max_len=180) or 'n/a'}",
         ],
     )
@@ -2413,14 +3449,15 @@ def research_router_node(state: InvestmentState) -> dict:
         "_swarm_plan": planned,
         "_covered_buckets": covered_buckets,
         "_run_research": run_research,
-        "_research_plan": decision.get("allowed_requests", []),
+        "_research_plan": allowed_requests,
+        "_monitoring_forced_desks": list(monitoring_actions.get("selected_desks", [])),
         "research_stop_reason": "" if run_research else decision.get("reason", "no_trigger"),
         "user_action_required": user_action_required,
         "user_action_items": user_action_items,
         "trace": [{
             "node": "research_router",
             "run": run_research,
-            "reason": decision.get("reason", ""),
+            "reason": decision_reason,
             "planned_requests": len(planned),
             "followup_actions": len(followup_actions),
             "autonomy_issues": len(recovery.get("issues", [])),
@@ -2432,6 +3469,8 @@ def research_router_node(state: InvestmentState) -> dict:
             "missing_buckets": missing_buckets,
             "swarm_candidates": len(swarm_candidates),
             "user_action_required": user_action_required,
+            "monitoring_force_research": bool(monitoring_actions.get("force_research", False)),
+            "monitoring_selected_desks": list(monitoring_actions.get("selected_desks", [])),
         }],
     }
     if _graph_trace_enabled():
@@ -2726,13 +3765,36 @@ def research_executor_node(state: InvestmentState) -> dict:
     _log(state, "research_executor", "enter")
     plan = list(state.get("_research_plan", []))
     if not plan:
+        forced_desks = sorted({
+            str(desk).strip().lower()
+            for desk in (state.get("_monitoring_forced_desks", []) or [])
+            if str(desk).strip().lower() in {"macro", "fundamental", "sentiment", "quant"}
+        })
+        ct = dict(state.get("completed_tasks", {}))
+        for desk in forced_desks:
+            ct[desk] = False
         _log(state, "research_executor", "exit", {"queries_executed": 0, "delta": 0})
         return {
             "last_research_delta": 0,
             "_run_research": False,
             "_executed_requests": [],
-            "_rerun_plan": {"selected_desks": [], "k": _MAX_RERUN_DESKS, "reasons": {}, "executed_kinds": []},
+            "_rerun_plan": {
+                "selected_desks": forced_desks,
+                "k": _MAX_RERUN_DESKS,
+                "reasons": {desk: ["monitoring_escalation"] for desk in forced_desks},
+                "executed_kinds": [],
+            },
             "_evidence_delta_kinds": {},
+            "completed_tasks": ct,
+            "trace": [{
+                "node": "research_executor",
+                "research_round": int(state.get("research_round", 0)),
+                "queries_executed": 0,
+                "last_research_delta": 0,
+                "evidence_score": int(state.get("evidence_score", 0)),
+                "rerun_desks": forced_desks,
+                "forced_rerun_desks": forced_desks,
+            }],
         }
 
     as_of = state.get("as_of", "")
@@ -2837,6 +3899,21 @@ def research_executor_node(state: InvestmentState) -> dict:
         k=_MAX_RERUN_DESKS,
     )
     rerun_desks = set(rerun_plan.get("selected_desks", []))
+    forced_desks = {
+        str(desk).strip().lower()
+        for desk in (state.get("_monitoring_forced_desks", []) or [])
+        if str(desk).strip().lower() in {"macro", "fundamental", "sentiment", "quant"}
+    }
+    if forced_desks:
+        rerun_desks.update(forced_desks)
+        reasons = dict(rerun_plan.get("reasons", {}) or {})
+        for desk in sorted(forced_desks):
+            reason_list = list(reasons.get(desk, []) or [])
+            if "monitoring_escalation" not in reason_list:
+                reason_list.append("monitoring_escalation")
+            reasons[desk] = reason_list
+        rerun_plan["reasons"] = reasons
+    rerun_plan["selected_desks"] = sorted(rerun_desks)
 
     ct = dict(state.get("completed_tasks", {}))
     for desk in rerun_desks:
@@ -2958,6 +4035,7 @@ def research_executor_node(state: InvestmentState) -> dict:
             "resolved_request_ratio": round(resolved_request_ratio, 4),
             "evidence_score": score_block["score"],
             "rerun_desks": sorted(rerun_desks),
+            "forced_rerun_desks": sorted(forced_desks),
         }],
     }
     _log(state, "research_executor", "exit", {"queries_executed": queries_executed, "delta": delta, "score": score_block["score"]})
@@ -3145,10 +4223,10 @@ def risk_router(state: InvestmentState) -> Literal["orchestrator", "report_write
 def build_investment_graph() -> StateGraph:
     """
     V4 Graph:
-      START → orchestrator → [4 desks parallel] → barrier → hedge_lite_builder → research_router
+      START → orchestrator → [4 desks parallel] → barrier → hedge_lite_builder → monitoring_router → research_router
         research_router -> risk_manager
         research_router -> research_executor -> [4 desks(parallel,research)] -> research_barrier
-                         -> hedge_lite_builder -> research_router
+                         -> hedge_lite_builder -> monitoring_router -> research_router
       risk_manager -> router -> orchestrator/report_writer
     """
     g = StateGraph(InvestmentState)
@@ -3160,6 +4238,7 @@ def build_investment_graph() -> StateGraph:
     g.add_node("quant_analyst", quant_analyst_node)
     g.add_node("barrier", barrier_node)
     g.add_node("hedge_lite_builder", hedge_lite_builder_node)
+    g.add_node("monitoring_router", monitoring_router_node)
     g.add_node("research_router", research_router_node)
     g.add_node("research_executor", research_executor_node)
     g.add_node("research_barrier", research_barrier_node)
@@ -3181,7 +4260,8 @@ def build_investment_graph() -> StateGraph:
         g.add_edge(desk, "barrier")
 
     g.add_edge("barrier", "hedge_lite_builder")
-    g.add_edge("hedge_lite_builder", "research_router")
+    g.add_edge("hedge_lite_builder", "monitoring_router")
+    g.add_edge("monitoring_router", "research_router")
 
     g.add_conditional_edges("research_router", research_router, {
         "research_executor": "research_executor",

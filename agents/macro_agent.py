@@ -74,6 +74,37 @@ def _build_what_to_watch(axes: dict, indicators: dict) -> list[str]:
     return items[:5]
 
 
+def _coerce_float(value: Any) -> float | None:
+    try:
+        if value is None or value == "":
+            return None
+        return float(value)
+    except (TypeError, ValueError):
+        return None
+
+
+def _days_to_event(as_of: str, date_value: Any) -> int | None:
+    raw = str(date_value or "").strip()
+    if not raw:
+        return None
+    try:
+        event_dt = datetime.fromisoformat(raw.replace("Z", "+00:00"))
+    except ValueError:
+        try:
+            event_dt = datetime.strptime(raw[:10], "%Y-%m-%d").replace(tzinfo=timezone.utc)
+        except ValueError:
+            return None
+    if event_dt.tzinfo is None:
+        event_dt = event_dt.replace(tzinfo=timezone.utc)
+    try:
+        base_dt = datetime.fromisoformat(str(as_of).replace("Z", "+00:00"))
+    except ValueError:
+        base_dt = datetime.now(timezone.utc)
+    if base_dt.tzinfo is None:
+        base_dt = base_dt.replace(tzinfo=timezone.utc)
+    return (event_dt.date() - base_dt.astimezone(timezone.utc).date()).days
+
+
 def _build_scenario_notes(regime: str, ron: dict) -> dict:
     tail = ron.get("tail_risk_warning", False)
 
@@ -548,6 +579,20 @@ def _build_portfolio_implications(
 
     hedge_like = [x for x in targets if x["ticker"] != main_ticker and x["bucket"] in {"duration", "gold", "energy"}]
     preferred_hedges = [x["ticker"] for x in sorted(hedge_like, key=lambda x: x["macro_fit_score"], reverse=True)[:2]]
+    relative_value_views = []
+    ordered = sorted(targets, key=lambda item: item["macro_fit_score"], reverse=True)
+    if len(ordered) >= 2:
+        best = ordered[0]
+        worst = ordered[-1]
+        score_gap = round(best["macro_fit_score"] - worst["macro_fit_score"], 2)
+        if score_gap >= 1.0:
+            relative_value_views.append(
+                {
+                    "pair": f"{best['ticker']} over {worst['ticker']}",
+                    "score_gap": score_gap,
+                    "rationale": "현재 매크로 레짐 기준 bucket 적합도 차이가 큼",
+                }
+            )
 
     return {
         "context": {
@@ -559,11 +604,235 @@ def _build_portfolio_implications(
         },
         "targets": targets,
         "preferred_hedges": preferred_hedges,
+        "relative_value_views": relative_value_views,
         "main_takeaway": (
             "tail-risk 방어 헤지를 유지하며 beta를 관리"
             if ron.get("tail_risk_warning")
             else "거시 레짐과 금리/신용 조건에 맞춰 main exposure와 hedges를 선별"
         ),
+    }
+
+
+def _build_macro_event_calendar(as_of: str, macro_events: Optional[list[dict]]) -> list[dict]:
+    events: list[dict] = []
+    for raw in macro_events or []:
+        if not isinstance(raw, dict):
+            continue
+        days = _days_to_event(as_of, raw.get("date"))
+        if days is not None and days < -3:
+            status = "stale"
+        elif days is not None and days <= 7:
+            status = "imminent"
+        else:
+            status = "upcoming"
+        events.append(
+            {
+                "type": str(raw.get("type", "")).strip().lower() or "macro_event",
+                "subtype": str(raw.get("subtype", "")).strip().lower(),
+                "title": str(raw.get("title", "")).strip(),
+                "date": str(raw.get("date", "")).strip(),
+                "days_to_event": days,
+                "status": status,
+                "source": str(raw.get("source", "")).strip() or "macro_event_calendar",
+                "source_url": str(raw.get("source_url", "")).strip(),
+                "source_classification": str(raw.get("source_classification", "")).strip().lower() or "confirmed",
+                "event_origin": str(raw.get("event_origin", "")).strip() or "macro_event_calendar",
+                "notes": str(raw.get("notes", "")).strip(),
+            }
+        )
+    events.sort(key=lambda item: (10_000 if item.get("days_to_event") is None else int(item["days_to_event"]), item.get("title", "")))
+    return events[:8]
+
+
+def _normalized_pricing_change(indicators: dict) -> tuple[float | None, str]:
+    sofr_change = _coerce_float(indicators.get("sofr_futures_implied_change_6m_bp"))
+    if sofr_change is not None:
+        return sofr_change, "sofr_futures_implied_change_6m_bp"
+    ff_change = _coerce_float(indicators.get("fed_funds_futures_implied_change_6m_bp"))
+    if ff_change is not None:
+        return ff_change, "fed_funds_futures_implied_change_6m_bp"
+    cuts_proxy = _coerce_float(indicators.get("cuts_priced_proxy_2y_ffr_bp"))
+    if cuts_proxy is not None:
+        return -cuts_proxy, "cuts_priced_proxy_2y_ffr_bp_normalized"
+    return None, ""
+
+
+def _build_pricing_divergence(axes: dict, ron: dict, indicators: dict) -> dict:
+    pricing_change, pricing_metric = _normalized_pricing_change(indicators)
+    growth = float(axes.get("growth", {}).get("score", 0) or 0)
+    inflation = float(axes.get("inflation", {}).get("score", 0) or 0)
+    credit = float(axes.get("credit", {}).get("score", 0) or 0)
+    rates = float(axes.get("rates", {}).get("score", 0) or 0)
+
+    expected_bias = 0.0
+    expected_bias += 0.7 if growth >= 1 else (-0.7 if growth <= -1 else 0.0)
+    expected_bias += 0.8 if inflation >= 1 else (-0.3 if inflation <= -1 else 0.0)
+    expected_bias += 0.5 if credit >= 1 else (-0.8 if credit <= -1 else 0.0)
+    expected_bias += 0.3 if ron.get("risk_on_off") == "risk_on" else (-0.4 if ron.get("risk_on_off") == "risk_off" else 0.0)
+    expected_policy_bias = "balanced"
+    if expected_bias >= 0.75:
+        expected_policy_bias = "hawkish"
+    elif expected_bias <= -0.75:
+        expected_policy_bias = "dovish"
+
+    policy_signal = "aligned"
+    policy_gap_bp = pricing_change
+    if pricing_change is not None:
+        if expected_policy_bias == "hawkish" and pricing_change <= -10:
+            policy_signal = "hawkish_surprise_risk"
+        elif expected_policy_bias == "dovish" and pricing_change >= 10:
+            policy_signal = "dovish_surprise_risk"
+
+    hy = _coerce_float(indicators.get("hy_oas"))
+    vix = _coerce_float(indicators.get("vix_level"))
+    if vix is None:
+        vix = _coerce_float(indicators.get("vix_index"))
+    cross_asset_signal = "aligned"
+    if hy is not None and vix is not None:
+        if hy >= 450 and vix <= 18:
+            cross_asset_signal = "vol_complacency"
+        elif hy <= 300 and vix >= 28:
+            cross_asset_signal = "panic_vs_credit"
+
+    oil = _coerce_float(indicators.get("wti_spot"))
+    if oil is None:
+        oil = _coerce_float(indicators.get("wti_front_month"))
+    inflation_signal = "aligned"
+    if oil is not None and oil >= 80 and inflation >= 1 and pricing_change is not None and pricing_change <= -10:
+        inflation_signal = "inflation_repricing_risk"
+
+    overall_signal = "aligned"
+    if policy_signal != "aligned":
+        overall_signal = policy_signal
+    elif cross_asset_signal != "aligned":
+        overall_signal = cross_asset_signal
+    elif inflation_signal != "aligned":
+        overall_signal = inflation_signal
+
+    severity = 0.0
+    if overall_signal != "aligned" and policy_gap_bp is not None:
+        severity = min(abs(policy_gap_bp) / 50.0, 1.0)
+    elif overall_signal != "aligned":
+        severity = 0.5
+
+    return {
+        "overall_signal": overall_signal,
+        "severity": round(severity, 4),
+        "policy_path": {
+            "expected_policy_bias": expected_policy_bias,
+            "pricing_metric": pricing_metric,
+            "normalized_pricing_change_6m_bp": policy_gap_bp,
+            "signal": policy_signal,
+            "readthrough": "macro state와 선물/OIS pricing이 어긋나면 듀레이션·성장주 재가격 위험이 커진다",
+        },
+        "cross_asset_consistency": {
+            "signal": cross_asset_signal,
+            "hy_oas": hy,
+            "vix_level": vix,
+            "readthrough": "신용과 변동성이 엇갈리면 risk-on/off 해석을 한 단계 보수적으로 봐야 한다",
+        },
+        "commodity_inflation": {
+            "signal": inflation_signal,
+            "oil_proxy": oil,
+            "inflation_score": inflation,
+            "readthrough": "원유 상승 + easing pricing 동시 발생 시 인플레 재가격 위험이 커질 수 있다",
+        },
+    }
+
+
+def _scenario_probability_map(ron: dict, divergence: dict) -> dict[str, float]:
+    if ron.get("tail_risk_warning"):
+        bull, base, bear = 0.15, 0.45, 0.40
+    elif ron.get("risk_on_off") == "risk_on":
+        bull, base, bear = 0.30, 0.50, 0.20
+    elif ron.get("risk_on_off") == "risk_off":
+        bull, base, bear = 0.15, 0.40, 0.45
+    else:
+        bull, base, bear = 0.20, 0.55, 0.25
+    signal = str((divergence or {}).get("overall_signal", "")).strip().lower()
+    if signal == "hawkish_surprise_risk":
+        bull, base, bear = max(0.10, bull - 0.05), base, min(0.55, bear + 0.05)
+    elif signal == "dovish_surprise_risk":
+        bull, base, bear = min(0.35, bull + 0.05), base, max(0.15, bear - 0.05)
+    total = bull + base + bear
+    return {
+        "bull": round(bull / total, 4),
+        "base": round(base / total, 4),
+        "bear": round(bear / total, 4),
+    }
+
+
+def _bucket_scenario_adjustment(bucket: str, scenario: str) -> float:
+    if scenario == "bull":
+        return {
+            "growth_equity": 1.25,
+            "broad_equity": 0.9,
+            "single_name_equity": 0.85,
+            "duration": -0.8,
+            "gold": -0.2,
+            "energy": 0.6,
+        }.get(bucket, 0.0)
+    if scenario == "bear":
+        return {
+            "growth_equity": -1.4,
+            "broad_equity": -1.1,
+            "single_name_equity": -1.0,
+            "duration": 1.1,
+            "gold": 0.9,
+            "energy": -0.2,
+        }.get(bucket, 0.0)
+    return 0.0
+
+
+def _build_scenario_stress_grid(
+    ticker: str,
+    axes: dict,
+    ron: dict,
+    state: Optional[dict],
+    divergence: dict,
+) -> dict:
+    universe = _resolve_macro_universe(ticker, state)
+    probabilities = _scenario_probability_map(ron, divergence)
+    scenarios: list[dict] = []
+    base_signal = str(divergence.get("overall_signal", "")).strip().lower()
+    descriptions = {
+        "bull": "성장 유지 + 신용 안정 + pricing이 우호적으로 해소되는 경로",
+        "base": "현재 레짐 유지. 지표와 pricing이 큰 충돌 없이 점진적으로 수렴하는 경로",
+        "bear": "credit/vol/oil 또는 policy surprise로 risk budget을 줄여야 하는 경로",
+    }
+    actions = {
+        "bull": "beta와 성장 익스포저를 유지/확대",
+        "base": "main exposure 유지, hedge는 선택적 유지",
+        "bear": "gross/net 축소, duration·gold 헤지 우선",
+    }
+    for scenario in ("bull", "base", "bear"):
+        asset_impacts = []
+        for candidate in universe:
+            bucket = _ticker_macro_bucket(candidate, state)
+            base_score = _portfolio_score_for_bucket(bucket, axes, ron)
+            score = round(base_score + _bucket_scenario_adjustment(bucket, scenario), 2)
+            asset_impacts.append(
+                {
+                    "ticker": candidate,
+                    "bucket": bucket,
+                    "scenario_score": score,
+                    "stance": _stance_from_score(score),
+                }
+            )
+        scenarios.append(
+            {
+                "name": scenario,
+                "probability": probabilities[scenario],
+                "description": descriptions[scenario],
+                "trigger": base_signal if scenario == "bear" and base_signal != "aligned" else "regime_continuation",
+                "portfolio_action": actions[scenario],
+                "asset_impacts": asset_impacts,
+            }
+        )
+    return {
+        "status": "ok",
+        "base_case": "base",
+        "scenarios": scenarios,
     }
 
 
@@ -824,6 +1093,7 @@ def macro_analyst_run(
     source_name: str = "mock",
     focus_areas: Optional[list[str]] = None,
     state: Optional[dict] = None,
+    macro_events: Optional[list[dict]] = None,
 ) -> dict:
     """
     Macro Analyst v2: engine compute → 5축/risk_on_off → key_drivers/what_to_watch/scenario_notes.
@@ -837,6 +1107,7 @@ def macro_analyst_run(
     overlay = compute_overlay_guidance(features)
     axes = compute_macro_axes(macro_indicators)
     ron = compute_risk_on_off(axes, macro_indicators)
+    pricing_divergence = _build_pricing_divergence(axes, ron, macro_indicators)
 
     regime = features["macro_regime"]
     tail_risk = ron["tail_risk_warning"]
@@ -950,6 +1221,18 @@ def macro_analyst_run(
         primary_decision = "neutral"
         recommendation = "allow_with_limits"
         confidence = 0.55
+    divergence_signal = str(pricing_divergence.get("overall_signal", "")).strip().lower()
+    if divergence_signal == "hawkish_surprise_risk" and primary_decision == "bullish":
+        primary_decision = "neutral"
+        recommendation = "allow_with_limits"
+        confidence = min(confidence, 0.55)
+    elif divergence_signal == "vol_complacency":
+        recommendation = "allow_with_limits"
+        confidence = min(confidence, 0.55)
+    elif divergence_signal == "dovish_surprise_risk" and primary_decision == "bearish":
+        primary_decision = "neutral"
+        recommendation = "allow_with_limits"
+        confidence = min(confidence, 0.55)
 
     # ── Data quality ──────────────────────────────────────────────────
     keyed = {k for k in ["yield_curve_spread", "hy_oas", "gdp_growth", "pmi"] if macro_indicators.get(k) is not None}
@@ -974,7 +1257,28 @@ def macro_analyst_run(
     transmission_map = _build_transmission_map(axes, ron, macro_indicators, focus_areas, state)
     portfolio_implications = _build_portfolio_implications(ticker, axes, ron, state)
     portfolio_implications["context"]["macro_regime"] = map_macro_regime_to_canonical(regime)
+    macro_event_calendar = _build_macro_event_calendar(as_of, macro_events)
     monitoring_triggers = _build_monitoring_triggers(axes, macro_indicators, focus_areas, state)
+    scenario_stress_grid = _build_scenario_stress_grid(ticker, axes, ron, state, pricing_divergence)
+    if divergence_signal != "aligned":
+        key_drivers = (
+            key_drivers
+            + [
+                f"Pricing divergence: {divergence_signal}",
+            ]
+        )[:6]
+        what_to_watch = (
+            what_to_watch
+            + [
+                "선물/OIS pricing과 실제 매크로 축이 재정렬되는지 확인",
+            ]
+        )[:5]
+    if macro_event_calendar:
+        next_event = macro_event_calendar[0]
+        title = str(next_event.get("title", "")).strip()
+        days = next_event.get("days_to_event")
+        key_drivers = (key_drivers + [f"Next macro event: {title} (D{days:+d})" if isinstance(days, int) else f"Next macro event: {title}"])[:6]
+        what_to_watch = (what_to_watch + [f"공식 일정: {title}"])[:5]
     if evidence_digest:
         title = str(evidence_digest[0].get("title", "external evidence")).strip()[:90]
         kinds = sorted({str(item.get("kind", "")).strip() for item in evidence_digest if item.get("kind")})
@@ -1077,7 +1381,10 @@ def macro_analyst_run(
         "scenario_notes": scenario_notes,
         "evidence_digest": evidence_digest,
         "transmission_map": transmission_map,
+        "pricing_divergence": pricing_divergence,
         "portfolio_implications": portfolio_implications,
+        "scenario_stress_grid": scenario_stress_grid,
+        "macro_event_calendar": macro_event_calendar,
         "monitoring_triggers": monitoring_triggers,
         "open_questions": open_questions,
         "decision_sensitivity": decision_sensitivity,

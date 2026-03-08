@@ -396,6 +396,14 @@ class InvestmentState(TypedDict, total=False):
     hedge_lite: dict             # B 모드 hedge lite 분석 산출물
     positions_proposed: dict     # Allocator 출력: {ticker -> weight}
     positions_final: dict        # Risk 최종 확정: {ticker -> weight}
+    active_ideas: dict           # Orchestrator snapshot: {ticker -> idea status/meta}
+    portfolio_memory: dict       # Persistent thesis/position memory across runs
+    monitoring_backlog: list     # Open review/monitoring tasks derived by orchestrator
+    book_allocation_plan: dict   # Book-level pre-allocation plan from orchestrator
+    capital_competition: list    # Ranked capital competition rows across current/new ideas
+    event_calendar: list         # First-class normalized event/trigger calendar across desks
+    monitoring_actions: dict     # Monitoring/escalation router output
+    decision_quality_scorecard: dict  # Desk/source quality snapshot for rerun prioritization
 
     # Legacy
     user_request: str
@@ -476,6 +484,14 @@ def create_initial_state(
         hedge_lite={},
         positions_proposed={},
         positions_final={},
+        active_ideas={},
+        portfolio_memory={},
+        monitoring_backlog=[],
+        book_allocation_plan={},
+        capital_competition=[],
+        event_calendar=[],
+        monitoring_actions={},
+        decision_quality_scorecard={},
         user_request=user_request,
         target_ticker="",
         analysis_tasks=[],

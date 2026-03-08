@@ -14,6 +14,27 @@ from __future__ import annotations
 from typing import Any, Dict, List, Optional
 
 
+def _safe_float(value: Any) -> Optional[float]:
+    try:
+        if value in (None, ""):
+            return None
+        return float(value)
+    except (TypeError, ValueError):
+        return None
+
+
+def _normalize_events(upcoming_events: list) -> list[dict]:
+    normalized: list[dict] = []
+    for raw in upcoming_events or []:
+        if isinstance(raw, dict):
+            normalized.append(raw)
+            continue
+        if raw is None:
+            continue
+        normalized.append({"type": str(raw).strip(), "status": "upcoming"})
+    return normalized
+
+
 def compute_sentiment_features(indicators: dict) -> dict:
     """
     감성/포지셔닝/변동성 지표에서 state bucket + tilt factor를 파생.
@@ -34,17 +55,47 @@ def compute_sentiment_features(indicators: dict) -> dict:
             "crypto_oi_pct_change_24h": float (optional),
         }
     """
-    pcr = indicators.get("put_call_ratio")
+    pcr = indicators.get("put_call_oi_ratio")
+    pcr_source = "put_call_oi_ratio"
+    if pcr is None:
+        pcr = indicators.get("put_call_ratio")
+        pcr_source = "put_call_ratio"
+    if pcr is None:
+        pcr = indicators.get("put_call_volume_ratio")
+        pcr_source = "put_call_volume_ratio"
     pcr_pct = indicators.get("pcr_percentile_90d")
-    vix = indicators.get("vix_level")
-    vix_term = indicators.get("vix_term_structure", "contango")
-    skew = indicators.get("skew_index")
-    si_pct = indicators.get("short_interest_pct")
+    vix = _safe_float(indicators.get("vix_level"))
+    vvix = _safe_float(indicators.get("vvix_level"))
+    vix_term = str(indicators.get("vix_term_structure", "contango") or "contango").strip().lower()
+    skew = _safe_float(indicators.get("skew_index"))
+    si_pct = _safe_float(indicators.get("short_interest_pct"))
+    si_change = _safe_float(indicators.get("short_interest_change_pct"))
+    held_inst = _safe_float(
+        indicators.get("held_percent_institutions", indicators.get("institutions_percent_held"))
+    )
+    ownership_crowding = str(
+        indicators.get("ownership_crowding_risk", indicators.get("crowding_risk", "normal"))
+    ).strip().lower()
     insider = indicators.get("insider_net_activity", "neutral")
-    news_score = indicators.get("news_sentiment_score")
-    events = indicators.get("upcoming_events", [])
+    news_score = _safe_float(indicators.get("news_sentiment_score"))
+    events = _normalize_events(indicators.get("upcoming_events", []))
     funding = indicators.get("crypto_funding_rate")
     oi_change = indicators.get("crypto_oi_pct_change_24h")
+    confirmed_event_count = 0
+    imminent_event_count = 0
+    for event in events:
+        confirmed = bool(event.get("confirmed")) or str(event.get("source_classification", "")).strip().lower() == "confirmed"
+        status = str(event.get("status", "")).strip().lower()
+        days = event.get("days_to_event")
+        try:
+            days_i = int(days) if days is not None else None
+        except (TypeError, ValueError):
+            days_i = None
+        imminent = status in {"imminent", "triggered"} or (days_i is not None and 0 <= days_i <= 7)
+        if confirmed:
+            confirmed_event_count += 1
+        if imminent:
+            imminent_event_count += 1
 
     # ── PCR State ─────────────────────────────────────────────────────
     if pcr_pct is not None:
@@ -74,9 +125,9 @@ def compute_sentiment_features(indicators: dict) -> dict:
 
     # ── VIX / Volatility Regime ───────────────────────────────────────
     if vix is not None:
-        if vix > 35:
+        if vix > 35 or (vix_term == "backwardation" and (vvix or 0.0) >= 110):
             vol_regime = "crisis"
-        elif vix > 25:
+        elif vix > 25 or vix_term == "backwardation" or (vvix or 0.0) >= 95:
             vol_regime = "high"
         elif vix > 15:
             vol_regime = "normal"
@@ -100,28 +151,35 @@ def compute_sentiment_features(indicators: dict) -> dict:
 
     # ── Positioning / Crowding ────────────────────────────────────────
     if si_pct is not None:
-        if si_pct > 20:
+        if si_pct > 12 or (si_change is not None and si_change > 15):
             positioning = "short_crowded"
-        elif si_pct > 10:
+        elif ownership_crowding in {"high", "elevated"} or (held_inst is not None and held_inst >= 75):
+            positioning = "long_crowded"
+        elif si_pct > 6:
             positioning = "balanced"
         else:
             positioning = "long_crowded"
     else:
-        positioning = "balanced"
+        if ownership_crowding in {"high", "elevated"} or (held_inst is not None and held_inst >= 75):
+            positioning = "long_crowded"
+        else:
+            positioning = "balanced"
 
     # ── Sentiment Regime (종합) ───────────────────────────────────────
     fear_signals = sum([
         pcr_state in ("extreme_fear", "fear"),
-        vol_regime in ("crisis", "high"),
+        vol_regime in ("crisis", "high") or vix_term == "backwardation",
         news_score is not None and news_score < -0.3,
+        imminent_event_count > 0,
     ])
     greed_signals = sum([
         pcr_state in ("extreme_greed", "greed"),
-        vol_regime == "low",
+        vol_regime == "low" and vix_term != "backwardation",
         news_score is not None and news_score > 0.3,
+        vix_term == "contango" and (vvix or 999.0) < 90,
     ])
 
-    if fear_signals >= 2:
+    if fear_signals >= 3:
         sentiment_regime = "panic" if vol_regime == "crisis" else "fear"
     elif greed_signals >= 2:
         sentiment_regime = "euphoria" if pcr_state == "extreme_greed" else "greed"
@@ -129,9 +187,7 @@ def compute_sentiment_features(indicators: dict) -> dict:
         sentiment_regime = "neutral"
 
     # ── Event Risk ────────────────────────────────────────────────────
-    event_risk_flag = len(events) > 0 and any(
-        kw in str(events).lower() for kw in ["earnings", "fomc", "cpi", "nonfarm"]
-    )
+    event_risk_flag = imminent_event_count > 0 or confirmed_event_count > 0
 
     # ── Crypto Signals (optional) ─────────────────────────────────────
     if funding is not None:
@@ -167,7 +223,10 @@ def compute_sentiment_features(indicators: dict) -> dict:
 
     # Event risk → dampen
     if event_risk_flag:
-        tilt -= 0.05
+        if tilt > 1.0:
+            tilt -= 0.10
+        elif tilt < 1.0:
+            tilt += 0.05
 
     # Vol crisis → cap long tilt to 0.9
     if vol_regime in ("crisis", "high") and tilt > 0.9:
@@ -181,12 +240,17 @@ def compute_sentiment_features(indicators: dict) -> dict:
         "volatility_regime": vol_regime,
         "skew_state": skew_state,
         "positioning_crowding": positioning,
+        "ownership_crowding": ownership_crowding,
         "sentiment_regime": sentiment_regime,
         "event_risk_flag": event_risk_flag,
+        "confirmed_event_count": confirmed_event_count,
+        "imminent_event_count": imminent_event_count,
         "funding_state": funding_state,
         "oi_shock": oi_shock,
         "base_tilt_factor": tilt,
         "insider_activity": insider,
+        "pcr_source": pcr_source,
+        "vix_term_structure_state": vix_term or "unknown",
     }
 
 
@@ -316,10 +380,12 @@ def compute_sentiment_velocity(score_series: list) -> dict:
 
 _CATALYST_TYPES: dict[str, list[str]] = {
     "earnings":     ["earnings", "실적", "eps", "어닝"],
-    "regulatory":   ["regulatory", "sec", "doj", "규제", "조사", "investigation"],
+    "regulatory":   ["regulatory", "doj", "규제", "조사", "investigation", "lawsuit", "legal_reg"],
     "m&a_rumor":    ["merger", "acquisition", "buyout", "인수", "합병"],
-    "product":      ["launch", "release", "제품", "발표"],
+    "product":      ["launch", "release", "제품", "발표", "product_cycle", "investor_day"],
     "macro_event":  ["fomc", "cpi", "nonfarm", "gdp", "금리", "연준", "fed"],
+    "pricing_reset": ["pricing", "price increase", "discount", "pricing_reset"],
+    "contract_renewal": ["contract", "renewal", "material agreement", "1.01", "1.02"],
 }
 
 
@@ -330,20 +396,54 @@ def detect_catalyst_risk(
 ) -> dict:
     """이벤트 타입 + 위험도: high = macro_event/regulatory OR z>2."""
     detected: list[str] = []
-    for ev in upcoming_events:
-        ev_str = str(ev).lower()
+    confirmed_events: list[dict] = []
+    confirmed_count = 0
+    imminent_count = 0
+    for ev in _normalize_events(upcoming_events):
+        ev_str = " ".join(
+            [
+                str(ev.get("type", "")).lower(),
+                str(ev.get("subtype", "")).lower(),
+                str(ev.get("title", "")).lower(),
+                str(ev.get("notes", "")).lower(),
+            ]
+        )
         for cat, kws in _CATALYST_TYPES.items():
             if any(kw in ev_str for kw in kws) and cat not in detected:
                 detected.append(cat)
+        confirmed = bool(ev.get("confirmed")) or str(ev.get("source_classification", "")).strip().lower() == "confirmed"
+        status = str(ev.get("status", "")).strip().lower()
+        days = ev.get("days_to_event")
+        try:
+            days_i = int(days) if days is not None else None
+        except (TypeError, ValueError):
+            days_i = None
+        imminent = status in {"imminent", "triggered"} or (days_i is not None and 0 <= days_i <= event_window_days)
+        if confirmed:
+            confirmed_count += 1
+            confirmed_events.append(
+                {
+                    "type": str(ev.get("type", "")).strip().lower() or "event",
+                    "subtype": str(ev.get("subtype", "")).strip() or str(ev.get("title", "")).strip(),
+                    "date": str(ev.get("date", "")).strip(),
+                    "days_to_event": days_i,
+                    "source": str(ev.get("source", "")).strip() or "event_calendar",
+                    "status": status or ("imminent" if imminent else "upcoming"),
+                }
+            )
+        if imminent:
+            imminent_count += 1
 
     present = bool(detected)
     if not present:
         level = "low"
-    elif any(c in detected for c in ("macro_event", "regulatory")):
+    elif imminent_count > 0 and confirmed_count > 0:
+        level = "high"
+    elif any(c in detected for c in ("macro_event", "regulatory", "earnings", "pricing_reset")):
         level = "high"
     elif (news_volume_z is not None and news_volume_z > 2.0) or len(detected) >= 2:
         level = "high"
-    elif news_volume_z is not None and news_volume_z > 1.0:
+    elif news_volume_z is not None and news_volume_z > 1.0 or confirmed_count > 0:
         level = "medium"
     else:
         level = "low"
@@ -353,6 +453,9 @@ def detect_catalyst_risk(
         "catalyst_type":       detected,
         "event_window_days":   event_window_days,
         "catalyst_risk_level": level,
+        "confirmed_count":     confirmed_count,
+        "imminent_count":      imminent_count,
+        "confirmed_events":    confirmed_events[:6],
     }
 
 
@@ -390,8 +493,23 @@ def infer_vol_regime(state: dict, sentiment_inputs: dict) -> dict:
     if ron_val == "risk_off":
         return {"vol_regime": "high",   "source": "macro_risk_off",   "value": None}
 
-    # Priority 3: VIX
-    vix = sentiment_inputs.get("vix_level")
+    # Priority 3: VIX complex / term structure
+    vix = _safe_float(sentiment_inputs.get("vix_level"))
+    vvix = _safe_float(sentiment_inputs.get("vvix_level"))
+    skew = _safe_float(sentiment_inputs.get("skew_index"))
+    term = str(sentiment_inputs.get("vix_term_structure", "")).strip().lower()
+    if term == "backwardation" and ((vix or 0.0) >= 24 or (vvix or 0.0) >= 95):
+        return {
+            "vol_regime": "crisis" if (vix or 0.0) >= 30 or (vvix or 0.0) >= 110 else "high",
+            "source": "vix_term_structure",
+            "value": {"vix": vix, "vvix": vvix, "term": term},
+        }
+    if vvix is not None and vix is not None and vvix >= 105 and vix >= 20:
+        return {"vol_regime": "high", "source": "vvix+vix", "value": {"vix": vix, "vvix": vvix}}
+    if skew is not None and vix is not None and skew >= 145 and vix >= 20:
+        return {"vol_regime": "high", "source": "skew+vix", "value": {"vix": vix, "skew": skew}}
+
+    # Priority 4: VIX
     if vix is not None:
         try:
             vf   = float(vix)
@@ -400,6 +518,6 @@ def infer_vol_regime(state: dict, sentiment_inputs: dict) -> dict:
         except (TypeError, ValueError):
             pass
 
-    # Priority 4: fallback
+    # Priority 5: fallback
     warnings.append("vol_regime_unknown")
     return {"vol_regime": "normal", "source": "default_fallback", "value": None, "warnings": warnings}
