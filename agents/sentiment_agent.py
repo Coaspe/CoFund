@@ -302,6 +302,9 @@ _SENTI_EVIDENCE_KINDS = {
     "ownership_identity",
 }
 _PATCHABLE_FIELDS = {
+    "primary_decision",
+    "recommendation",
+    "confidence",
     "key_drivers",
     "what_to_watch",
     "scenario_notes",
@@ -451,8 +454,12 @@ def _apply_overlay_patch(output: dict, patch: dict) -> None:
     if not isinstance(patch, dict):
         return
     for key in _PATCHABLE_FIELDS:
-        if key in patch and patch[key]:
-            output[key] = patch[key]
+        if key not in patch:
+            continue
+        value = patch.get(key)
+        if value in (None, "", [], {}):
+            continue
+        output[key] = value
     if patch.get("evidence_requests"):
         output["evidence_requests"] = _merge_requests(
             output.get("evidence_requests", []),
@@ -531,13 +538,13 @@ def _generate_evidence_requests(
                 },
                 {
                     "desk": "sentiment",
-                    "kind": "web_search",
+                    "kind": "press_release_or_ir",
                     "ticker": ticker,
-                    "query": f"{ticker} ETF flow creation redemption options put call skew",
+                    "query": f"{ticker} investor relations press release latest catalyst update",
                     "priority": 2,
                     "recency_days": 14,
                     "max_items": 4,
-                    "rationale": "no_articles_provided -> fallback to flow/options data",
+                    "rationale": "no_articles_provided -> fallback to official issuer updates",
                 },
             ]
         )

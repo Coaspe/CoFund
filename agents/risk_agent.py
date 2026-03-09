@@ -93,6 +93,26 @@ def _normalize_ticker_list(value: Any) -> list[str]:
     return out
 
 
+def _normalize_weight_map(value: Any) -> dict[str, float]:
+    out: dict[str, float] = {}
+    if not isinstance(value, dict):
+        return out
+    for ticker, weight in value.items():
+        try:
+            wt = float(weight)
+        except (TypeError, ValueError):
+            continue
+        if np.isnan(wt) or np.isinf(wt):
+            continue
+        key = str(ticker or "").strip().upper()
+        if key:
+            out[key] = wt
+    total = float(sum(max(0.0, abs(v)) for v in out.values()))
+    if total > 1e-12:
+        out = {t: float(v) / total for t, v in out.items()}
+    return out
+
+
 def _coerce_float(value: Any) -> Optional[float]:
     try:
         if value is None or value == "":
@@ -1407,21 +1427,13 @@ def risk_manager_node(state: InvestmentState) -> dict:
     signed_weight = compute_signed_weight(quant_decision, raw_alloc)
 
     raw_proposed = state.get("positions_proposed", {})
-    positions_proposed: dict[str, float] = {}
-    if isinstance(raw_proposed, dict):
-        for t, w in raw_proposed.items():
-            try:
-                wt = float(w)
-            except (TypeError, ValueError):
-                continue
-            if np.isnan(wt) or np.isinf(wt):
-                continue
-            positions_proposed[str(t).strip().upper()] = wt
-
-    if positions_proposed:
-        total = float(sum(max(0.0, abs(v)) for v in positions_proposed.values()))
-        if total > 1e-12:
-            positions_proposed = {t: float(v) / total for t, v in positions_proposed.items()}
+    positions_proposed = _normalize_weight_map(raw_proposed)
+    frontdoor = state.get("question_understanding", {}) if isinstance(state.get("question_understanding"), dict) else {}
+    frontdoor_intent = str(frontdoor.get("intent", "")).strip().lower()
+    normalized_snapshot = state.get("normalized_portfolio_snapshot", {}) if isinstance(state.get("normalized_portfolio_snapshot"), dict) else {}
+    snapshot_weights = _normalize_weight_map(normalized_snapshot.get("weights", {}))
+    if not positions_proposed and frontdoor_intent == "position_review" and snapshot_weights:
+        positions_proposed = snapshot_weights
 
     def _sector_for_ticker(t: str) -> str:
         tt = str(t).strip().upper()
@@ -1505,6 +1517,7 @@ def risk_manager_node(state: InvestmentState) -> dict:
     payload["event_calendar"] = state.get("event_calendar", []) or []
     payload["monitoring_actions"] = state.get("monitoring_actions", {}) or {}
     payload["decision_quality_scorecard"] = state.get("decision_quality_scorecard", {}) or {}
+    payload["portfolio_construction_analysis"] = state.get("portfolio_construction_analysis", {}) or {}
 
     print("   [LLM] 5-Gate CRO 의사결정 요청 중...")
     decision = _call_llm(payload)

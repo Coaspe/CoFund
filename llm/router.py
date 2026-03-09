@@ -9,6 +9,7 @@ llm/router.py — Multi-Provider LLM Router (bounded concurrency)
   - Cerebras rate-limit fallback: qwen-3-235B-A22B-2507
   - Agent-level override: <AGENT>_MODEL (기존 동작 유지)
   - Global concurrent LLM invokes: 기본 1개 (초과 시 대기 + 콘솔 로그)
+  - gpt-oss 예산 보호: 기본 30 RPM / 64,000 TPM
   - Rate limit 감지 시 콘솔 로그 + fallback 시도
   - pytest 실행 중에는 기본적으로 캐시를 비활성화하여 실호출을 강제
 """
@@ -135,6 +136,11 @@ _LLM_MIN_REQUEST_INTERVAL_SEC = max(0.0, _llm_min_request_interval_sec())
 _LLM_REQUEST_GUARD_LOCK = threading.Lock()
 _LLM_LAST_REQUEST_TS = 0.0
 _CEREBRAS_RL_FALLBACK_MODEL = "qwen-3-235B-A22B-2507"
+_GPT_OSS_WINDOW_SEC = 60.0
+_GPT_OSS_MAX_REQUESTS_PER_MIN = max(1, _safe_int_env("GPT_OSS_MAX_REQUESTS_PER_MIN", 30))
+_GPT_OSS_MAX_TOKENS_PER_MIN = max(1, _safe_int_env("GPT_OSS_MAX_TOKENS_PER_MIN", 64_000))
+_MODEL_BUDGET_LOCK = threading.Lock()
+_MODEL_BUDGET_HISTORY: dict[str, list[tuple[float, int]]] = {}
 
 
 # ── Agent config ──────────────────────────────────────────────────────────────
@@ -414,6 +420,91 @@ def _provider_label(config: dict[str, Any]) -> str:
     return f"{provider}:{model}"
 
 
+def _model_budget_bucket(label: str) -> str:
+    _, _, model = str(label or "").partition(":")
+    model_name = (model or label or "").strip().lower()
+    if model_name.startswith("gpt-oss"):
+        return "gpt-oss"
+    return ""
+
+
+def _estimate_request_tokens(args: tuple[Any, ...], kwargs: dict[str, Any], backend: Any) -> int:
+    prompt_chars = 0
+    for arg in args:
+        prompt_chars += len(_to_trace_text(arg))
+    if kwargs:
+        prompt_chars += len(_to_trace_text(kwargs))
+    prompt_tokens = max(1, (prompt_chars + 3) // 4)
+    max_output_tokens = getattr(backend, "max_tokens", None)
+    if max_output_tokens is None:
+        max_output_tokens = getattr(backend, "max_output_tokens", None)
+    try:
+        output_reserve = max(0, int(max_output_tokens or 0))
+    except (TypeError, ValueError):
+        output_reserve = 0
+    return max(1, prompt_tokens + output_reserve)
+
+
+def _prune_budget_history(now: float, history: list[tuple[float, int]]) -> list[tuple[float, int]]:
+    cutoff = now - _GPT_OSS_WINDOW_SEC
+    return [(ts, tokens) for ts, tokens in history if ts > cutoff]
+
+
+def _request_budget_wait_sec(now: float, history: list[tuple[float, int]], max_requests: int) -> float:
+    current = len(history)
+    if current + 1 <= max_requests:
+        return 0.0
+    idx = max(0, current - max_requests)
+    return max(0.0, _GPT_OSS_WINDOW_SEC - (now - history[idx][0]))
+
+
+def _token_budget_wait_sec(now: float, history: list[tuple[float, int]], reserve_tokens: int, max_tokens: int) -> float:
+    used = int(sum(tokens for _, tokens in history))
+    if used + reserve_tokens <= max_tokens:
+        return 0.0
+    released = 0
+    needed = used + reserve_tokens - max_tokens
+    for ts, tokens in history:
+        released += int(tokens)
+        if released >= needed:
+            return max(0.0, _GPT_OSS_WINDOW_SEC - (now - ts))
+    return max(0.0, _GPT_OSS_WINDOW_SEC - (now - history[0][0])) if history else 0.0
+
+
+def _apply_model_budget_guard(agent_name: str, label: str, backend: Any, args: tuple[Any, ...], kwargs: dict[str, Any]) -> None:
+    bucket = _model_budget_bucket(label)
+    if bucket != "gpt-oss":
+        return
+
+    reserve_tokens = _estimate_request_tokens(args, kwargs, backend)
+    if reserve_tokens > _GPT_OSS_MAX_TOKENS_PER_MIN:
+        print(
+            f"   [LLM Router] {agent_name}: 요청 추정 토큰 {reserve_tokens}가 "
+            f"gpt-oss TPM 한도({_GPT_OSS_MAX_TOKENS_PER_MIN})를 초과합니다. ({label})",
+            flush=True,
+        )
+
+    while True:
+        with _MODEL_BUDGET_LOCK:
+            now = time.monotonic()
+            history = _prune_budget_history(now, _MODEL_BUDGET_HISTORY.get(bucket, []))
+            wait_req = _request_budget_wait_sec(now, history, _GPT_OSS_MAX_REQUESTS_PER_MIN)
+            wait_tok = _token_budget_wait_sec(now, history, reserve_tokens, _GPT_OSS_MAX_TOKENS_PER_MIN)
+            wait_sec = max(wait_req, wait_tok)
+            if wait_sec <= 0:
+                history.append((now, reserve_tokens))
+                _MODEL_BUDGET_HISTORY[bucket] = history
+                return
+            _MODEL_BUDGET_HISTORY[bucket] = history
+
+        print(
+            f"   [LLM Router] {agent_name}: gpt-oss 예산 대기 {wait_sec:.2f}초 "
+            f"(reserve={reserve_tokens}, {label})",
+            flush=True,
+        )
+        time.sleep(wait_sec)
+
+
 def _apply_llm_request_interval_guard(agent_name: str, label: str) -> None:
     global _LLM_LAST_REQUEST_TS
     if _LLM_MIN_REQUEST_INTERVAL_SEC <= 0:
@@ -538,6 +629,7 @@ class _BoundedLLMProxy:
                     continue
                 zai_rl_retry = 0
                 while True:
+                    _apply_model_budget_guard(self._agent_name, label, backend, args, kwargs)
                     _apply_llm_request_interval_guard(self._agent_name, label)
                     _llm_trace(self._agent_name, f"{method_name} 시도 -> {label}")
                     if _llm_trace_enabled():

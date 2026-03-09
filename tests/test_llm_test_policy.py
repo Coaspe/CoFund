@@ -167,6 +167,90 @@ def test_llm_router_logs_provider_label_on_api_call(capfd):
     assert "[LLM Router] orchestrator: API 호출 (zai:glm-4.7-flash)" in out
 
 
+def test_gpt_oss_budget_guard_waits_for_rpm_window(monkeypatch):
+    from llm import router
+
+    class _Backend:
+        max_tokens = 100
+
+    old_history = {k: list(v) for k, v in router._MODEL_BUDGET_HISTORY.items()}
+    old_rpm = router._GPT_OSS_MAX_REQUESTS_PER_MIN
+    old_tpm = router._GPT_OSS_MAX_TOKENS_PER_MIN
+    now = {"value": 20.0}
+    sleeps: list[float] = []
+
+    def _fake_monotonic():
+        return now["value"]
+
+    def _fake_sleep(sec: float):
+        sleeps.append(sec)
+        now["value"] += sec
+
+    monkeypatch.setattr(router.time, "monotonic", _fake_monotonic)
+    monkeypatch.setattr(router.time, "sleep", _fake_sleep)
+    router._MODEL_BUDGET_HISTORY.clear()
+    router._MODEL_BUDGET_HISTORY["gpt-oss"] = [(0.0, 1000), (10.0, 1000)]
+    router._GPT_OSS_MAX_REQUESTS_PER_MIN = 2
+    router._GPT_OSS_MAX_TOKENS_PER_MIN = 100_000
+    try:
+        router._apply_model_budget_guard(
+            "orchestrator",
+            "cerebras:gpt-oss-120b",
+            _Backend(),
+            ("ping",),
+            {},
+        )
+        assert sleeps == [40.0]
+        assert router._MODEL_BUDGET_HISTORY["gpt-oss"][-1][0] == 60.0
+    finally:
+        router._MODEL_BUDGET_HISTORY.clear()
+        router._MODEL_BUDGET_HISTORY.update(old_history)
+        router._GPT_OSS_MAX_REQUESTS_PER_MIN = old_rpm
+        router._GPT_OSS_MAX_TOKENS_PER_MIN = old_tpm
+
+
+def test_gpt_oss_budget_guard_waits_for_tpm_window(monkeypatch):
+    from llm import router
+
+    class _Backend:
+        max_tokens = 1000
+
+    old_history = {k: list(v) for k, v in router._MODEL_BUDGET_HISTORY.items()}
+    old_rpm = router._GPT_OSS_MAX_REQUESTS_PER_MIN
+    old_tpm = router._GPT_OSS_MAX_TOKENS_PER_MIN
+    now = {"value": 10.0}
+    sleeps: list[float] = []
+
+    def _fake_monotonic():
+        return now["value"]
+
+    def _fake_sleep(sec: float):
+        sleeps.append(sec)
+        now["value"] += sec
+
+    monkeypatch.setattr(router.time, "monotonic", _fake_monotonic)
+    monkeypatch.setattr(router.time, "sleep", _fake_sleep)
+    router._MODEL_BUDGET_HISTORY.clear()
+    router._MODEL_BUDGET_HISTORY["gpt-oss"] = [(0.0, 63_500)]
+    router._GPT_OSS_MAX_REQUESTS_PER_MIN = 30
+    router._GPT_OSS_MAX_TOKENS_PER_MIN = 64_000
+    try:
+        router._apply_model_budget_guard(
+            "orchestrator",
+            "cerebras:gpt-oss-120b",
+            _Backend(),
+            ("x" * 2000,),
+            {},
+        )
+        assert sleeps == [50.0]
+        assert router._MODEL_BUDGET_HISTORY["gpt-oss"][-1][0] == 60.0
+    finally:
+        router._MODEL_BUDGET_HISTORY.clear()
+        router._MODEL_BUDGET_HISTORY.update(old_history)
+        router._GPT_OSS_MAX_REQUESTS_PER_MIN = old_rpm
+        router._GPT_OSS_MAX_TOKENS_PER_MIN = old_tpm
+
+
 def test_global_llm_env_override_zai_glm(monkeypatch):
     from llm import router
 

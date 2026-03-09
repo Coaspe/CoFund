@@ -572,7 +572,8 @@ def _fmt_pct(val: Any) -> str:
     if val is None or val == "N/A":
         return "N/A"
     try:
-        return f"{float(val) * 100:.2f}%" if float(val) < 1.0 else f"{float(val):.2f}%"
+        value = float(val)
+        return f"{value * 100:.2f}%" if abs(value) <= 1.0 else f"{value:.2f}%"
     except (TypeError, ValueError):
         return str(val)
 
@@ -687,7 +688,19 @@ def _fmt_research_appendix(state: dict) -> str:
     return "\n".join(lines)
 
 
+def _hide_allocation_sections_for_position_review(state: dict) -> bool:
+    frontdoor = state.get("question_understanding", {}) if isinstance(state.get("question_understanding"), dict) else {}
+    if str(frontdoor.get("intent", "")).strip() != "position_review":
+        return False
+    normalized = state.get("normalized_portfolio_snapshot", {}) if isinstance(state.get("normalized_portfolio_snapshot"), dict) else {}
+    weights = normalized.get("weights", {}) if isinstance(normalized.get("weights"), dict) else {}
+    proposed = state.get("positions_proposed", {}) if isinstance(state.get("positions_proposed"), dict) else {}
+    return not bool(weights) and not bool(proposed)
+
+
 def _build_positions_section(state: dict, *, lang: str = "ko") -> str:
+    if _hide_allocation_sections_for_position_review(state):
+        return ""
     proposed = state.get("positions_proposed", {}) if isinstance(state.get("positions_proposed"), dict) else {}
     final = state.get("positions_final", {}) if isinstance(state.get("positions_final"), dict) else {}
     tickers = [str(t).strip().upper() for t in (state.get("universe", []) or []) if str(t).strip()]
@@ -707,6 +720,8 @@ def _build_positions_section(state: dict, *, lang: str = "ko") -> str:
 
 
 def _build_book_allocation_section(state: dict, *, lang: str = "ko") -> str:
+    if _hide_allocation_sections_for_position_review(state):
+        return ""
     plan = state.get("book_allocation_plan", {}) if isinstance(state.get("book_allocation_plan"), dict) else {}
     rows = state.get("capital_competition", []) if isinstance(state.get("capital_competition"), list) else []
     if not plan and not rows:
@@ -734,7 +749,41 @@ def _build_book_allocation_section(state: dict, *, lang: str = "ko") -> str:
                     exp_ret=row.get("expected_return_score", "n/a"),
                     downside=row.get("downside_penalty", "n/a"),
                     catalyst=row.get("catalyst_proximity_score", "n/a"),
-                    weight=_fmt_pct(row.get("target_weight", 0.0)),
+                    weight=_fmt_pct(row.get("target_book_weight", row.get("target_weight", 0.0))),
+                )
+            )
+    return "\n".join(lines) + "\n"
+
+
+def _build_portfolio_construction_section(state: dict, *, lang: str = "ko") -> str:
+    construction = state.get("portfolio_construction_analysis", {}) if isinstance(state.get("portfolio_construction_analysis"), dict) else {}
+    if not construction:
+        return ""
+    rebalances = construction.get("rebalances", []) if isinstance(construction.get("rebalances"), list) else []
+    lines = ["", "## Portfolio Construction Quant"]
+    lines.extend(
+        [
+            "",
+            f"- Source: {construction.get('allocator_source', 'n/a')}",
+            f"- Gross target: {construction.get('target_gross_exposure', 'n/a')}",
+            f"- Single-name cap: {construction.get('single_name_cap', 'n/a')}",
+            f"- Diversification score: {construction.get('diversification_score', 'n/a')}",
+            f"- Turnover estimate: {construction.get('turnover_estimate', 'n/a')}",
+            f"- Event risk level: {construction.get('event_risk_level', 'n/a')}",
+        ]
+    )
+    if rebalances:
+        lines.extend(["", "| Ticker | Action | Base | Target | Delta |", "|---|---|---:|---:|---:|"])
+        for row in rebalances[:8]:
+            if not isinstance(row, dict):
+                continue
+            lines.append(
+                "| {ticker} | {action} | {base} | {target} | {delta} |".format(
+                    ticker=row.get("ticker", ""),
+                    action=row.get("action", ""),
+                    base=_fmt_pct(row.get("base_weight", 0.0)),
+                    target=_fmt_pct(row.get("target_weight", 0.0)),
+                    delta=_fmt_pct(row.get("delta_weight", 0.0)),
                 )
             )
     return "\n".join(lines) + "\n"
@@ -793,12 +842,26 @@ def _build_event_monitoring_section(state: dict, *, lang: str = "ko") -> str:
         for trigger in (desk.get("monitoring_triggers", []) or [])[:3]:
             if isinstance(trigger, dict):
                 desk_triggers.append((label, trigger))
-    if not event_calendar and not monitoring_actions and not desk_triggers:
+    filtered_events = []
+    for item in event_calendar:
+        if not isinstance(item, dict):
+            continue
+        if str(item.get("status", "")).strip().lower() == "stale":
+            continue
+        if str(item.get("metric", "")).strip().lower() == "pmi":
+            try:
+                current_value = float(item.get("current_value"))
+            except (TypeError, ValueError):
+                current_value = None
+            if current_value is not None and not (0.0 <= current_value <= 100.0):
+                continue
+        filtered_events.append(item)
+    if not filtered_events and not monitoring_actions and not desk_triggers:
         return ""
     lines = ["", "## Event Calendar & Monitoring"]
-    if event_calendar:
+    if filtered_events:
         lines.extend(["", "| Desk | Type | Status | Date/Trigger | Source |", "|---|---|---|---|---|"])
-        for item in event_calendar[:10]:
+        for item in filtered_events[:10]:
             if not isinstance(item, dict):
                 continue
             lines.append(
@@ -909,6 +972,7 @@ def _build_fidelity_report(state: dict) -> str:
     risk_rationale = str(ticker_dec.get("rationale_short", "")).strip()
     positions_final = state.get("positions_final", {}) if isinstance(state.get("positions_final"), dict) else {}
     positions_proposed = state.get("positions_proposed", {}) if isinstance(state.get("positions_proposed"), dict) else {}
+    hide_allocation_sections = _hide_allocation_sections_for_position_review(state)
 
     cvar_limit = (
         ((risk.get("risk_payload", {}) or {}).get("risk_limits", {}) or {}).get("max_portfolio_cvar_1d")
@@ -928,6 +992,11 @@ def _build_fidelity_report(state: dict) -> str:
             "\n- 분석 미실행 유니버스: " + ", ".join(unanalyzed) +
             " (state 근거 없음, 가정으로만 취급)"
         )
+    if hide_allocation_sections:
+        mode_note += "\n- 보유 수량/평단 미제공으로 실제 비중 기반 매도 규모 산정은 생략"
+
+    quant_alloc_display = "n/a" if hide_allocation_sections else _fmt_pct(quant_alloc)
+    risk_weight_display = "n/a" if hide_allocation_sections else _fmt_pct(risk_weight)
 
     def _build_hedge_lite_summary_ko() -> str:
         if not str(analysis_mode).startswith("B_"):
@@ -994,8 +1063,8 @@ def _build_fidelity_report(state: dict) -> str:
             f"- Iteration: {iteration}\n"
             f"- Intent: {intent}\n"
             f"- Universe: {universe}\n"
-            f"- Quant decision: {quant_decision} / alloc={quant_alloc}\n"
-            f"- Risk decision: {risk_decision_label} / weight={risk_weight} / grade={risk_grade}\n"
+            f"- Quant decision: {quant_decision} / alloc={quant_alloc_display}\n"
+            f"- Risk decision: {risk_decision_label} / weight={risk_weight_display} / grade={risk_grade}\n"
             f"- CVaR breach claim allowed: {cvar_breach}\n"
             f"{mode_note}\n\n"
             f"## Evidence-backed reason fields\n"
@@ -1005,6 +1074,7 @@ def _build_fidelity_report(state: dict) -> str:
             f"- portfolio_cvar_1d(state): {portfolio_cvar} / limit(state): {cvar_limit}\n"
             f"{_build_positions_section(state, lang='en')}"
             f"{_build_book_allocation_section(state, lang='en')}"
+            f"{_build_portfolio_construction_section(state, lang='en')}"
             f"{_build_provenance_section(state, lang='en')}"
             f"{_build_event_monitoring_section(state, lang='en')}"
             f"{_build_report_limitations_section(state, lang='en')}"
@@ -1017,8 +1087,8 @@ def _build_fidelity_report(state: dict) -> str:
         f"- 반복횟수: {iteration}\n"
         f"- 의도(intent): {intent or 'n/a'}\n"
         f"- 분석 유니버스(state.universe): {universe}\n"
-        f"- Quant 결정(state): {quant_decision} / 비중={_fmt_pct(quant_alloc)}\n"
-        f"- Risk 결정(state): {risk_decision_label} / 최종비중={_fmt_pct(risk_weight)} / 등급={risk_grade}\n"
+        f"- Quant 결정(state): {quant_decision} / 비중={quant_alloc_display}\n"
+        f"- Risk 결정(state): {risk_decision_label} / 최종비중={risk_weight_display} / 등급={risk_grade}\n"
         f"{cvar_line}\n"
         f"- portfolio_cvar_1d(state): {_fmt_pct(portfolio_cvar)} / limit(state): {_fmt_pct(cvar_limit)}"
         f"{mode_note}\n\n"
@@ -1031,6 +1101,7 @@ def _build_fidelity_report(state: dict) -> str:
         f"- `research_stop_reason`: {state.get('research_stop_reason', '')}\n\n"
         f"{_build_positions_section(state, lang='ko')}"
         f"{_build_book_allocation_section(state, lang='ko')}"
+        f"{_build_portfolio_construction_section(state, lang='ko')}"
         f"{_build_provenance_section(state, lang='ko')}"
         f"{_build_event_monitoring_section(state, lang='ko')}"
         f"{_build_report_limitations_section(state, lang='ko')}"

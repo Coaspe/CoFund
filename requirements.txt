@@ -22,3 +22,6 @@ hmmlearn>=0.3.0
 
 # Development & Testing
 pytest>=7.0.0
+fastapi>=0.116.0
+uvicorn>=0.35.0
+httpx>=0.28.0

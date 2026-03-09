@@ -75,6 +75,48 @@ def test_desks_emit_autonomy_fields_without_llm():
         assert "evidence_digest" in out
 
 
+def test_macro_missing_checks_do_not_treat_zero_as_missing():
+    reqs = macro_agent._generate_evidence_requests(
+        "NVDA",
+        axes={"growth": {"score": 0}},
+        ron={"risk_on_off": "risk_off", "tail_risk_warning": False},
+        features={"macro_regime": "expansion"},
+        indicators={"yield_curve_spread": 0.0},
+        focus_areas=[],
+    )
+
+    assert not any("yield curve" in str(req.get("rationale", "")).lower() for req in reqs)
+
+
+def test_etf_fundamental_requests_only_when_context_is_missing():
+    out = fundamental_analyst_run(
+        "SPY",
+        {
+            "sector": "ETF",
+            "holdings_top10_weight_pct": 48.0,
+            "sector_weights": {"technology": 0.31},
+            "factor_exposures": {"beta": 1.0},
+            "index_forward_pe": 21.5,
+            "net_flow_1m": 1250000,
+            "tracking_error": 0.001,
+            "expense_ratio": 0.0009,
+            "liquidity_score": 0.95,
+        },
+        asset_type="ETF",
+    )
+
+    assert out.get("evidence_requests", []) == []
+
+
+def test_sentiment_no_articles_fallback_avoids_etf_specific_query_for_equity():
+    out = sentiment_analyst_run("NVDA", {"vix_level": 25, "news_sentiment_score": 0.2})
+    queries = [str(req.get("query", "")).lower() for req in out.get("evidence_requests", [])]
+    kinds = [str(req.get("kind", "")).lower() for req in out.get("evidence_requests", [])]
+
+    assert not any("etf flow creation redemption" in query for query in queries)
+    assert "press_release_or_ir" in kinds
+
+
 def test_research_router_seeds_when_requests_are_sparse():
     state = _base_state()
     state["macro_analysis"] = {"open_questions": []}

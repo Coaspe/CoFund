@@ -385,9 +385,11 @@ class InvestmentState(TypedDict, total=False):
     run_id: str
     as_of: str
     mode: str
-    intent: str  # market_outlook | single_name | hedge_design | relative_value ...
+    intent: str  # canonical workflow intent: market_outlook | single_name | hedge_design | relative_value ...
+    scenario_tags: list  # planner nuance tags: event_risk | overheated_check | ...
     output_language: str  # ko | en
     analysis_execution_mode: str  # single_main | B_main_plus_hedge_lite
+    workflow_kind: str  # general | position_review
     run_context: dict  # {run_id, as_of, mode, seed, git_commit, config_hash}
 
     # Universe & positions
@@ -401,9 +403,13 @@ class InvestmentState(TypedDict, total=False):
     monitoring_backlog: list     # Open review/monitoring tasks derived by orchestrator
     book_allocation_plan: dict   # Book-level pre-allocation plan from orchestrator
     capital_competition: list    # Ranked capital competition rows across current/new ideas
+    portfolio_construction_analysis: dict  # Construction quant output
     event_calendar: list         # First-class normalized event/trigger calendar across desks
     monitoring_actions: dict     # Monitoring/escalation router output
     decision_quality_scorecard: dict  # Desk/source quality snapshot for rerun prioritization
+    question_understanding: dict  # Frontdoor question classification/extraction output
+    portfolio_intake: dict       # Structured portfolio intake extracted from natural language
+    normalized_portfolio_snapshot: dict  # Deterministic holdings normalization snapshot
 
     # Legacy
     user_request: str
@@ -443,6 +449,7 @@ class InvestmentState(TypedDict, total=False):
     _rerun_plan: dict
     _executed_requests: list
     _evidence_delta_kinds: dict
+    _frontdoor_prepared: bool
 
     # Audit
     audit: dict  # {paths, gate_trace, validations}
@@ -471,8 +478,10 @@ def create_initial_state(
         as_of=as_of,
         mode=mode,
         intent="single_name",
+        scenario_tags=[],
         output_language="ko",
         analysis_execution_mode="single_main",
+        workflow_kind="general",
         run_context={
             "run_id": run_id,
             "as_of": as_of,
@@ -489,9 +498,13 @@ def create_initial_state(
         monitoring_backlog=[],
         book_allocation_plan={},
         capital_competition=[],
+        portfolio_construction_analysis={},
         event_calendar=[],
         monitoring_actions={},
         decision_quality_scorecard={},
+        question_understanding={},
+        portfolio_intake={},
+        normalized_portfolio_snapshot={},
         user_request=user_request,
         target_ticker="",
         analysis_tasks=[],
@@ -525,6 +538,7 @@ def create_initial_state(
         _rerun_plan={},
         _executed_requests=[],
         _evidence_delta_kinds={},
+        _frontdoor_prepared=False,
         audit={
             "paths": {},
             "gate_trace": [],

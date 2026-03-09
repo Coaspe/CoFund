@@ -3,7 +3,7 @@ agents/autonomy_overlay.py
 ==========================
 LLM overlay layer for desk autonomy (macro/fundamental/sentiment).
 - Deterministic outputs stay authoritative.
-- LLM may only return JSON patch for narrative/research-planning fields.
+- LLM may only return JSON patch for bounded bucket/narrative/research fields.
 - Any invalid/unsafe patch is ignored (no-op fallback).
 """
 
@@ -27,6 +27,9 @@ MAX_STR_LEN = 220
 MAX_REACT_LEN = 120
 
 _ALLOWED_PATCH_FIELDS = {
+    "primary_decision",
+    "recommendation",
+    "confidence",
     "key_drivers",
     "what_to_watch",
     "scenario_notes",
@@ -44,6 +47,16 @@ _DEFAULT_KIND_BY_DESK = {
     "fundamental": "valuation_context",
     "sentiment": "catalyst_event_detail",
 }
+_ALLOWED_PRIMARY_DECISIONS_BY_DESK = {
+    "macro": {"bullish", "neutral", "bearish"},
+    "fundamental": {"bullish", "neutral", "bearish", "avoid"},
+    "sentiment": {"bullish", "neutral", "bearish"},
+}
+_ALLOWED_RECOMMENDATIONS_BY_DESK = {
+    "macro": {"allow", "allow_with_limits", "reject"},
+    "fundamental": {"allow", "allow_with_limits", "reject"},
+    "sentiment": {"allow", "allow_with_limits"},
+}
 
 _SYSTEM_PROMPT = """
 You are a hedge-fund desk analyst overlay.
@@ -53,11 +66,15 @@ but you MUST NEVER output chain-of-thought.
 Output rules:
 - Return JSON object patch ONLY. No prose, no markdown.
 - Allowed keys only:
+  primary_decision, recommendation, confidence,
   key_drivers, what_to_watch, scenario_notes,
   open_questions, decision_sensitivity, followups, evidence_requests, react_trace.
 - Keep lists concise (max 5 items), strings <= 220 chars.
 - evidence_requests max 3 items.
-- Do not modify engine outputs, risk_flags, evidence numeric values, or tilt_factor.
+- Use only the allowed bucket values provided in the payload.
+- Preserve deterministic bucket fields unless user_request or evidence_digest clearly supports a better allowed bucket.
+- Do not modify risk_flags, evidence numeric values, tilt_factor, or other engine-computed numeric fields.
+- confidence must be a number in [0, 1].
 - open_questions, decision_sensitivity, followups should be non-empty whenever possible.
 
 ReAct semantics to encode in structured fields:
@@ -116,6 +133,19 @@ def _sanitize_string_list(values: Any) -> list[str]:
         if s:
             out.append(s)
     return out
+
+
+def _sanitize_bucket_choice(value: Any, allowed: set[str]) -> str | None:
+    choice = str(value or "").strip().lower()
+    return choice if choice in allowed else None
+
+
+def _sanitize_confidence(value: Any) -> float | None:
+    try:
+        confidence = float(value)
+    except (TypeError, ValueError):
+        return None
+    return round(max(0.0, min(1.0, confidence)), 2)
 
 
 def validate_evidence_requests(
@@ -182,7 +212,24 @@ def ensure_schema(
         if key not in _ALLOWED_PATCH_FIELDS:
             continue
 
-        if key in ("key_drivers", "what_to_watch"):
+        if key == "primary_decision":
+            allowed = _ALLOWED_PRIMARY_DECISIONS_BY_DESK.get(desk, set())
+            value = _sanitize_bucket_choice(patch.get(key), allowed)
+            if value:
+                sanitized[key] = value
+
+        elif key == "recommendation":
+            allowed = _ALLOWED_RECOMMENDATIONS_BY_DESK.get(desk, set())
+            value = _sanitize_bucket_choice(patch.get(key), allowed)
+            if value:
+                sanitized[key] = value
+
+        elif key == "confidence":
+            value = _sanitize_confidence(patch.get(key))
+            if value is not None:
+                sanitized[key] = value
+
+        elif key in ("key_drivers", "what_to_watch"):
             sanitized[key] = _sanitize_string_list(patch.get(key))
 
         elif key == "scenario_notes":
@@ -289,6 +336,7 @@ def _build_human_payload(
         "ticker": output.get("ticker"),
         "horizon_days": output.get("horizon_days"),
         "primary_decision": output.get("primary_decision"),
+        "recommendation": output.get("recommendation"),
         "confidence": output.get("confidence"),
         "needs_more_data": output.get("needs_more_data"),
         "data_quality": output.get("data_quality"),
@@ -305,8 +353,12 @@ def _build_human_payload(
         "user_request": (state or {}).get("user_request", ""),
         "focus_areas": focus_areas or [],
         "evidence_digest": (evidence_digest or [])[:7],
+        "allowed_bucket_values": {
+            "primary_decision": sorted(_ALLOWED_PRIMARY_DECISIONS_BY_DESK.get(desk, set())),
+            "recommendation": sorted(_ALLOWED_RECOMMENDATIONS_BY_DESK.get(desk, set())),
+        },
         "deterministic_output": compact_output,
-        "instruction": "Return JSON patch object only.",
+        "instruction": "Return JSON patch object only. Prefer leaving bucket fields unchanged unless the evidence clearly warrants a different allowed bucket.",
     }
     return json.dumps(payload, ensure_ascii=False)
 

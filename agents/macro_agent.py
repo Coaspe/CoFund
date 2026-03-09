@@ -149,6 +149,9 @@ def _build_scenario_notes(regime: str, ron: dict) -> dict:
 
 _MACRO_EVIDENCE_KINDS = {"macro_headline_context", "macro_release", "press_release_or_ir"}
 _PATCHABLE_FIELDS = {
+    "primary_decision",
+    "recommendation",
+    "confidence",
     "key_drivers",
     "what_to_watch",
     "scenario_notes",
@@ -988,8 +991,12 @@ def _apply_overlay_patch(output: dict, patch: dict) -> None:
     if not isinstance(patch, dict):
         return
     for key in _PATCHABLE_FIELDS:
-        if key in patch and patch[key]:
-            output[key] = patch[key]
+        if key not in patch:
+            continue
+        value = patch.get(key)
+        if value in (None, "", [], {}):
+            continue
+        output[key] = value
     if patch.get("evidence_requests"):
         output["evidence_requests"] = _merge_requests(
             output.get("evidence_requests", []),
@@ -1009,26 +1016,26 @@ def _generate_evidence_requests(
     """매크로 evidence request 생성: regime flip/axes 급변 + driver 불명."""
     reqs = []
     risk_on_off = ron.get("risk_on_off", "neutral")
-    if risk_on_off == "risk_off" and not indicators.get("yield_curve_spread"):
+    if risk_on_off == "risk_off" and indicators.get("yield_curve_spread") is None:
         reqs.append(
             {
                 "desk": "macro",
                 "kind": "macro_headline_context",
-                "ticker": ticker,
-                "query": f"{ticker} macro headwind driver recession risk",
+                "ticker": "__GLOBAL__",
+                "query": "US yield curve inversion recession risk latest macro context",
                 "priority": 2,
                 "recency_days": 7,
                 "max_items": 5,
                 "rationale": "risk_off but missing yield curve — need context",
             }
         )
-    if ron.get("tail_risk_warning") and not indicators.get("hy_oas"):
+    if ron.get("tail_risk_warning") and indicators.get("hy_oas") is None:
         reqs.append(
             {
                 "desk": "macro",
                 "kind": "macro_headline_context",
-                "ticker": ticker,
-                "query": "high yield credit spread stress financial conditions",
+                "ticker": "__GLOBAL__",
+                "query": "US high yield credit spread stress financial conditions latest",
                 "priority": 1,
                 "recency_days": 3,
                 "max_items": 3,
@@ -1036,13 +1043,13 @@ def _generate_evidence_requests(
             }
         )
     g_score = axes.get("growth", {}).get("score", 0)
-    if abs(g_score) >= 2 and not indicators.get("pmi") and not indicators.get("gdp_growth"):
+    if abs(g_score) >= 2 and indicators.get("pmi") is None and indicators.get("gdp_growth") is None:
         reqs.append(
             {
                 "desk": "macro",
                 "kind": "macro_headline_context",
-                "ticker": ticker,
-                "query": "US PMI GDP growth contraction latest",
+                "ticker": "__GLOBAL__",
+                "query": "US PMI GDP growth contraction latest macro context",
                 "priority": 2,
                 "recency_days": 7,
                 "max_items": 3,
@@ -1056,8 +1063,8 @@ def _generate_evidence_requests(
             {
                 "desk": "macro",
                 "kind": "macro_headline_context",
-                "ticker": ticker,
-                "query": f"{ticker} macro regime flip driver",
+                "ticker": "__GLOBAL__",
+                "query": f"US macro regime shift driver {prev_regime} {curr_regime} growth inflation rates credit",
                 "priority": 1,
                 "recency_days": 7,
                 "max_items": 4,

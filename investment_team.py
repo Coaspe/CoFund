@@ -35,7 +35,7 @@ import re
 import sys
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any, Literal
+from typing import Any, Literal, Optional
 from urllib.parse import parse_qsl, urlencode, urlparse, urlunparse
 
 import numpy as np
@@ -48,6 +48,7 @@ from schemas.common import (
     compute_disagreement_score,
 )
 import telemetry
+from visualization.agent_empire import write_run_dashboard
 
 # ── Data Providers ────────────────────────────────────────────────────────
 from data_providers.data_hub import DataHub
@@ -66,6 +67,16 @@ from agents.autonomy_planner import plan_runtime_recovery
 # ── Engines (for quant) ──────────────────────────────────────────────────
 from engines.quant_engine import generate_quant_payload, mock_quant_decision
 from engines.research_policy import compute_evidence_score, should_run_web_research
+
+try:
+    from llm.router import get_llm_with_cache
+    from langchain_core.messages import HumanMessage, SystemMessage
+
+    HAS_FRONTDOOR_LLM = True
+except Exception:
+    HAS_FRONTDOOR_LLM = False
+    get_llm_with_cache = None  # type: ignore
+    HumanMessage = SystemMessage = None  # type: ignore
 
 # ── Existing agent imports (graceful) ─────────────────────────────────────
 try:
@@ -157,6 +168,21 @@ _LANDING_PATH_PATTERNS = (
     "/newsevents/pressreleases.htm",
 )
 _LANDING_TITLE_TOKENS = ("press releases", "newsroom", "news", "latest news")
+_QUESTION_TICKER_RE = re.compile(r"(?<![A-Z0-9])((?:[A-Z]{1,5}|[0-9]{4,6})(?:[.-][A-Z0-9]{1,6})?)(?![A-Z0-9])")
+_QUESTION_TICKER_STOPWORDS = {"AI", "ETF", "PM", "CEO", "CIO", "IPO", "USD", "KRW"}
+_QUESTION_KR_TICKER_MAP = {
+    "애플": "AAPL",
+    "마이크로소프트": "MSFT",
+    "엔비디아": "NVDA",
+    "테슬라": "TSLA",
+    "구글": "GOOGL",
+    "알파벳": "GOOGL",
+    "아마존": "AMZN",
+    "메타": "META",
+    "나스닥": "QQQ",
+    "미국증시": "SPY",
+    "미국 시장": "SPY",
+}
 
 
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
@@ -185,6 +211,62 @@ def _normalize_query_text(text: Any) -> str:
     return " ".join(str(text or "").strip().lower().split())
 
 
+def _normalize_primary_tickers(values: Any) -> list[str]:
+    out: list[str] = []
+    seen = set()
+    for raw in values or []:
+        ticker = str(raw or "").strip().upper()
+        if not ticker or ticker in _QUESTION_TICKER_STOPWORDS or ticker in seen:
+            continue
+        out.append(ticker)
+        seen.add(ticker)
+    return out
+
+
+_POSITION_REVIEW_EXPLICIT_HINTS = (
+    "평단", "보유", "shares", "주 ", "주,", "avg cost", "매입가", "리밸런", "비중",
+)
+_POSITION_REVIEW_SELL_HINTS = (
+    "매도", "익절", "차익실현", "정리", "팔까", "팔아", "sell", "trim", "take profit",
+)
+_POSITION_REVIEW_PROFIT_HINTS = (
+    "수익", "수익률", "profit", "gain", "gains",
+)
+_POSITION_REVIEW_TIMING_HINTS = (
+    "언제", "when", "지금", "now", "timing",
+)
+_CANONICAL_FRONTDOOR_INTENTS = {
+    "single_name",
+    "position_review",
+    "portfolio_rebalance",
+    "hedge_design",
+    "market_outlook",
+    "relative_value",
+}
+_LEGACY_PLANNER_INTENT_TO_CANONICAL = {
+    "single_ticker_entry": "single_name",
+    "compare_tickers": "relative_value",
+}
+_PLANNER_INTENT_SCENARIO_TAGS = {
+    "event_risk": "event_risk",
+    "overheated_check": "overheated_check",
+}
+
+
+def _looks_like_position_review_request(user_request: str, universe: list[str]) -> bool:
+    text = _normalize_query_text(user_request)
+    if any(k in text for k in _POSITION_REVIEW_EXPLICIT_HINTS):
+        return True
+    symbols = [str(t).strip().upper() for t in (universe or []) if str(t).strip()]
+    if len(symbols) != 1:
+        return False
+    if any(k in text for k in _POSITION_REVIEW_SELL_HINTS):
+        return True
+    has_profit = any(k in text for k in _POSITION_REVIEW_PROFIT_HINTS)
+    has_timing = any(k in text for k in _POSITION_REVIEW_TIMING_HINTS)
+    return has_profit and has_timing
+
+
 def _detect_output_language(user_request: str) -> str:
     text = str(user_request or "")
     if re.search(r"[가-힣]", text):
@@ -194,6 +276,11 @@ def _detect_output_language(user_request: str) -> str:
 
 def _infer_intent_from_request(user_request: str, universe: list[str]) -> str:
     text = _normalize_query_text(user_request)
+    if _looks_like_position_review_request(user_request, universe):
+        if len(universe or []) >= 2:
+            return "portfolio_rebalance"
+        if len(universe or []) == 1:
+            return "position_review"
     if any(k in text for k in ("시장", "macro", "market outlook", "전망", "지정학", "event risk", "이벤트")):
         return "market_outlook"
     if any(k in text for k in ("헤지", "hedge")):
@@ -201,6 +288,768 @@ def _infer_intent_from_request(user_request: str, universe: list[str]) -> str:
     if len(universe or []) >= 2:
         return "relative_value"
     return "single_name"
+
+
+def _normalize_scenario_tags(values: Any) -> list[str]:
+    out: list[str] = []
+    seen = set()
+    for raw in values or []:
+        tag = str(raw or "").strip().lower()
+        if not tag or tag in seen:
+            continue
+        out.append(tag)
+        seen.add(tag)
+    return out
+
+
+def _canonicalize_runtime_intent(
+    raw_intent: Any,
+    *,
+    preferred_intent: Any = "",
+    user_request: str = "",
+    universe: Optional[list[str]] = None,
+) -> tuple[str, list[str]]:
+    raw = str(raw_intent or "").strip().lower()
+    preferred = str(preferred_intent or "").strip().lower()
+    scenario_tag = _PLANNER_INTENT_SCENARIO_TAGS.get(raw)
+    scenario_tags = [scenario_tag] if scenario_tag else []
+
+    if preferred in _CANONICAL_FRONTDOOR_INTENTS:
+        canonical = preferred
+    elif raw in _CANONICAL_FRONTDOOR_INTENTS:
+        canonical = raw
+    elif raw in _LEGACY_PLANNER_INTENT_TO_CANONICAL:
+        canonical = _LEGACY_PLANNER_INTENT_TO_CANONICAL[raw]
+    else:
+        canonical = ""
+
+    if canonical not in _CANONICAL_FRONTDOOR_INTENTS:
+        canonical = _infer_intent_from_request(
+            user_request,
+            [str(t).strip().upper() for t in (universe or []) if str(t).strip()],
+        ) if user_request else "single_name"
+    if canonical not in _CANONICAL_FRONTDOOR_INTENTS:
+        canonical = "single_name"
+    return canonical, scenario_tags
+
+
+def _extract_question_tickers(user_request: str) -> list[str]:
+    text = str(user_request or "")
+    out: list[str] = []
+    seen = set()
+    for match in _QUESTION_TICKER_RE.findall(text):
+        t = str(match or "").strip().upper()
+        if t in _QUESTION_TICKER_STOPWORDS:
+            continue
+        if t not in seen:
+            out.append(t)
+            seen.add(t)
+    if out:
+        return out
+    for kr, ticker in _QUESTION_KR_TICKER_MAP.items():
+        if kr in text and ticker not in seen:
+            out.append(ticker)
+            seen.add(ticker)
+    return out
+
+
+def _parse_numeric_phrase(value: Any) -> Optional[float]:
+    raw = str(value or "").strip().lower()
+    if not raw:
+        return None
+    multiplier = 1.0
+    if "억" in raw:
+        multiplier *= 100_000_000.0
+    if "만" in raw:
+        multiplier *= 10_000.0
+    if raw.endswith("k"):
+        multiplier *= 1_000.0
+    elif raw.endswith("m"):
+        multiplier *= 1_000_000.0
+    elif raw.endswith("b"):
+        multiplier *= 1_000_000_000.0
+    cleaned = re.sub(r"[^0-9.+-]", "", raw)
+    if not cleaned:
+        return None
+    try:
+        return float(cleaned) * multiplier
+    except ValueError:
+        return None
+
+
+def _normalize_currency(text: Any) -> str:
+    raw = str(text or "").strip().upper()
+    if not raw:
+        return "USD"
+    if "₩" in raw or "KRW" in raw or "원" in raw:
+        return "KRW"
+    return "USD"
+
+
+def _normalize_holdings(holdings_raw: Any) -> list[dict]:
+    out: list[dict] = []
+    for item in holdings_raw or []:
+        if not isinstance(item, dict):
+            continue
+        ticker = str(item.get("ticker", "")).strip().upper()
+        shares = _parse_numeric_phrase(item.get("shares"))
+        if not ticker or shares is None or shares <= 0:
+            continue
+        avg_cost = _parse_numeric_phrase(item.get("avg_cost"))
+        out.append({
+            "ticker": ticker,
+            "shares": round(float(shares), 6),
+            "avg_cost": round(float(avg_cost), 6) if avg_cost is not None else None,
+            "currency": _normalize_currency(item.get("currency")),
+        })
+    return out
+
+
+def _portfolio_context_intake_seed(portfolio_context: Any) -> dict:
+    ctx = portfolio_context if isinstance(portfolio_context, dict) else {}
+    holdings = _normalize_holdings(ctx.get("holdings") or [])
+    primary_tickers = _normalize_primary_tickers(
+        ctx.get("primary_tickers")
+        or [item.get("ticker") for item in holdings]
+    )
+    cash = ctx.get("cash") if isinstance(ctx.get("cash"), dict) else None
+    account_value = ctx.get("account_value") if isinstance(ctx.get("account_value"), dict) else None
+    return {
+        "holdings": holdings,
+        "primary_tickers": primary_tickers,
+        "cash": cash,
+        "account_value": account_value,
+    }
+
+
+def _question_understanding_rules(user_request: str) -> dict:
+    text = str(user_request or "")
+    lower = text.lower()
+    tickers = _extract_question_tickers(text)
+    holdings: list[dict] = []
+    holding_pat = re.compile(
+        r"\b(?P<ticker>[A-Z]{1,5})\b[\s:,-]*"
+        r"(?P<shares>[0-9][0-9,]*(?:\.[0-9]+)?)\s*(?:주|shares?)"
+        r"(?:[\s,/-]*(?:평단|avg(?:\s*cost)?|cost|매입가|at)\s*"
+        r"(?P<avg>[$₩]?[0-9][0-9,]*(?:\.[0-9]+)?(?:만|억|k|m|b)?))?",
+        re.IGNORECASE,
+    )
+    seen = set()
+    for match in holding_pat.finditer(text):
+        ticker = str(match.group("ticker") or "").strip().upper()
+        shares = _parse_numeric_phrase(match.group("shares"))
+        avg_cost = _parse_numeric_phrase(match.group("avg"))
+        if not ticker or shares is None or shares <= 0 or ticker in seen:
+            continue
+        holdings.append({
+            "ticker": ticker,
+            "shares": round(float(shares), 6),
+            "avg_cost": round(float(avg_cost), 6) if avg_cost is not None else None,
+            "currency": "USD",
+        })
+        seen.add(ticker)
+    cash_match = re.search(
+        r"(?:현금|cash)\s*(?:은|는|이|가)?\s*(?P<amount>[$₩]?[0-9][0-9,]*(?:\.[0-9]+)?(?:만|억|k|m|b)?)",
+        text,
+        re.IGNORECASE,
+    )
+    account_match = re.search(
+        r"(?:총\s*자산|계좌\s*규모|계좌\s*가치|portfolio\s*value|account\s*value)\s*(?:은|는|이|가)?\s*(?P<amount>[$₩]?[0-9][0-9,]*(?:\.[0-9]+)?(?:만|억|k|m|b)?)",
+        text,
+        re.IGNORECASE,
+    )
+    if holdings:
+        tickers = [item["ticker"] for item in holdings]
+    looks_like_position_review = _looks_like_position_review_request(text, tickers)
+    question_type = "single_name_analysis"
+    if (
+        any(k in lower for k in ("리밸런", "rebalance", "비중", "allocation", "포트폴리오"))
+        or len(holdings) >= 2
+        or (looks_like_position_review and len(tickers) >= 2)
+    ):
+        question_type = "portfolio_rebalance"
+    elif holdings or looks_like_position_review:
+        question_type = "single_position_review"
+    elif any(k in lower for k in ("헤지", "hedge")):
+        question_type = "hedge_request"
+    elif any(k in lower for k in ("시장", "전망", "macro", "outlook")) and not tickers:
+        question_type = "market_outlook"
+    elif len(tickers) >= 2:
+        question_type = "compare_tickers"
+
+    intent_map = {
+        "portfolio_rebalance": "portfolio_rebalance",
+        "single_position_review": "position_review",
+        "hedge_request": "hedge_design",
+        "market_outlook": "market_outlook",
+        "compare_tickers": "relative_value",
+        "single_name_analysis": "single_name",
+    }
+    missing_fields: list[str] = []
+    if holdings and any(item.get("avg_cost") is None for item in holdings):
+        missing_fields.append("avg_cost")
+    if question_type == "portfolio_rebalance" and not cash_match and not account_match:
+        missing_fields.append("account_value_or_cash")
+    return {
+        "question_type": question_type,
+        "intent": intent_map.get(question_type, "single_name"),
+        "primary_tickers": tickers[:8],
+        "holdings": holdings,
+        "cash": {
+            "amount": _parse_numeric_phrase(cash_match.group("amount")),
+            "currency": _normalize_currency(cash_match.group("amount")),
+        } if cash_match else None,
+        "account_value": {
+            "amount": _parse_numeric_phrase(account_match.group("amount")),
+            "currency": _normalize_currency(account_match.group("amount")),
+        } if account_match else None,
+        "constraints": {
+            "horizon_days": 30,
+            "risk_tolerance": None,
+        },
+        "user_goal": "review_or_rebalance" if question_type in {"single_position_review", "portfolio_rebalance"} else "analyze",
+        "missing_fields": missing_fields,
+        "assumption_policy": "limited_answer_without_fabrication",
+        "confidence": (
+            0.92 if holdings
+            else (0.84 if question_type == "single_position_review" else (0.80 if question_type == "portfolio_rebalance" else (0.78 if tickers else 0.55)))
+        ),
+        "source": "rules",
+    }
+
+
+def _parse_json_dict_maybe_fenced(text: str) -> dict:
+    s = str(text or "").strip()
+    if s.startswith("```"):
+        lines = s.splitlines()
+        if lines and lines[0].strip().startswith("```"):
+            lines = lines[1:]
+        if lines and lines[-1].strip() == "```":
+            lines = lines[:-1]
+        s = "\n".join(lines).strip()
+    try:
+        obj = json.loads(s)
+        if isinstance(obj, dict):
+            return obj
+    except (json.JSONDecodeError, TypeError):
+        pass
+    decoder = json.JSONDecoder()
+    for i, ch in enumerate(s):
+        if ch not in "{[":
+            continue
+        try:
+            obj, _ = decoder.raw_decode(s[i:])
+        except json.JSONDecodeError:
+            continue
+        if isinstance(obj, dict):
+            return obj
+    raise json.JSONDecodeError("No JSON object found", s, 0)
+
+
+def _validate_question_understanding(result: Any) -> bool:
+    if not isinstance(result, dict):
+        return False
+    if not isinstance(result.get("question_type"), str):
+        return False
+    if not isinstance(result.get("intent"), str):
+        return False
+    if result.get("holdings") is not None and not isinstance(result.get("holdings"), list):
+        return False
+    return True
+
+
+_QUESTION_UNDERSTANDING_SYSTEM_PROMPT = """
+You are a frontdoor parser for an investment research system.
+Return JSON only.
+Do not guess missing facts.
+If the user did not provide a value, use null.
+Infer the user's underlying investment task semantically, not with keyword matching.
+Resolve company/common-language names to canonical tradable tickers when unambiguous.
+If ticker resolution is ambiguous, leave primary_tickers empty and add "ticker_confirmation" to missing_fields.
+If the user is asking about when to sell, trim, or protect gains on an existing position, classify it as single_position_review.
+Extract the user's question type, tickers, holdings, cash, account value, and constraints.
+Valid question_type values:
+- single_name_analysis
+- single_position_review
+- portfolio_rebalance
+- hedge_request
+- market_outlook
+- compare_tickers
+Valid intent values:
+- single_name
+- position_review
+- portfolio_rebalance
+- hedge_design
+- market_outlook
+- relative_value
+Output keys:
+question_type, intent, primary_tickers, holdings, cash, account_value, constraints,
+user_goal, missing_fields, assumption_policy, confidence.
+Each holding must be: {ticker, shares, avg_cost, currency}.
+""".strip()
+
+
+def _apply_question_understanding_guardrails(
+    llm_out: dict,
+    rules: dict,
+) -> dict:
+    merged = dict(llm_out or {})
+    merged["primary_tickers"] = _normalize_primary_tickers(
+        merged.get("primary_tickers") or rules.get("primary_tickers") or []
+    )
+    merged["holdings"] = _normalize_holdings(merged.get("holdings") or rules.get("holdings") or [])
+    merged["cash"] = merged.get("cash") if isinstance(merged.get("cash"), dict) else rules.get("cash")
+    merged["account_value"] = (
+        merged.get("account_value")
+        if isinstance(merged.get("account_value"), dict)
+        else rules.get("account_value")
+    )
+    merged["constraints"] = (
+        merged.get("constraints")
+        if isinstance(merged.get("constraints"), dict)
+        else rules.get("constraints")
+    )
+    merged["missing_fields"] = list(dict.fromkeys([
+        str(x).strip()
+        for x in [*(merged.get("missing_fields") or []), *(rules.get("missing_fields") or [])]
+        if str(x).strip()
+    ]))
+    merged["assumption_policy"] = str(
+        merged.get("assumption_policy") or rules.get("assumption_policy") or "limited_answer_without_fabrication"
+    ).strip()
+    try:
+        merged["confidence"] = max(0.0, min(1.0, float(merged.get("confidence", rules.get("confidence", 0.0)) or 0.0)))
+    except (TypeError, ValueError):
+        merged["confidence"] = float(rules.get("confidence", 0.0) or 0.0)
+
+    question_type = str(merged.get("question_type", "")).strip()
+    intent = str(merged.get("intent", "")).strip()
+    user_goal = str(merged.get("user_goal", "")).strip()
+    low_confidence = float(merged.get("confidence", 0.0) or 0.0) < 0.70
+
+    if merged["holdings"]:
+        if len(merged["holdings"]) >= 2:
+            question_type = "portfolio_rebalance"
+            intent = "portfolio_rebalance"
+        else:
+            question_type = "single_position_review"
+            intent = "position_review"
+        user_goal = "review_or_rebalance"
+    elif low_confidence:
+        rules_question_type = str(rules.get("question_type", "")).strip()
+        if rules_question_type in {"single_position_review", "portfolio_rebalance"}:
+            question_type = rules_question_type
+            intent = str(rules.get("intent", "")).strip()
+            user_goal = str(rules.get("user_goal", "")).strip()
+
+    if not question_type:
+        question_type = str(rules.get("question_type", "")).strip()
+    if not intent:
+        intent = str(rules.get("intent", "")).strip()
+    if not user_goal:
+        user_goal = str(rules.get("user_goal", "")).strip()
+
+    merged["question_type"] = question_type
+    merged["intent"] = intent
+    merged["user_goal"] = user_goal
+    if not merged["primary_tickers"]:
+        merged["primary_tickers"] = _normalize_primary_tickers(rules.get("primary_tickers") or [])
+    if str(merged.get("source", "")).strip() != "rules":
+        merged["source"] = "llm"
+    return merged
+
+
+def _merge_understanding_with_intake_seed(understanding: dict, intake_seed: dict) -> dict:
+    merged = dict(understanding or {})
+    holdings = intake_seed.get("holdings") or []
+    primary_tickers = _normalize_primary_tickers(
+        intake_seed.get("primary_tickers")
+        or merged.get("primary_tickers")
+        or [item.get("ticker") for item in holdings]
+    )
+    if holdings:
+        merged["holdings"] = holdings
+        primary_tickers = [item["ticker"] for item in holdings]
+        if len(holdings) >= 2:
+            merged["question_type"] = "portfolio_rebalance"
+            merged["intent"] = "portfolio_rebalance"
+        else:
+            merged["question_type"] = "single_position_review"
+            merged["intent"] = "position_review"
+        merged["user_goal"] = "review_or_rebalance"
+    if primary_tickers:
+        merged["primary_tickers"] = primary_tickers
+    if intake_seed.get("cash") is not None:
+        merged["cash"] = intake_seed.get("cash")
+    if intake_seed.get("account_value") is not None:
+        merged["account_value"] = intake_seed.get("account_value")
+    missing_fields = [str(x).strip() for x in (merged.get("missing_fields") or []) if str(x).strip()]
+    if holdings and all(item.get("avg_cost") is not None for item in holdings):
+        missing_fields = [item for item in missing_fields if item != "avg_cost"]
+    if primary_tickers:
+        missing_fields = [item for item in missing_fields if item != "ticker_confirmation"]
+    merged["missing_fields"] = list(dict.fromkeys(missing_fields))
+    return merged
+
+
+def _call_question_understanding_llm(user_request: str) -> dict:
+    rules = _question_understanding_rules(user_request)
+    if not HAS_FRONTDOOR_LLM or get_llm_with_cache is None or SystemMessage is None or HumanMessage is None:
+        return rules
+    human_msg = (
+        "Parse the following investment question into structured JSON.\n"
+        "Do not infer missing portfolio facts.\n\n"
+        f"User question:\n{user_request}"
+    )
+    try:
+        llm, cached = get_llm_with_cache("orchestrator", human_msg)
+        if isinstance(cached, dict) and _validate_question_understanding(cached):
+            out = dict(cached)
+        else:
+            if llm is None:
+                return rules
+            raw = llm.invoke([
+                SystemMessage(content=_QUESTION_UNDERSTANDING_SYSTEM_PROMPT),
+                HumanMessage(content=human_msg),
+            ])
+            out = _parse_json_dict_maybe_fenced(getattr(raw, "content", ""))
+        if not _validate_question_understanding(out):
+            return rules
+        return _apply_question_understanding_guardrails(out, rules)
+    except Exception:
+        return rules
+
+
+def _merge_portfolio_context(existing: dict, understanding: dict, intake: dict, normalized: dict) -> dict:
+    ctx = dict(existing or {})
+    ctx.setdefault("question_type", understanding.get("question_type"))
+    ctx.setdefault("frontdoor_intent", understanding.get("intent"))
+    ctx.setdefault("primary_tickers", understanding.get("primary_tickers", []))
+    ctx.setdefault("user_goal", understanding.get("user_goal"))
+    ctx.setdefault("frontdoor_confidence", understanding.get("confidence"))
+    ctx.setdefault("frontdoor_source", understanding.get("source"))
+    if intake.get("holdings"):
+        ctx.setdefault("holdings", intake.get("holdings"))
+    if intake.get("cash") is not None:
+        ctx.setdefault("cash", intake.get("cash"))
+    if intake.get("account_value") is not None:
+        ctx.setdefault("account_value", intake.get("account_value"))
+    if normalized:
+        ctx["normalized_portfolio_snapshot"] = normalized
+    missing = understanding.get("missing_fields", [])
+    if missing:
+        ctx["missing_fields"] = list(dict.fromkeys([*ctx.get("missing_fields", []), *missing]))
+    return ctx
+
+
+def _resolve_frontdoor_targets(
+    state: InvestmentState,
+    understanding: dict,
+    intake: dict,
+) -> tuple[str, list[str]]:
+    target = str(state.get("target_ticker", "")).strip().upper()
+    primary_tickers = _normalize_primary_tickers(understanding.get("primary_tickers") or [])
+    universe = [str(t).strip().upper() for t in (state.get("universe") or []) if str(t).strip()]
+    if not universe:
+        universe = primary_tickers[:]
+    if not universe:
+        universe = [str(item.get("ticker", "")).strip().upper() for item in intake.get("holdings", []) if str(item.get("ticker", "")).strip()]
+    if not target and primary_tickers:
+        target = primary_tickers[0]
+    if not target and universe:
+        target = universe[0]
+    return target, universe
+
+
+def _build_frontdoor_bundle(
+    state: InvestmentState,
+    *,
+    compute_normalized: bool = True,
+) -> dict[str, Any]:
+    if state.get("_frontdoor_prepared") and isinstance(state.get("question_understanding"), dict) and state.get("question_understanding"):
+        understanding = dict(state.get("question_understanding", {}) or {})
+        intake = dict(state.get("portfolio_intake", {}) or {})
+        normalized = dict(state.get("normalized_portfolio_snapshot", {}) or {})
+        if compute_normalized and not normalized:
+            normalized = _normalize_portfolio_snapshot(state, intake)
+        merged_ctx = _merge_portfolio_context(
+            state.get("portfolio_context", {}) if isinstance(state.get("portfolio_context"), dict) else {},
+            understanding,
+            intake,
+            normalized,
+        )
+        target, universe = _resolve_frontdoor_targets(state, understanding, intake)
+    else:
+        user_request = str(state.get("user_request", "") or "")
+        understanding = _call_question_understanding_llm(user_request)
+        intake_seed = _portfolio_context_intake_seed(state.get("portfolio_context", {}))
+        understanding = _merge_understanding_with_intake_seed(understanding, intake_seed)
+        intake = {
+            "holdings": _normalize_holdings(understanding.get("holdings") or []),
+            "cash": understanding.get("cash"),
+            "account_value": understanding.get("account_value"),
+            "missing_fields": list(understanding.get("missing_fields", []) or []),
+        }
+        normalized = _normalize_portfolio_snapshot(state, intake) if compute_normalized else {}
+        existing_ctx = state.get("portfolio_context", {}) if isinstance(state.get("portfolio_context"), dict) else {}
+        merged_ctx = _merge_portfolio_context(existing_ctx, understanding, intake, normalized)
+        target, universe = _resolve_frontdoor_targets(state, understanding, intake)
+
+    out: dict[str, Any] = {
+        "question_understanding": understanding,
+        "portfolio_intake": intake,
+        "normalized_portfolio_snapshot": normalized,
+        "portfolio_context": merged_ctx,
+        "_frontdoor_prepared": True,
+    }
+    if universe and not state.get("universe"):
+        out["universe"] = universe
+    if target and not state.get("target_ticker"):
+        out["target_ticker"] = target
+    if understanding.get("intent") and not state.get("intent"):
+        out["intent"] = str(understanding.get("intent"))
+    if not (state.get("positions_final") or state.get("positions_proposed")) and normalized.get("weights"):
+        out["positions_final"] = dict(normalized.get("weights", {}))
+    return out
+
+
+def _build_position_review_clarification(understanding: dict, intake: dict) -> dict:
+    intent = str(understanding.get("intent", "")).strip()
+    if intent != "position_review":
+        return {"required": False, "fields": [], "message": "", "target_ticker": "", "currency": "USD"}
+    holdings = _normalize_holdings(intake.get("holdings") or [])
+    primary_tickers = _normalize_primary_tickers(understanding.get("primary_tickers") or [])
+    target_ticker = primary_tickers[0] if primary_tickers else (holdings[0]["ticker"] if holdings else "")
+    fields: list[str] = []
+    if not target_ticker:
+        fields.append("ticker")
+    if not holdings:
+        fields.extend(["shares", "avg_cost"])
+    else:
+        if holdings[0].get("avg_cost") is None:
+            fields.append("avg_cost")
+    message = ""
+    if fields:
+        message = "position review에서 매도 시점과 규모를 정밀하게 계산하려면 보유 수량과 평단이 필요합니다."
+        if "ticker" in fields:
+            message = "position review를 정확히 진행하려면 검토할 종목과 보유 수량, 평단이 필요합니다."
+    return {
+        "required": bool(fields),
+        "fields": fields,
+        "message": message,
+        "target_ticker": target_ticker,
+        "currency": "USD",
+    }
+
+
+def preview_launch_requirements(
+    user_request: str,
+    *,
+    portfolio_context: dict | None = None,
+    mode: str = "mock",
+    seed: int | None = 42,
+) -> dict[str, Any]:
+    state = create_initial_state(
+        user_request=user_request,
+        mode=mode,
+        portfolio_context=portfolio_context or {},
+        seed=seed,
+    )
+    bundle = _build_frontdoor_bundle(state, compute_normalized=False)
+    understanding = dict(bundle.get("question_understanding", {}) or {})
+    intake = dict(bundle.get("portfolio_intake", {}) or {})
+    clarification = _build_position_review_clarification(understanding, intake)
+    return {
+        "question_understanding": understanding,
+        "portfolio_intake": intake,
+        "target_ticker": str(bundle.get("target_ticker", "")),
+        "universe": list(bundle.get("universe", []) or []),
+        "needs_clarification": bool(clarification.get("required")),
+        "clarification": clarification,
+    }
+
+
+def _prompt_position_review_inputs_if_tty(state: InvestmentState, preview: dict[str, Any]) -> dict[str, Any]:
+    clarification = preview.get("clarification", {}) if isinstance(preview.get("clarification"), dict) else {}
+    if not clarification.get("required"):
+        return preview
+    if not (sys.stdin.isatty() and sys.stdout.isatty()):
+        return preview
+
+    fields = list(clarification.get("fields", []) or [])
+    target_ticker = str(clarification.get("target_ticker", "") or "").strip().upper()
+    currency = str(clarification.get("currency", "USD") or "USD").strip().upper() or "USD"
+
+    print("\n📝 Position Review Input Required")
+    print("   매도 시점과 규모를 정밀하게 계산하려면 보유 종목 정보를 입력해 주세요.")
+
+    if "ticker" in fields:
+        raw = input(f"   Ticker [{target_ticker or '예: NVDA'}]: ").strip().upper()
+        if raw:
+            target_ticker = raw
+    if "shares" in fields:
+        raw = input("   Shares [예: 25]: ").strip()
+        shares = _parse_numeric_phrase(raw)
+    else:
+        shares = None
+    if "avg_cost" in fields:
+        raw = input(f"   Avg Cost ({currency}) [예: 132.5]: ").strip()
+        avg_cost = _parse_numeric_phrase(raw)
+    else:
+        avg_cost = None
+    raw_currency = input(f"   Currency [{currency}]: ").strip().upper()
+    if raw_currency:
+        currency = raw_currency
+
+    if target_ticker and shares is not None and shares > 0:
+        portfolio_context = dict(state.get("portfolio_context", {}) if isinstance(state.get("portfolio_context"), dict) else {})
+        portfolio_context["holdings"] = [{
+            "ticker": target_ticker,
+            "shares": float(shares),
+            "avg_cost": float(avg_cost) if avg_cost is not None else None,
+            "currency": currency,
+        }]
+        portfolio_context["primary_tickers"] = [target_ticker]
+        state["portfolio_context"] = portfolio_context
+        return preview_launch_requirements(
+            str(state.get("user_request", "") or ""),
+            portfolio_context=portfolio_context,
+            mode=str(state.get("mode", "mock") or "mock"),
+            seed=state.get("run_context", {}).get("seed"),
+        )
+    return preview
+
+
+def _has_position_review_snapshot(state: InvestmentState) -> bool:
+    frontdoor = state.get("question_understanding", {}) if isinstance(state.get("question_understanding"), dict) else {}
+    if str(frontdoor.get("intent", "")).strip() != "position_review":
+        return True
+    normalized = state.get("normalized_portfolio_snapshot", {}) if isinstance(state.get("normalized_portfolio_snapshot"), dict) else {}
+    weights = normalized.get("weights", {}) if isinstance(normalized.get("weights"), dict) else {}
+    if weights:
+        return True
+    intake = state.get("portfolio_intake", {}) if isinstance(state.get("portfolio_intake"), dict) else {}
+    if _normalize_holdings(intake.get("holdings") or []):
+        return True
+    positions_final = state.get("positions_final", {}) if isinstance(state.get("positions_final"), dict) else {}
+    return bool(positions_final) and not bool(state.get("positions_proposed"))
+
+
+def _frontdoor_intent(state: InvestmentState) -> str:
+    frontdoor = state.get("question_understanding", {}) if isinstance(state.get("question_understanding"), dict) else {}
+    frontdoor_intent = str(frontdoor.get("intent", "")).strip().lower()
+    if frontdoor_intent in _CANONICAL_FRONTDOOR_INTENTS:
+        return frontdoor_intent
+    return _state_canonical_intent(state)
+
+
+def _state_canonical_intent(state: InvestmentState) -> str:
+    frontdoor = state.get("question_understanding", {}) if isinstance(state.get("question_understanding"), dict) else {}
+    frontdoor_intent = str(frontdoor.get("intent", "")).strip()
+    frontdoor_tickers = _normalize_primary_tickers(frontdoor.get("primary_tickers") or [])
+    universe = [str(t).strip().upper() for t in (state.get("universe") or frontdoor_tickers) if str(t).strip()]
+    canonical, _ = _canonicalize_runtime_intent(
+        state.get("intent", ""),
+        preferred_intent=frontdoor_intent,
+        user_request=str(state.get("user_request", "") or ""),
+        universe=universe,
+    )
+    return canonical
+
+
+def _state_scenario_tags(state: InvestmentState) -> list[str]:
+    tags = _normalize_scenario_tags(state.get("scenario_tags") or [])
+    legacy_tag = _PLANNER_INTENT_SCENARIO_TAGS.get(str(state.get("intent", "")).strip().lower())
+    if legacy_tag and legacy_tag not in tags:
+        tags.append(legacy_tag)
+    return tags
+
+
+def _state_has_scenario_tag(state: InvestmentState, tag: str) -> bool:
+    return str(tag or "").strip().lower() in set(_state_scenario_tags(state))
+
+
+def _normalize_portfolio_snapshot(state: InvestmentState, intake: dict) -> dict:
+    holdings = _normalize_holdings(intake.get("holdings") or [])
+    if not holdings:
+        return {"status": "no_holdings", "holdings": [], "weights": {}, "basis": "none", "missing_fields": []}
+    seed = _make_seed(state) + 401
+    as_of = state.get("as_of", "")
+    mode = state.get("mode", "mock")
+    hub = DataHub(run_id=state.get("run_id", ""), as_of=as_of, mode=mode)
+    cash_payload = intake.get("cash") or {}
+    account_value_payload = intake.get("account_value") or {}
+    cash_amount = _parse_numeric_phrase(cash_payload.get("amount"))
+    account_value = _parse_numeric_phrase(account_value_payload.get("amount"))
+    enriched: list[dict] = []
+    unresolved: list[str] = []
+    price_evidence: list[dict] = []
+    total_holdings_value = 0.0
+    for idx, item in enumerate(holdings):
+        ticker = item["ticker"]
+        try:
+            prices, ev, _ = hub.get_price_series(ticker, lookback_days=90, seed=seed + idx * 17)
+            px = float(prices[-1]) if len(prices) else None
+            px_as_of = str((ev[-1].get("as_of") if ev else "") or as_of)
+            price_evidence.extend(ev or [])
+        except Exception:
+            px = None
+            px_as_of = as_of
+        if px is None or px <= 0:
+            unresolved.append(ticker)
+            enriched.append({
+                **item,
+                "current_price": None,
+                "price_as_of": px_as_of,
+                "market_value": None,
+                "unrealized_pnl": None,
+                "unrealized_pnl_pct": None,
+            })
+            continue
+        market_value = float(item["shares"]) * px
+        total_holdings_value += market_value
+        avg_cost = item.get("avg_cost")
+        pnl = None
+        pnl_pct = None
+        if avg_cost is not None and avg_cost > 0:
+            pnl = (px - float(avg_cost)) * float(item["shares"])
+            pnl_pct = ((px / float(avg_cost)) - 1.0) * 100.0
+        enriched.append({
+            **item,
+            "current_price": round(px, 6),
+            "price_as_of": px_as_of,
+            "market_value": round(market_value, 6),
+            "unrealized_pnl": round(pnl, 6) if pnl is not None else None,
+            "unrealized_pnl_pct": round(pnl_pct, 4) if pnl_pct is not None else None,
+        })
+    denominator = None
+    basis = "known_assets_only"
+    if account_value is not None and account_value > 0:
+        denominator = float(account_value)
+        basis = "account_value"
+    elif total_holdings_value > 0:
+        denominator = total_holdings_value + max(0.0, float(cash_amount or 0.0))
+        basis = "holdings_plus_cash" if cash_amount is not None else "known_assets_only"
+    weights: dict[str, float] = {}
+    if denominator and denominator > 0:
+        for item in enriched:
+            mv = item.get("market_value")
+            if mv is None:
+                continue
+            weights[item["ticker"]] = float(mv) / denominator
+        weights = _normalize_long_only_weights(weights)
+    return {
+        "status": "ok" if weights else ("insufficient_price_data" if unresolved else "no_weights"),
+        "holdings": enriched,
+        "weights": weights,
+        "basis": basis,
+        "known_holdings_value": round(total_holdings_value, 6),
+        "cash_amount": round(float(cash_amount), 6) if cash_amount is not None else None,
+        "account_value": round(float(account_value), 6) if account_value is not None else None,
+        "price_unresolved": unresolved,
+        "missing_fields": list(intake.get("missing_fields", []) or []),
+        "evidence_count": len(price_evidence),
+    }
 
 
 def _infer_asset_type(ticker: str) -> str:
@@ -662,8 +1511,39 @@ def _log(state: dict, node: str, phase: str, data: dict | None = None):
 
 
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-# ① Orchestrator Node
+# ① Frontdoor + Orchestrator Node
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+def question_understanding_node(state: InvestmentState) -> dict:
+    """Frontdoor node: diverse user questions -> structured intake + normalized portfolio snapshot."""
+    _log(state, "question_understanding", "enter")
+    out = _build_frontdoor_bundle(state, compute_normalized=True)
+    understanding = out.get("question_understanding", {}) if isinstance(out.get("question_understanding"), dict) else {}
+    intake = out.get("portfolio_intake", {}) if isinstance(out.get("portfolio_intake"), dict) else {}
+    normalized = out.get("normalized_portfolio_snapshot", {}) if isinstance(out.get("normalized_portfolio_snapshot"), dict) else {}
+    primary_tickers = _normalize_primary_tickers(understanding.get("primary_tickers") or [])
+
+    _ops_log(
+        state,
+        "question_understanding",
+        "frontdoor parse",
+        [
+            f"type={understanding.get('question_type', 'unknown')} intent={understanding.get('intent', 'unknown')}",
+            f"tickers={_list_preview(primary_tickers, max_items=6, max_len=120) or 'n/a'} holdings={len(intake.get('holdings', []))}",
+            f"normalization={normalized.get('status', 'unknown')} basis={normalized.get('basis', 'n/a')}",
+            f"missing={_list_preview(understanding.get('missing_fields', []), max_items=6, max_len=120) or 'none'}",
+        ],
+    )
+    _log(
+        state,
+        "question_understanding",
+        "exit",
+        {
+            "question_type": understanding.get("question_type"),
+            "holdings": len(intake.get("holdings", [])),
+        },
+    )
+    return out
 
 def orchestrator_node(state: InvestmentState) -> dict:
     """① Orchestrator — CIO/PM."""
@@ -687,24 +1567,80 @@ def orchestrator_node(state: InvestmentState) -> dict:
     directives = result.get("orchestrator_directives", {})
     if not isinstance(directives, dict):
         directives = {}
+        result["orchestrator_directives"] = directives
+    frontdoor = state.get("question_understanding", {}) if isinstance(state.get("question_understanding"), dict) else {}
+    frontdoor_tickers = [str(t).strip().upper() for t in (frontdoor.get("primary_tickers") or []) if str(t).strip()]
+    frontdoor_intent = str(frontdoor.get("intent", "")).strip() or str(state.get("intent", "")).strip()
     universe = _extract_universe_from_directives(directives)
     if not universe and state.get("universe"):
         universe = [str(t).strip().upper() for t in state.get("universe", []) if str(t).strip()]
+    if not universe and frontdoor_tickers:
+        universe = frontdoor_tickers[:]
     target_ticker = str(result.get("target_ticker", "")).strip().upper()
+    if not target_ticker:
+        target_ticker = str(state.get("target_ticker", "")).strip().upper()
+    if not target_ticker and frontdoor_tickers:
+        target_ticker = frontdoor_tickers[0]
     if not universe and target_ticker:
         universe = [target_ticker]
-    if universe:
-        target_ticker = universe[0]
 
     output_language = str(state.get("output_language", "")).strip().lower() or _detect_output_language(user_request)
-    intent = str(directives.get("intent", "")).strip() or _infer_intent_from_request(user_request, universe)
-    execution_mode = "B_main_plus_hedge_lite" if len(universe) >= 2 else "single_main"
+    brief = directives.get("investment_brief", {}) if isinstance(directives.get("investment_brief"), dict) else {}
+    directive_universe = universe[:]
+    action_type = str(directives.get("action_type", "")).strip()
+    if frontdoor_intent == "position_review" and frontdoor_tickers:
+        normalized_universe = frontdoor_tickers[:]
+        target_ticker = frontdoor_tickers[0]
+        needs_directive_update = (
+            normalized_universe != directive_universe
+            or action_type == "pivot_strategy"
+            or str(directives.get("intent", "")).strip() not in {"", "position_review"}
+        )
+        if needs_directive_update:
+            directives = dict(directives)
+            brief = dict(brief)
+            note = "포지션 리뷰 요청이므로 원보유 종목의 유지/축소/청산 판단에 집중."
+            rationale = str(brief.get("rationale", "")).strip()
+            if note not in rationale:
+                brief["rationale"] = f"{rationale} {note}".strip() if rationale else note
+            brief["target_universe"] = normalized_universe
+            directives["investment_brief"] = brief
+            directives["intent"] = "position_review"
+            if action_type == "pivot_strategy":
+                directives["action_type"] = "scale_down"
+            result["orchestrator_directives"] = directives
+        universe = normalized_universe
+    elif universe:
+        target_ticker = universe[0]
+
+    raw_directive_intent = str(directives.get("intent", "")).strip()
+    raw_directive_scenario_tags = _normalize_scenario_tags(directives.get("scenario_tags") or [])
+    preferred_intent = frontdoor_intent or _infer_intent_from_request(user_request, universe)
+    intent, derived_scenario_tags = _canonicalize_runtime_intent(
+        raw_directive_intent or preferred_intent,
+        preferred_intent=preferred_intent,
+        user_request=user_request,
+        universe=universe,
+    )
+    if frontdoor_intent in {"position_review", "portfolio_rebalance"} and raw_directive_intent in {"", "single_name", "single_ticker_entry"}:
+        intent = frontdoor_intent
+    scenario_tags = _normalize_scenario_tags([
+        *_state_scenario_tags(state),
+        *raw_directive_scenario_tags,
+        *derived_scenario_tags,
+    ])
+    directives = dict(directives)
+    directives["intent"] = intent
+    directives["scenario_tags"] = scenario_tags
+    result["orchestrator_directives"] = directives
+    execution_mode = "single_main" if frontdoor_intent == "position_review" else ("B_main_plus_hedge_lite" if len(universe) >= 2 else "single_main")
     asset_type_by_ticker = _build_asset_type_map(universe)
 
     result["target_ticker"] = target_ticker
     result["universe"] = universe
     result["asset_type_by_ticker"] = asset_type_by_ticker
     result["intent"] = intent
+    result["scenario_tags"] = scenario_tags
     result["output_language"] = output_language
     result["analysis_execution_mode"] = execution_mode
 
@@ -725,6 +1661,7 @@ def orchestrator_node(state: InvestmentState) -> dict:
         "action_type": directives.get("action_type"),
         "analysis_tasks": result["analysis_tasks"],
         "intent": intent,
+        "scenario_tags": scenario_tags,
         "execution_mode": execution_mode,
         "universe_size": len(universe),
         "portfolio_mandate_applied": bool(((directives.get("portfolio_mandate") or {}) if isinstance(directives, dict) else {}).get("applied")),
@@ -1189,11 +2126,18 @@ def sentiment_analyst_node(state: InvestmentState) -> dict:
     }
 
 
-def _quant_select_pair_ticker(*, ticker: str, intent: str, asset_type: str) -> str:
+def _quant_select_pair_ticker(
+    *,
+    ticker: str,
+    intent: str,
+    asset_type: str,
+    scenario_tags: Optional[list[str]] = None,
+) -> str:
     t = str(ticker or "").strip().upper()
     it = str(intent or "").strip().lower()
     at = str(asset_type or "").strip().upper()
-    if it in {"market_outlook", "event_risk", "hedge_design"}:
+    tags = set(_normalize_scenario_tags(scenario_tags or []))
+    if it in {"market_outlook", "hedge_design"} or "event_risk" in tags:
         if t == "XLE":
             return "SPY"
         if t in {"SPY", "QQQ", "IWM"} or at in {"ETF", "INDEX"}:
@@ -1658,6 +2602,483 @@ def _normalize_long_only_weights(weights: dict[str, float]) -> dict[str, float]:
     return {k: v / s for k, v in cleaned.items()}
 
 
+def _safe_return_vector(prices: Any, window: int = 60) -> np.ndarray | None:
+    if not hasattr(prices, "__len__") or len(prices) < window + 2:
+        return None
+    try:
+        p = np.asarray(prices, dtype=float)
+        rets = np.diff(np.log(p))
+        tail = rets[-window:]
+        if len(tail) < max(10, window // 2):
+            return None
+        return tail
+    except Exception:
+        return None
+
+
+def _weighted_average_correlation(
+    return_map: dict[str, np.ndarray | None],
+    base_weights: dict[str, float],
+    ticker: str,
+) -> float | None:
+    current = return_map.get(ticker)
+    if current is None:
+        return None
+    weighted_sum = 0.0
+    weight_sum = 0.0
+    for other, base_weight in (base_weights or {}).items():
+        if other == ticker or float(base_weight) <= 1e-12:
+            continue
+        other_ret = return_map.get(other)
+        if other_ret is None:
+            continue
+        n = min(len(current), len(other_ret))
+        if n < 20:
+            continue
+        corr = np.corrcoef(current[-n:], other_ret[-n:])[0, 1]
+        if np.isnan(corr):
+            continue
+        weighted_sum += float(base_weight) * float(corr)
+        weight_sum += float(base_weight)
+    if weight_sum <= 1e-12:
+        return None
+    return weighted_sum / weight_sum
+
+
+def _cap_relative_weights(weights: dict[str, float], cap: float) -> dict[str, float]:
+    capped = {str(t): max(0.0, float(w)) for t, w in (weights or {}).items()}
+    if not capped:
+        return {}
+    cap = max(0.05, min(float(cap), 1.0))
+    for _ in range(6):
+        overflow = 0.0
+        open_names: list[str] = []
+        for ticker, weight in list(capped.items()):
+            if weight > cap:
+                overflow += weight - cap
+                capped[ticker] = cap
+            else:
+                open_names.append(ticker)
+        if overflow <= 1e-12 or not open_names:
+            break
+        room = {t: max(0.0, cap - capped[t]) for t in open_names}
+        room_total = float(sum(room.values()))
+        if room_total <= 1e-12:
+            break
+        for ticker in open_names:
+            capped[ticker] += overflow * (room[ticker] / room_total)
+    return _normalize_long_only_weights(capped)
+
+
+def _portfolio_construction_base_weights(state: InvestmentState, universe: list[str], main: str) -> dict[str, float]:
+    raw = state.get("positions_proposed", {}) if isinstance(state.get("positions_proposed"), dict) else {}
+    base = _normalize_long_only_weights(raw)
+    if base:
+        for ticker in universe:
+            base.setdefault(ticker, 0.0)
+        return base
+
+    plan = state.get("book_allocation_plan", {}) if isinstance(state.get("book_allocation_plan"), dict) else {}
+    weights = plan.get("weights_relative", {}) if isinstance(plan.get("weights_relative"), dict) else {}
+    base = _normalize_long_only_weights(weights)
+    if base:
+        for ticker in universe:
+            base.setdefault(ticker, 0.0)
+        return base
+
+    if universe:
+        fallback = {ticker: 0.0 for ticker in universe}
+        fallback[main] = 1.0
+        return fallback
+    return {main: 1.0} if main else {}
+
+
+def _portfolio_construction_signal_snapshot(
+    state: InvestmentState,
+    ticker: str,
+    competition_by_ticker: dict[str, dict],
+    main: str,
+) -> dict:
+    row = competition_by_ticker.get(ticker, {}) if isinstance(competition_by_ticker, dict) else {}
+    snapshot = {
+        "conviction_score": float(row.get("conviction_score", 0.0) or 0.0),
+        "expected_return_score": float(row.get("expected_return_score", 0.0) or 0.0),
+        "downside_penalty": float(row.get("downside_penalty", 0.0) or 0.0),
+        "catalyst_proximity_score": float(row.get("catalyst_proximity_score", 0.0) or 0.0),
+        "source": "capital_competition" if row else "fallback",
+    }
+    if ticker != main:
+        hedge_lite = state.get("hedge_lite", {}) if isinstance(state.get("hedge_lite"), dict) else {}
+        hedge_rows = hedge_lite.get("hedges", {}) if isinstance(hedge_lite.get("hedges"), dict) else {}
+        hedge_row = hedge_rows.get(ticker, {}) if isinstance(hedge_rows.get(ticker), dict) else {}
+        if hedge_row:
+            snapshot["conviction_score"] = float(snapshot["conviction_score"]) + 0.40 * float(hedge_row.get("score", 0.0) or 0.0)
+            snapshot["source"] = "capital_competition+hedge_lite"
+        return snapshot
+
+    fundamental = state.get("fundamental_analysis", {}) if isinstance(state.get("fundamental_analysis"), dict) else {}
+    technical = state.get("technical_analysis", {}) if isinstance(state.get("technical_analysis"), dict) else {}
+    sentiment = state.get("sentiment_analysis", {}) if isinstance(state.get("sentiment_analysis"), dict) else {}
+    expected_profile = fundamental.get("expected_return_profile", {}) if isinstance(fundamental.get("expected_return_profile"), dict) else {}
+    if not row:
+        anchor_upside = expected_profile.get("anchor_upside_pct")
+        bear_downside = expected_profile.get("bear_downside_pct")
+        if anchor_upside is not None:
+            snapshot["expected_return_score"] = _clip(float(anchor_upside) / 20.0)
+        if bear_downside is not None:
+            snapshot["downside_penalty"] = _clip(abs(float(bear_downside)) / 20.0, 0.0, 1.0)
+        f_score = float(fundamental.get("signal_strength", 0.0) or 0.0)
+        q_score = float((technical.get("signal_stack", {}) or {}).get("total_score", 0.0) or 0.0)
+        s_score = float(sentiment.get("signal_strength", 0.0) or 0.0)
+        snapshot["conviction_score"] = _clip(0.45 * f_score + 0.40 * q_score + 0.15 * s_score)
+    catalyst_calendar = fundamental.get("catalyst_calendar", []) if isinstance(fundamental.get("catalyst_calendar"), list) else []
+    first_catalyst = next((item for item in catalyst_calendar if isinstance(item, dict)), None)
+    if first_catalyst is not None:
+        days = first_catalyst.get("days_to_event")
+        if isinstance(days, int):
+            if days <= 7:
+                snapshot["catalyst_proximity_score"] = max(float(snapshot["catalyst_proximity_score"]), 0.80)
+            elif days <= 30:
+                snapshot["catalyst_proximity_score"] = max(float(snapshot["catalyst_proximity_score"]), 0.40)
+    return snapshot
+
+
+def _portfolio_construction_event_penalty(event_calendar: list[dict], ticker: str) -> tuple[float, dict]:
+    confirmed = 0
+    imminent = 0
+    triggered = 0
+    for item in event_calendar or []:
+        if not isinstance(item, dict):
+            continue
+        event_ticker = str(item.get("ticker", "")).strip().upper()
+        if event_ticker not in {"", "__GLOBAL__", ticker}:
+            continue
+        status = str(item.get("status", "")).strip().lower()
+        if status == "triggered":
+            triggered += 1
+        elif status == "imminent":
+            imminent += 1
+        if bool(item.get("confirmed")) or str(item.get("source_classification", "")).strip().lower() == "confirmed":
+            confirmed += 1
+    penalty = min(0.40, 0.05 * confirmed + 0.08 * imminent + 0.12 * triggered)
+    return penalty, {
+        "confirmed_event_count": confirmed,
+        "imminent_event_count": imminent,
+        "triggered_event_count": triggered,
+    }
+
+
+def _build_portfolio_construction_monitoring_triggers(
+    rows: dict[str, dict],
+    turnover_estimate: float,
+    diversification_score: float,
+    cap_relative: float,
+) -> list[dict]:
+    triggers: list[dict] = []
+    if turnover_estimate >= 0.28:
+        triggers.append({
+            "name": "Turnover budget",
+            "metric": "turnover_estimate",
+            "current_value": round(float(turnover_estimate), 4),
+            "trigger": "> 0.35",
+            "action": "construction 재균형 강도를 낮추고 catalyst 근거 재검토",
+            "priority": 2,
+        })
+    if diversification_score <= 0.32:
+        triggers.append({
+            "name": "Correlation crowding",
+            "metric": "diversification_score",
+            "current_value": round(float(diversification_score), 4),
+            "trigger": "< 0.30",
+            "action": "상관 집중 포지션 축소 및 hedge sleeve 확대 검토",
+            "priority": 1,
+        })
+    for ticker, row in rows.items():
+        target_weight = float(row.get("target_weight", 0.0) or 0.0)
+        if target_weight >= max(0.45, cap_relative * 0.97):
+            triggers.append({
+                "name": "Concentration pressure",
+                "metric": f"{ticker}_target_weight",
+                "current_value": round(target_weight, 4),
+                "trigger": f"> {round(cap_relative, 4)}",
+                "action": "single-name concentration 재조정",
+                "priority": 1,
+            })
+        event_penalty = float(row.get("event_penalty", 0.0) or 0.0)
+        if event_penalty >= 0.20:
+            triggers.append({
+                "name": "Event cluster risk",
+                "metric": f"{ticker}_event_penalty",
+                "current_value": round(event_penalty, 4),
+                "trigger": "> 0.20",
+                "action": "event window 동안 target weight 보수화",
+                "priority": 2,
+            })
+    return triggers[:8]
+
+
+def portfolio_construction_quant_node(state: InvestmentState) -> dict:
+    """Quant portfolio construction layer: positions_proposed를 construction-aware하게 재조정."""
+    if not _has_position_review_snapshot(state):
+        return {}
+    _log(state, "portfolio_construction_quant", "enter")
+
+    universe = [
+        str(t).strip().upper()
+        for t in (state.get("universe", []) or [])
+        if str(t).strip()
+    ]
+    main = str(state.get("target_ticker", "")).strip().upper() or (universe[0] if universe else "")
+    if main and main not in universe:
+        universe = [main] + [t for t in universe if t != main]
+    if not universe and main:
+        universe = [main]
+    if not universe:
+        return {}
+
+    as_of = str(state.get("as_of", "")).strip()
+    mode = str(state.get("mode", "mock")).strip() or "mock"
+    seed = _make_seed(state) + 29
+    base_weights = _portfolio_construction_base_weights(state, universe, main)
+    if not base_weights:
+        return {}
+
+    book_plan = state.get("book_allocation_plan", {}) if isinstance(state.get("book_allocation_plan"), dict) else {}
+    allocator_guidance = (
+        ((state.get("orchestrator_directives", {}) or {}).get("allocator_guidance", {}))
+        if isinstance(state.get("orchestrator_directives", {}), dict)
+        else {}
+    )
+    gross_target = float(
+        book_plan.get("gross_target")
+        or allocator_guidance.get("target_gross_exposure")
+        or 1.0
+    )
+    gross_target = max(0.10, min(gross_target, 1.0))
+    single_name_cap = float(
+        book_plan.get("single_name_cap")
+        or allocator_guidance.get("single_name_cap")
+        or min(0.55, gross_target)
+    )
+    single_name_cap = max(0.10, min(single_name_cap, gross_target))
+    cap_relative = max(0.10, min(single_name_cap / max(gross_target, 1e-6), 1.0))
+
+    capital_competition = state.get("capital_competition", []) if isinstance(state.get("capital_competition"), list) else []
+    competition_by_ticker = {
+        str(row.get("ticker", "")).strip().upper(): row
+        for row in capital_competition
+        if isinstance(row, dict) and str(row.get("ticker", "")).strip()
+    }
+    event_calendar = state.get("event_calendar", []) if isinstance(state.get("event_calendar"), list) else []
+
+    hub = DataHub(run_id=state.get("run_id", ""), as_of=as_of, mode=mode)
+    market_prices, market_evidence, _ = hub.get_market_series("SPY", lookback_days=260, seed=seed)
+    market_returns = _safe_return_vector(market_prices, window=60)
+    evidence = list(market_evidence)
+
+    price_map: dict[str, Any] = {}
+    return_map: dict[str, np.ndarray | None] = {}
+    metric_rows: dict[str, dict] = {}
+    vol_values: list[float] = []
+    for idx, ticker in enumerate(universe):
+        prices, price_evidence, _ = hub.get_price_series(ticker, lookback_days=260, seed=seed + (idx + 1) * 17)
+        price_map[ticker] = prices
+        return_map[ticker] = _safe_return_vector(prices, window=60)
+        evidence.extend(price_evidence)
+        vol_60d = _safe_ann_vol(prices, window=60)
+        if vol_60d is not None:
+            vol_values.append(float(vol_60d))
+        metric_rows[ticker] = {
+            "base_weight": round(float(base_weights.get(ticker, 0.0) or 0.0), 6),
+            "vol_20d_ann": _safe_ann_vol(prices, window=20),
+            "vol_60d_ann": vol_60d,
+            "corr_with_market_60d": _safe_corr(prices, market_prices, window=60),
+            "beta_to_market_60d": _safe_beta_to_main(prices, market_prices, window=60) if market_returns is not None else None,
+            "downside_beta_60d": _safe_downside_beta(prices, market_prices, window=60) if market_returns is not None else None,
+            "drawdown_60d": _safe_max_drawdown(prices, window=60),
+            "liquidity_proxy": _liquidity_proxy_score(ticker, state.get("asset_type_by_ticker", {})),
+        }
+
+    median_vol = float(np.median(np.asarray(vol_values, dtype=float))) if vol_values else None
+    raw_weights: dict[str, float] = {}
+    diversification_components: list[float] = []
+    rows: dict[str, dict] = {}
+    for ticker in universe:
+        signal = _portfolio_construction_signal_snapshot(state, ticker, competition_by_ticker, main)
+        weighted_corr = _weighted_average_correlation(return_map, base_weights, ticker)
+        event_penalty, event_counts = _portfolio_construction_event_penalty(event_calendar, ticker)
+        vol_60d = metric_rows[ticker].get("vol_60d_ann")
+        inv_vol_multiplier = 1.0
+        if median_vol is not None and vol_60d not in (None, 0):
+            inv_vol_multiplier = max(0.55, min(median_vol / float(vol_60d), 1.65))
+        diversification_multiplier = 1.0
+        if weighted_corr is not None:
+            diversification_multiplier = max(0.45, min(1.30, 1.0 + (0.25 - float(weighted_corr)) * 0.85))
+            diversification_components.append(1.0 - max(float(weighted_corr), 0.0))
+        liquidity_multiplier = 0.75 + 0.35 * float(metric_rows[ticker].get("liquidity_proxy", 0.50) or 0.50)
+        drawdown_penalty = max(0.0, min(float(metric_rows[ticker].get("drawdown_60d", 0.0) or 0.0) * 3.5, 0.45))
+        beta_penalty = 0.0
+        beta = metric_rows[ticker].get("beta_to_market_60d")
+        if beta is not None:
+            beta_penalty = max(0.0, min(abs(float(beta) - 1.0) * 0.12, 0.20))
+
+        conviction = float(signal.get("conviction_score", 0.0) or 0.0)
+        expected_return = float(signal.get("expected_return_score", 0.0) or 0.0)
+        downside_penalty = float(signal.get("downside_penalty", 0.0) or 0.0)
+        catalyst_score = float(signal.get("catalyst_proximity_score", 0.0) or 0.0)
+
+        alpha_multiplier = max(
+            0.30,
+            1.0
+            + 0.35 * conviction
+            + 0.25 * expected_return
+            - 0.20 * downside_penalty
+            + 0.08 * catalyst_score,
+        )
+        risk_multiplier = max(
+            0.15,
+            inv_vol_multiplier
+            * diversification_multiplier
+            * liquidity_multiplier
+            * (1.0 - drawdown_penalty)
+            * (1.0 - beta_penalty)
+            * (1.0 - event_penalty),
+        )
+        base_anchor = max(0.02, float(base_weights.get(ticker, 0.0) or 0.0))
+        if ticker == main:
+            base_anchor = max(base_anchor, 0.20)
+        raw_weight = base_anchor * alpha_multiplier * risk_multiplier
+        raw_weights[ticker] = raw_weight
+        rows[ticker] = {
+            **metric_rows[ticker],
+            "weighted_avg_corr_60d": round(float(weighted_corr), 6) if weighted_corr is not None else None,
+            "inv_vol_multiplier": round(float(inv_vol_multiplier), 6),
+            "diversification_multiplier": round(float(diversification_multiplier), 6),
+            "liquidity_multiplier": round(float(liquidity_multiplier), 6),
+            "drawdown_penalty": round(float(drawdown_penalty), 6),
+            "beta_penalty": round(float(beta_penalty), 6),
+            "conviction_score": round(float(conviction), 6),
+            "expected_return_score": round(float(expected_return), 6),
+            "downside_penalty": round(float(downside_penalty), 6),
+            "catalyst_proximity_score": round(float(catalyst_score), 6),
+            "event_penalty": round(float(event_penalty), 6),
+            "event_counts": event_counts,
+            "raw_weight": round(float(raw_weight), 6),
+            "signal_source": str(signal.get("source", "fallback")).strip() or "fallback",
+        }
+        evidence.append(
+            make_evidence(
+                metric=f"{ticker.lower()}_construction_raw_weight",
+                value=round(float(raw_weight), 6),
+                source_name="portfolio_construction_quant",
+                source_type="model",
+                quality=0.86,
+                as_of=as_of,
+            )
+        )
+
+    raw_norm = _normalize_long_only_weights(raw_weights)
+    turnover_raw = 0.5 * float(sum(abs(float(raw_norm.get(t, 0.0)) - float(base_weights.get(t, 0.0))) for t in universe))
+    avg_catalyst = float(np.mean([rows[t]["catalyst_proximity_score"] for t in universe])) if universe else 0.0
+    turnover_blend = max(0.45, min(0.85, 0.55 + 0.60 * turnover_raw - 0.15 * avg_catalyst))
+
+    blended = {}
+    for ticker in universe:
+        blended[ticker] = (
+            turnover_blend * float(base_weights.get(ticker, 0.0) or 0.0)
+            + (1.0 - turnover_blend) * float(raw_norm.get(ticker, 0.0) or 0.0)
+        )
+    blended = _normalize_long_only_weights(blended)
+    final_weights = _cap_relative_weights(blended, cap_relative)
+    turnover_final = 0.5 * float(sum(abs(float(final_weights.get(t, 0.0)) - float(base_weights.get(t, 0.0))) for t in universe))
+
+    for ticker in universe:
+        target_weight = float(final_weights.get(ticker, 0.0) or 0.0)
+        base_weight = float(base_weights.get(ticker, 0.0) or 0.0)
+        delta = target_weight - base_weight
+        if base_weight <= 1e-12 and target_weight >= 0.03:
+            action = "add"
+        elif delta > 0.03:
+            action = "scale_up"
+        elif delta < -0.03:
+            action = "scale_down"
+        else:
+            action = "hold"
+        rows[ticker]["target_weight"] = round(target_weight, 6)
+        rows[ticker]["delta_weight"] = round(delta, 6)
+        rows[ticker]["rebalance_action"] = action
+
+    diversification_score = max(0.0, min(float(np.mean(diversification_components)) if diversification_components else 0.50, 1.0))
+    monitoring_triggers = _build_portfolio_construction_monitoring_triggers(
+        rows,
+        turnover_estimate=turnover_final,
+        diversification_score=diversification_score,
+        cap_relative=cap_relative,
+    )
+    event_risk_level = "high" if any(float(rows[t]["event_penalty"]) >= 0.20 for t in universe) else ("medium" if any(float(rows[t]["event_penalty"]) >= 0.10 for t in universe) else "low")
+
+    portfolio_construction_analysis = {
+        "status": "ok",
+        "allocator_source": "portfolio_construction_quant_v1",
+        "main_ticker": main,
+        "universe": universe,
+        "base_weights": {t: round(float(base_weights.get(t, 0.0)), 6) for t in universe},
+        "weights_proposed": {t: round(float(final_weights.get(t, 0.0)), 6) for t in universe},
+        "target_gross_exposure": round(gross_target, 6),
+        "single_name_cap": round(single_name_cap, 6),
+        "relative_single_name_cap": round(cap_relative, 6),
+        "turnover_estimate": round(turnover_final, 6),
+        "turnover_blend": round(turnover_blend, 6),
+        "diversification_score": round(diversification_score, 6),
+        "event_risk_level": event_risk_level,
+        "covariance_window_days": 60,
+        "rows": rows,
+        "rebalances": [
+            {
+                "ticker": ticker,
+                "action": rows[ticker]["rebalance_action"],
+                "base_weight": rows[ticker]["base_weight"],
+                "target_weight": rows[ticker]["target_weight"],
+                "delta_weight": rows[ticker]["delta_weight"],
+            }
+            for ticker in sorted(universe)
+        ],
+        "monitoring_triggers": monitoring_triggers,
+        "evidence": evidence,
+        "build_version": "portfolio_construction_quant_v1",
+        "timestamp": as_of,
+        "seed": seed,
+    }
+
+    audit = dict(state.get("audit", {}) or {})
+    audit_paths = dict(audit.get("paths", {}) or {})
+    audit_paths["portfolio_construction_quant"] = {
+        "status": "ok",
+        "timestamp": as_of,
+        "seed": seed,
+        "turnover_estimate": round(turnover_final, 6),
+        "diversification_score": round(diversification_score, 6),
+    }
+    audit["paths"] = audit_paths
+
+    _ops_log(
+        state,
+        "portfolio_construction_quant",
+        "construction output",
+        [
+            f"gross_target={gross_target} cap={single_name_cap} base={base_weights}",
+            f"turnover={round(turnover_final, 4)} diversification={round(diversification_score, 4)}",
+            f"weights={final_weights}",
+        ],
+    )
+    _log(state, "portfolio_construction_quant", "exit", {"turnover": round(turnover_final, 4), "diversification": round(diversification_score, 4)})
+    return {
+        "portfolio_construction_analysis": portfolio_construction_analysis,
+        "positions_proposed": final_weights,
+        "audit": audit,
+    }
+
+
 def hedge_lite_builder_node(state: InvestmentState) -> dict:
     """B 모드에서 메인+헤지 후보를 경량 분석해 positions_proposed를 생성."""
     analysis_mode = str(state.get("analysis_execution_mode", "")).strip()
@@ -1669,7 +3090,8 @@ def hedge_lite_builder_node(state: InvestmentState) -> dict:
     as_of = state.get("as_of", "")
     seed = _make_seed(state) + 17
     mode = state.get("mode", "mock")
-    intent = str(state.get("intent", "")).strip().lower()
+    intent = _state_canonical_intent(state)
+    scenario_tags = _state_scenario_tags(state)
     main = str(state.get("target_ticker", "")).strip().upper() or universe[0]
     if main not in universe:
         universe = [main] + [t for t in universe if t != main]
@@ -1764,7 +3186,7 @@ def hedge_lite_builder_node(state: InvestmentState) -> dict:
 
     hedge_budget = 0.15
     main_vol_shift = main_metrics.get("vol_shift_20d_vs_60d")
-    if intent in {"event_risk", "hedge_design"} or (main_vol_shift is not None and float(main_vol_shift) > 1.2):
+    if intent == "hedge_design" or _state_has_scenario_tag(state, "event_risk") or (main_vol_shift is not None and float(main_vol_shift) > 1.2):
         hedge_budget = 0.25
     if not selected:
         hedge_budget = 0.0
@@ -1815,6 +3237,7 @@ def hedge_lite_builder_node(state: InvestmentState) -> dict:
         "main_metrics": main_metrics,
         "weights_proposed": {t: positions_proposed.get(t, 0.0) for t in universe},
         "intent": intent,
+        "scenario_tags": scenario_tags,
         "timestamp": as_of,
         "seed": seed,
         "build_version": "hedge_lite_v1",
@@ -1967,11 +3390,17 @@ def quant_analyst_node(state: InvestmentState) -> dict:
     seed = _make_seed(state) + 3
     as_of = state.get("as_of", "")
     ticker = state.get("target_ticker", "AAPL")
-    intent = str(state.get("intent", "")).strip().lower() or "single_name"
+    intent = _state_canonical_intent(state) or "single_name"
+    scenario_tags = _state_scenario_tags(state)
     asset_type = str((state.get("asset_type_by_ticker", {}) or {}).get(ticker, "")).strip().upper() or _infer_asset_type(ticker)
     horizon_days, focus_areas, risk_budget = _get_desk_task(state, "quant", 10)
-    pair_ticker = _quant_select_pair_ticker(ticker=ticker, intent=intent, asset_type=asset_type)
-    analysis_mode = "event_regime" if intent in {"market_outlook", "event_risk", "hedge_design"} else "statarb"
+    pair_ticker = _quant_select_pair_ticker(
+        ticker=ticker,
+        intent=intent,
+        asset_type=asset_type,
+        scenario_tags=scenario_tags,
+    )
+    analysis_mode = "event_regime" if intent in {"market_outlook", "hedge_design", "position_review"} or _state_has_scenario_tag(state, "event_risk") else "statarb"
     rerun_reason = _rerun_reason_for_desk(state, "quant")
     prev_quant = state.get("technical_analysis", {}) if isinstance(state.get("technical_analysis"), dict) else {}
 
@@ -2092,6 +3521,7 @@ def quant_analyst_node(state: InvestmentState) -> dict:
         "focus_areas": focus_areas,
         "risk_budget": risk_budget,
         "intent": intent,
+        "scenario_tags": scenario_tags,
         "analysis_mode": analysis_mode,
         "pair_ticker": pair_ticker,
         "asset_type": asset_type,
@@ -2594,6 +4024,29 @@ def _macro_trigger_breached(trigger: dict) -> bool:
     return False
 
 
+def _macro_trigger_value_is_plausible(metric: str, value: Any) -> bool:
+    try:
+        current = float(value)
+    except (TypeError, ValueError):
+        return False
+    metric = str(metric or "").strip().lower()
+    if metric == "pmi":
+        return 0.0 <= current <= 100.0
+    if metric == "hy_oas":
+        return 0.0 <= current <= 2000.0
+    if metric in {"inflation_proxy", "core_cpi_yoy", "cpi_yoy"}:
+        return -10.0 <= current <= 30.0
+    if metric == "vix_level":
+        return 0.0 <= current <= 150.0
+    if metric == "yield_curve_spread":
+        return -10.0 <= current <= 10.0
+    if metric == "sofr_ff_6m_basis_bp":
+        return -200.0 <= current <= 200.0
+    if metric in {"wti/brent", "wti", "brent"}:
+        return 0.0 <= current <= 500.0
+    return abs(current) <= 10_000.0
+
+
 def _event_priority_rank(item: dict) -> tuple[int, int, int, str, str]:
     priority = int(item.get("priority", 3) or 3)
     status = str(item.get("status", "")).strip().lower()
@@ -2627,16 +4080,20 @@ def _build_event_calendar(state: InvestmentState) -> list[dict]:
     for trigger in macro.get("monitoring_triggers", []) or []:
         if not isinstance(trigger, dict):
             continue
+        metric = str(trigger.get("metric", "")).strip()
+        current_value = trigger.get("current_value")
+        if not _macro_trigger_value_is_plausible(metric, current_value):
+            continue
         breached = _macro_trigger_breached(trigger)
         item = {
             "desk": "macro",
             "ticker": "__GLOBAL__",
             "type": "macro_monitor",
-            "subtype": str(trigger.get("name", "")).strip() or str(trigger.get("metric", "")).strip(),
-            "metric": str(trigger.get("metric", "")).strip(),
+            "subtype": str(trigger.get("name", "")).strip() or metric,
+            "metric": metric,
             "priority": int(trigger.get("priority", 3) or 3),
             "status": "triggered" if breached else "watch",
-            "current_value": trigger.get("current_value"),
+            "current_value": current_value,
             "trigger": str(trigger.get("trigger", "")).strip(),
             "action": str(trigger.get("action", "")).strip(),
             "source": "macro_monitoring_triggers",
@@ -2652,11 +4109,11 @@ def _build_event_calendar(state: InvestmentState) -> list[dict]:
         days = raw_event.get("days_to_event")
         if not isinstance(days, int):
             days = _event_days_to(as_of, raw_event.get("date"))
+        if days is not None and days < 0:
+            continue
         status = str(raw_event.get("status", "")).strip().lower() or "upcoming"
         if days is not None and days <= 7 and days >= 0:
             status = "imminent"
-        elif days is not None and days < 0:
-            status = "stale"
         event = {
             "desk": "macro",
             "ticker": "__GLOBAL__",
@@ -2683,11 +4140,11 @@ def _build_event_calendar(state: InvestmentState) -> list[dict]:
         days = item.get("days_to_event")
         if not isinstance(days, int):
             days = _event_days_to(as_of, item.get("date"))
+        if days is not None and days < 0:
+            continue
         status = str(item.get("status", "")).strip().lower() or "upcoming"
         if days is not None and days <= 7:
             status = "imminent"
-        elif days is not None and days < 0:
-            status = "stale"
         event = {
             "desk": "fundamental",
             "ticker": fundamental_ticker,
@@ -2744,6 +4201,27 @@ def _build_event_calendar(state: InvestmentState) -> list[dict]:
         }
         event["event_key"] = _event_key(event)
         events.append(event)
+
+    construction = state.get("portfolio_construction_analysis", {}) if isinstance(state.get("portfolio_construction_analysis"), dict) else {}
+    for trigger in construction.get("monitoring_triggers", []) or []:
+        if not isinstance(trigger, dict):
+            continue
+        item = {
+            "desk": "portfolio_construction",
+            "ticker": target or "__GLOBAL__",
+            "type": "construction_monitor",
+            "subtype": str(trigger.get("name", "")).strip() or str(trigger.get("metric", "")).strip(),
+            "metric": str(trigger.get("metric", "")).strip(),
+            "priority": int(trigger.get("priority", 2) or 2),
+            "status": "triggered",
+            "current_value": trigger.get("current_value"),
+            "trigger": str(trigger.get("trigger", "")).strip(),
+            "action": str(trigger.get("action", "")).strip(),
+            "source": "portfolio_construction_quant",
+            "confirmed": True,
+        }
+        item["event_key"] = _event_key(item)
+        events.append(item)
 
     deduped: dict[str, dict] = {}
     for item in events:
@@ -2895,6 +4373,9 @@ def _build_monitoring_actions(
         event_type = str(item.get("type", "")).strip().lower()
         if desk in {"macro", "fundamental", "sentiment", "quant"}:
             selected_desks.add(desk)
+        if desk == "portfolio_construction":
+            risk_refresh_required = True
+            selected_desks.add("quant")
         if desk == "fundamental" and event_type in {"earnings", "street_rating"}:
             selected_desks.add("sentiment")
         if desk in {"macro", "quant"}:
@@ -4132,6 +5613,17 @@ def risk_manager_node(state: InvestmentState) -> dict:
     return result
 
 
+def post_desk_router(state: InvestmentState) -> Literal["hedge_lite_builder", "risk_manager"]:
+    intent = _frontdoor_intent(state)
+    if intent == "position_review":
+        print("   [ROUTER] barrier -> risk_manager (frontdoor_intent=position_review)")
+        _graph_trace("route barrier -> risk_manager (frontdoor_intent=position_review)")
+        return "risk_manager"
+    print(f"   [ROUTER] barrier -> hedge_lite_builder (frontdoor_intent={intent or 'n/a'})")
+    _graph_trace(f"route barrier -> hedge_lite_builder (frontdoor_intent={intent or 'n/a'})")
+    return "hedge_lite_builder"
+
+
 def report_writer_node(state: InvestmentState) -> dict:
     """⑦ Report Writer — IC Memo + Red Team."""
     _log(state, "report_writer", "enter")
@@ -4220,17 +5712,19 @@ def risk_router(state: InvestmentState) -> Literal["orchestrator", "report_write
 # Graph Assembly
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 
-def build_investment_graph() -> StateGraph:
+def build_general_investment_graph() -> StateGraph:
     """
     V4 Graph:
-      START → orchestrator → [4 desks parallel] → barrier → hedge_lite_builder → monitoring_router → research_router
+      START → question_understanding → orchestrator → [4 desks parallel] → barrier → hedge_lite_builder
+            → portfolio_construction_quant → monitoring_router → research_router
         research_router -> risk_manager
         research_router -> research_executor -> [4 desks(parallel,research)] -> research_barrier
-                         -> hedge_lite_builder -> monitoring_router -> research_router
+                         -> hedge_lite_builder -> portfolio_construction_quant -> monitoring_router -> research_router
       risk_manager -> router -> orchestrator/report_writer
     """
     g = StateGraph(InvestmentState)
 
+    g.add_node("question_understanding", question_understanding_node)
     g.add_node("orchestrator", orchestrator_node)
     g.add_node("macro_analyst", macro_analyst_node)
     g.add_node("fundamental_analyst", fundamental_analyst_node)
@@ -4238,6 +5732,7 @@ def build_investment_graph() -> StateGraph:
     g.add_node("quant_analyst", quant_analyst_node)
     g.add_node("barrier", barrier_node)
     g.add_node("hedge_lite_builder", hedge_lite_builder_node)
+    g.add_node("portfolio_construction_quant", portfolio_construction_quant_node)
     g.add_node("monitoring_router", monitoring_router_node)
     g.add_node("research_router", research_router_node)
     g.add_node("research_executor", research_executor_node)
@@ -4249,7 +5744,8 @@ def build_investment_graph() -> StateGraph:
     g.add_node("risk_manager", risk_manager_node)
     g.add_node("report_writer", report_writer_node)
 
-    g.add_edge(START, "orchestrator")
+    g.add_edge(START, "question_understanding")
+    g.add_edge("question_understanding", "orchestrator")
 
     # Fan-out: orchestrator → 4 desks
     for desk in ["macro_analyst", "fundamental_analyst", "sentiment_analyst", "quant_analyst"]:
@@ -4259,8 +5755,12 @@ def build_investment_graph() -> StateGraph:
     for desk in ["macro_analyst", "fundamental_analyst", "sentiment_analyst", "quant_analyst"]:
         g.add_edge(desk, "barrier")
 
-    g.add_edge("barrier", "hedge_lite_builder")
-    g.add_edge("hedge_lite_builder", "monitoring_router")
+    g.add_conditional_edges("barrier", post_desk_router, {
+        "hedge_lite_builder": "hedge_lite_builder",
+        "risk_manager": "risk_manager",
+    })
+    g.add_edge("hedge_lite_builder", "portfolio_construction_quant")
+    g.add_edge("portfolio_construction_quant", "monitoring_router")
     g.add_edge("monitoring_router", "research_router")
 
     g.add_conditional_edges("research_router", research_router, {
@@ -4284,6 +5784,47 @@ def build_investment_graph() -> StateGraph:
     return g
 
 
+def build_position_review_graph() -> StateGraph:
+    """
+    Dedicated position review workflow:
+      START → question_understanding → orchestrator → [4 desks parallel] → barrier
+            → risk_manager → router → orchestrator/report_writer
+    """
+    g = StateGraph(InvestmentState)
+
+    g.add_node("question_understanding", question_understanding_node)
+    g.add_node("orchestrator", orchestrator_node)
+    g.add_node("macro_analyst", macro_analyst_node)
+    g.add_node("fundamental_analyst", fundamental_analyst_node)
+    g.add_node("sentiment_analyst", sentiment_analyst_node)
+    g.add_node("quant_analyst", quant_analyst_node)
+    g.add_node("barrier", barrier_node)
+    g.add_node("risk_manager", risk_manager_node)
+    g.add_node("report_writer", report_writer_node)
+
+    g.add_edge(START, "question_understanding")
+    g.add_edge("question_understanding", "orchestrator")
+
+    for desk in ("macro_analyst", "fundamental_analyst", "sentiment_analyst", "quant_analyst"):
+        g.add_edge("orchestrator", desk)
+        g.add_edge(desk, "barrier")
+
+    g.add_edge("barrier", "risk_manager")
+    g.add_conditional_edges("risk_manager", risk_router, {
+        "orchestrator": "orchestrator",
+        "report_writer": "report_writer",
+    })
+    g.add_edge("report_writer", END)
+    return g
+
+
+def build_investment_graph(frontdoor_intent: str | None = None) -> StateGraph:
+    intent = str(frontdoor_intent or "").strip()
+    if intent == "position_review":
+        return build_position_review_graph()
+    return build_general_investment_graph()
+
+
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 # Entry Point
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
@@ -4292,6 +5833,7 @@ def main(
     mode: str = "mock",
     seed: int | None = 42,
     user_request: str | None = None,
+    portfolio_context: dict | None = None,
 ) -> dict:
     print("🚀 7-Agent AI Investment Team V3 (Final Integration)")
     print("=" * 60)
@@ -4300,6 +5842,7 @@ def main(
     state = create_initial_state(
         user_request=user_request or "애플(AAPL) 주식을 지금 매수해도 괜찮을까요? 6개월 투자 관점에서 분석해 주세요.",
         mode=mode,
+        portfolio_context=portfolio_context or {},
         seed=seed,
     )
     run_id = state["run_id"]
@@ -4308,12 +5851,32 @@ def main(
     run_dir = telemetry.init_run(run_id, mode)
     print(f"   Run Dir: {run_dir}")
 
-    graph = build_investment_graph()
+    preview = preview_launch_requirements(
+        str(state.get("user_request", "") or ""),
+        portfolio_context=state.get("portfolio_context", {}) if isinstance(state.get("portfolio_context"), dict) else {},
+        mode=mode,
+        seed=seed,
+    )
+    preview = _prompt_position_review_inputs_if_tty(state, preview)
+    state["question_understanding"] = dict(preview.get("question_understanding", {}) or {})
+    state["portfolio_intake"] = dict(preview.get("portfolio_intake", {}) or {})
+    if preview.get("target_ticker"):
+        state["target_ticker"] = str(preview.get("target_ticker", "")).strip().upper()
+    if preview.get("universe"):
+        state["universe"] = [str(t).strip().upper() for t in (preview.get("universe") or []) if str(t).strip()]
+    state["_frontdoor_prepared"] = True
+    frontdoor_bundle = _build_frontdoor_bundle(state, compute_normalized=True)
+    state.update(frontdoor_bundle)
+    frontdoor_intent = str(((frontdoor_bundle.get("question_understanding", {}) or {}).get("intent", ""))).strip()
+    state["workflow_kind"] = "position_review" if frontdoor_intent == "position_review" else "general"
+
+    graph = build_investment_graph(frontdoor_intent=frontdoor_intent)
     app = graph.compile()
     final_state = app.invoke(state)
 
     telemetry.save_final_state(run_id, final_state)
     operator_summary_path = _write_operator_summary(run_id)
+    dashboard_path = write_run_dashboard(run_id)
 
     print("\n" + "=" * 60)
     print("✅ Pipeline Complete")
@@ -4338,6 +5901,7 @@ def main(
     print(f"   Ops Timeline: runs/{run_id}/operator_timeline.log")
     if operator_summary_path is not None:
         print(f"   Ops Summary:  {operator_summary_path}")
+    print(f"   Dashboard:    {dashboard_path}")
 
     report = final_state.get("final_report", "")
     if report:
@@ -4356,5 +5920,9 @@ if __name__ == "__main__":
     parser.add_argument("--mode", default="mock", choices=["mock", "live"])
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--question", type=str, default=None, help="사용자 질문 텍스트")
+    parser.add_argument("--portfolio-context-json", type=str, default=None, help="추가 포지션/북 컨텍스트 JSON")
     args = parser.parse_args()
-    main(mode=args.mode, seed=args.seed, user_request=args.question)
+    portfolio_context = None
+    if args.portfolio_context_json:
+        portfolio_context = json.loads(args.portfolio_context_json)
+    main(mode=args.mode, seed=args.seed, user_request=args.question, portfolio_context=portfolio_context)

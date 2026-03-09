@@ -824,28 +824,33 @@ class TestSentimentCatalystAndStructure:
 class TestOrchIntent:
     def test_single_ticker_entry(self):
         r = classify_intent_rules("AAPL 지금 매수해도 돼?")
-        assert r["intent"] == "single_ticker_entry"
+        assert r["intent"] == "single_name"
+        assert r["scenario_tags"] == []
         assert "AAPL" in r["universe"]
         assert r["horizon_days"] == 30
 
     def test_overheated_check(self):
         r = classify_intent_rules("NVDA 너무 오른 것 같은데 더 갈까?")
-        assert r["intent"] == "overheated_check"
+        assert r["intent"] == "single_name"
+        assert r["scenario_tags"] == ["overheated_check"]
         assert r["horizon_days"] == 90
 
     def test_compare_tickers(self):
         r = classify_intent_rules("AAPL vs MSFT 어느 게 나아?")
-        assert r["intent"] == "compare_tickers"
+        assert r["intent"] == "relative_value"
+        assert r["scenario_tags"] == []
         assert "AAPL" in r["universe"] or "MSFT" in r["universe"]
 
     def test_market_outlook(self):
         r = classify_intent_rules("지금 시장 전망이 어때?")
         assert r["intent"] == "market_outlook"
+        assert r["scenario_tags"] == []
         assert "SPY" in r["universe"]
 
     def test_event_risk(self):
         r = classify_intent_rules("TSLA 실적 발표 앞두고 들어가도 돼?")
-        assert r["intent"] == "event_risk"
+        assert r["intent"] == "single_name"
+        assert r["scenario_tags"] == ["event_risk"]
         assert r["horizon_days"] == 14
 
     def test_mock_market_outlook_avoids_aapl_default(self):
@@ -868,6 +873,21 @@ class TestOrchIntent:
             assert "desk_tasks" in r
             assert "macro" in r["desk_tasks"]
             assert "quant"  in r["desk_tasks"]
+
+    def test_semantic_frontdoor_context_overrides_rules_fallback(self):
+        r = classify_intent_rules(
+            "나는 지금 엔비디아 수익이 140%정도 났어. 언제쯤 매도하는 게 좋을까?",
+            {
+                "frontdoor_intent": "position_review",
+                "question_type": "single_position_review",
+                "primary_tickers": ["NVDA"],
+                "user_goal": "review_or_rebalance",
+            },
+        )
+        assert r["intent"] == "position_review"
+        assert r["scenario_tags"] == []
+        assert r["universe"] == ["NVDA"]
+        assert r["desk_tasks"]["quant"]["risk_budget"] == "Conservative"
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -1007,3 +1027,18 @@ class TestOrchLlmFirstWithFallback:
         result = _call_llm("AAPL 매수해도 돼?", 0)
         assert isinstance(result, dict)
         assert "desk_tasks" in result or "action_type" in result
+
+    def test_mock_orchestrator_uses_frontdoor_semantics_when_available(self):
+        from agents.orchestrator_agent import _mock_orchestrator_decision
+        out = _mock_orchestrator_decision(
+            "브로드컴 지금 너무 오른 것 같은데 언제쯤 줄이는 게 좋을까?",
+            0,
+            portfolio_context={
+                "frontdoor_intent": "position_review",
+                "question_type": "single_position_review",
+                "primary_tickers": ["AVGO"],
+                "user_goal": "review_or_rebalance",
+            },
+        )
+        assert out["intent"] == "position_review"
+        assert out["investment_brief"]["target_universe"] == ["AVGO"]

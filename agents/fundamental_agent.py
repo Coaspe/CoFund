@@ -1131,6 +1131,9 @@ _FUNDA_EVIDENCE_KINDS = {
     "web_search",
 }
 _PATCHABLE_FIELDS = {
+    "primary_decision",
+    "recommendation",
+    "confidence",
     "key_drivers",
     "what_to_watch",
     "scenario_notes",
@@ -1298,8 +1301,12 @@ def _apply_overlay_patch(output: dict, patch: dict) -> None:
     if not isinstance(patch, dict):
         return
     for key in _PATCHABLE_FIELDS:
-        if key in patch and patch[key]:
-            output[key] = patch[key]
+        if key not in patch:
+            continue
+        value = patch.get(key)
+        if value in (None, "", [], {}):
+            continue
+        output[key] = value
     if patch.get("evidence_requests"):
         output["evidence_requests"] = _merge_requests(
             output.get("evidence_requests", []),
@@ -1318,31 +1325,49 @@ def _generate_evidence_requests(
     focus_areas: Optional[list[str]] = None,
 ) -> list:
     """펀더멘탈 evidence request 생성."""
+    def _has_value(value: Any) -> bool:
+        return value not in (None, "", [], {})
+
     at = str(asset_type or "EQUITY").upper()
     if at in {"ETF", "INDEX"}:
-        reqs = [
-            {
-                "desk": "fundamental",
-                "kind": "valuation_context",
-                "ticker": ticker,
-                "query": f"{ticker} holdings top 10 sector weights factor exposures index forward PE",
-                "priority": 1,
-                "recency_days": 30,
-                "max_items": 5,
-                "rationale": f"{at.lower()} mode: holdings/sector/valuation aggregate",
-            },
-            {
-                "desk": "fundamental",
-                "kind": "web_search",
-                "ticker": ticker,
-                "query": f"{ticker} ETF flow creation redemption tracking error expense ratio liquidity",
-                "priority": 2,
-                "recency_days": 30,
-                "max_items": 5,
-                "rationale": f"{at.lower()} mode: flow/liquidity diagnostics",
-            },
-        ]
+        reqs = []
+        missing_composition_context = any(
+            not _has_value(financials.get(key))
+            for key in ("holdings_top10_weight_pct", "sector_weights", "factor_exposures", "index_forward_pe")
+        )
+        missing_flow_context = any(
+            not _has_value(financials.get(key))
+            for key in ("net_flow_1m", "tracking_error", "expense_ratio", "liquidity_score")
+        )
+        if missing_composition_context:
+            reqs.append(
+                {
+                    "desk": "fundamental",
+                    "kind": "valuation_context",
+                    "ticker": ticker,
+                    "query": f"{ticker} holdings top 10 sector weights factor exposures index forward PE",
+                    "priority": 1,
+                    "recency_days": 30,
+                    "max_items": 5,
+                    "rationale": f"{at.lower()} mode: holdings/sector/valuation aggregate missing",
+                }
+            )
+        if missing_flow_context:
+            reqs.append(
+                {
+                    "desk": "fundamental",
+                    "kind": "web_search",
+                    "ticker": ticker,
+                    "query": f"{ticker} ETF flow creation redemption tracking error expense ratio liquidity",
+                    "priority": 2,
+                    "recency_days": 30,
+                    "max_items": 5,
+                    "rationale": f"{at.lower()} mode: flow/liquidity diagnostics missing",
+                }
+            )
         for focus in (focus_areas or [])[:2]:
+            if not reqs:
+                break
             reqs.append(
                 {
                     "desk": "fundamental",
