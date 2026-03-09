@@ -1,6 +1,6 @@
 # AI Investment Team 프로젝트 상세 문서 (비개발자 친화판)
 
-작성 기준일: 2026-02-25  
+작성 기준일: 2026-03-09
 대상 저장소: `ai-investment-team`  
 문서 목적: 코드를 모르는 사람도 "이 시스템이 왜, 언제, 어떤 기준으로 움직이는지" 이해할 수 있도록 설명한다.
 
@@ -22,16 +22,19 @@
 
 ## 1) 5분 요약
 
-이 프로젝트는 "한 명의 PM(Orchestrator) + 4개 분석 데스크 + 리스크 위원회" 구조로 돌아가는 자동 투자 검토 파이프라인이다.
+이 프로젝트는 "Frontdoor Intake + 한 명의 PM(Orchestrator) + 4개 분석 데스크 + 리스크 위원회 + 운영/리서치 보조 레이어" 구조로 돌아가는 자동 투자 검토 파이프라인이다.
 
+- Frontdoor Parser: 자연어 질문을 구조화된 투자 요청으로 해석
 - Orchestrator: 이번 라운드에 누가 무엇을 볼지 지시
 - Macro/Fundamental/Sentiment/Quant: 각자 전문 관점으로 분석
+- Hedge Lite / Portfolio Construction Quant: 데스크 결과를 포지션/헤지 후보로 조립
+- Monitoring Router: 이벤트 일정과 품질 저하를 감지해 재검토 필요 여부 판단
 - Research Router/Executor: 근거가 부족하면 자동으로 추가 조사
 - Risk Manager: 5개 게이트로 최종 리스크 심사
 - Report Writer: 투자심의 메모 작성
 
 쉽게 말해:
-- 사람으로 치면 "팀장 -> 실무자 보고 -> 심사위원회 -> 최종 보고서" 흐름이다.
+- 사람으로 치면 "접수창구 -> 팀장 -> 실무자 보고 -> 조립/모니터링 -> 심사위원회 -> 최종 보고서" 흐름이다.
 - 데이터가 약하면 자동으로 "자료 더 찾아와"를 수행한다.
 
 ---
@@ -49,24 +52,28 @@
 
 ```mermaid
 flowchart LR
-    A["START"] --> B["orchestrator"]
-    B --> C["macro_analyst"]
-    B --> D["fundamental_analyst"]
-    B --> E["sentiment_analyst"]
-    B --> F["quant_analyst"]
-    C --> G["barrier"]
-    D --> G
-    E --> G
-    F --> G
-    G --> R["research_router"]
-    R -->|"run_research=true"| X["research_executor"]
-    X --> RC["rerun selected desks"]
-    RC --> RB["research_barrier"]
-    RB --> R
-    R -->|"run_research=false"| H["risk_manager"]
-    H -->|"High + feedback + iter<3"| B
-    H -->|"otherwise"| I["report_writer"]
-    I --> J["END"]
+    A["START"] --> B["question_understanding"]
+    B --> C["orchestrator"]
+    C --> D["macro_analyst"]
+    C --> E["fundamental_analyst"]
+    C --> F["sentiment_analyst"]
+    C --> G["quant_analyst"]
+    D --> H["barrier"]
+    E --> H
+    F --> H
+    G --> H
+    H --> I["hedge_lite_builder"]
+    I --> J["portfolio_construction_quant"]
+    J --> K["monitoring_router"]
+    K --> L["research_router"]
+    L -->|"run_research=true"| M["research_executor"]
+    M --> N["selected desk reruns"]
+    N --> O["research_barrier"]
+    O --> I
+    L -->|"run_research=false"| P["risk_manager"]
+    P -->|"High + feedback + iter<3"| C
+    P -->|"otherwise"| Q["report_writer"]
+    Q --> R["END"]
 ```
 
 기술 설명:
@@ -82,6 +89,41 @@ flowchart LR
 2. 리스크 반려 -> scale down / hedge / pivot
 3. 필요 시 추가 조사
 4. 반복 한도 도달 혹은 승인 시 최종 보고서
+
+### 2.2 포지션 리뷰 전용 경로
+
+`question_understanding.intent == position_review`이면 일반 그래프가 아니라 전용 그래프를 사용한다.
+
+```mermaid
+flowchart LR
+    A["START"] --> B["question_understanding"]
+    B --> C["orchestrator"]
+    C --> D["4 desks"]
+    D --> E["barrier"]
+    E --> F["risk_manager"]
+    F -->|"High + feedback + iter<3"| C
+    F -->|"otherwise"| G["report_writer"]
+    G --> H["END"]
+```
+
+기술 설명:
+- 포지션 리뷰는 기존 보유 포지션의 유지/축소/청산 판단이 핵심이므로 `hedge_lite_builder`, `portfolio_construction_quant`, `monitoring_router`, `research_router`를 건너뛴다.
+- 이 경로는 보유 수량/평단이 있을 때 더 정확해지고, TTY 실행에서는 부족한 입력을 추가로 물어볼 수 있다.
+
+쉽게 말해:
+- "새로 뭘 살까?"와 "이미 가진 걸 어떻게 관리할까?"는 다른 회의다.
+- 후자는 불필요한 리밸런싱/헤지 단계를 건너뛰고 바로 심사에 들어간다.
+
+### 2.3 대시보드에만 보이는 보조 단계
+
+운영 화면과 `events.jsonl`에는 아래 보조 단계가 별도 노드처럼 보일 수 있다.
+
+- `autonomy_planner`: 실행 중 복구/보강 아이디어 생성
+- `bounded_swarm_planner`: 추가 리서치 후보 우선순위 정리
+- `research_round`: 리서치 라운드 감사 이벤트
+- `human_handoff`: 자동 복구가 안 되는 경우 운영자 개입 신호
+
+이들은 모두 LangGraph의 1급 노드는 아니고, 감사/운영 추적을 위한 이벤트 계층이다.
 
 ---
 
@@ -120,6 +162,11 @@ flowchart LR
 ### 4.2 자주 보는 상태 필드
 
 - `run_id`, `as_of`, `mode`: 이번 실행의 신분증
+- `question_understanding`: Frontdoor가 뽑은 구조화 해석 결과
+- `portfolio_intake`, `normalized_portfolio_snapshot`: 자연어 포트폴리오 입력과 정규화 결과
+- `intent`: 시스템 전역 canonical workflow key
+- `scenario_tags`: planner nuance tag 집합
+- `workflow_kind`: `general` 또는 `position_review`
 - `macro_analysis/fundamental_analysis/...`: 데스크별 결과 본문
 - `evidence_store`: 모인 근거 원문 저장소
 - `evidence_score`: 근거 품질 종합 점수
@@ -127,12 +174,52 @@ flowchart LR
 - `completed_tasks`: 이번 라운드에서 끝난 desk
 - `trace/events`: 왜 이런 경로를 탔는지 감사 정보
 
-### 4.3 seed 동작
+### 4.3 최소 분류 모델(`question_type -> intent + scenario_tags`)
+
+이 시스템은 현재 질문 해석을 세 층으로 과도하게 늘리지 않고 아래 최소 모델로 정리한다.
+
+- `question_type`: 입력 형식 분류
+  - `single_name_analysis`
+  - `single_position_review`
+  - `portfolio_rebalance`
+  - `hedge_request`
+  - `market_outlook`
+  - `compare_tickers`
+- `intent`: 시스템 전체가 공유하는 canonical workflow intent
+  - `single_name`
+  - `position_review`
+  - `portfolio_rebalance`
+  - `hedge_design`
+  - `market_outlook`
+  - `relative_value`
+- `scenario_tags`: planner nuance
+  - 대표값: `event_risk`, `overheated_check`
+
+기술 설명:
+- `question_type`는 "질문을 어떤 intake form으로 읽을지"를 결정한다.
+- `intent`는 그래프 라우팅과 상위 워크플로우를 고정한다.
+- `scenario_tags`는 `event_risk` 같은 세부 렌즈를 붙인다.
+- 따라서 `state.intent`는 가능한 한 6개 canonical 값으로 유지되고, 세부 planner 의미는 `scenario_tags`로 분리된다.
+
+쉽게 말해:
+- "질문 형식", "큰 작업 종류", "세부 해석 렌즈"를 분리해 헷갈림을 줄인 구조다.
+
+예시:
+- `TSLA 실적 앞두고 들어가도 돼?`
+  - `question_type=single_name_analysis`
+  - `intent=single_name`
+  - `scenario_tags=["event_risk"]`
+- `NVDA 20주 평단 500인데 언제 일부 익절할까?`
+  - `question_type=single_position_review`
+  - `intent=position_review`
+  - `scenario_tags=[]`
+
+### 4.4 seed 동작
 
 기술 설명:
 - CLI `--seed`는 `create_initial_state(..., seed=...)`로 전달된다.
-- 현재 `_make_seed`는 `state.get("seed")`를 우선 참조한다.
-- top-level `seed`가 없으면 `run_id` 해시 기반 시드를 사용한다.
+- 상태에는 `run_context.seed`로 저장되고, `_make_seed`는 이를 우선 참조한다.
+- 값이 없으면 `run_id` 해시 기반 시드를 사용한다.
 
 쉽게 말해:
 - 같은 seed를 줘도 상태에 seed가 어떻게 들어오느냐에 따라 재현성이 달라질 수 있다.
@@ -300,11 +387,14 @@ macro/fundamental/sentiment desk는 rerun 시 `evidence_store`를 읽어 `eviden
 ## 7.1 Orchestrator (`agents/orchestrator_agent.py`)
 
 기술 설명:
-- 사용자 요청을 해석하고 desk별 `desk_tasks`를 발행
+- Frontdoor 결과(`question_type`, `intent`, `scenario_tags`)를 받아 desk별 `desk_tasks`를 발행
 - 리스크 피드백을 받으면 `scale_down`, `add_hedge`, `pivot_strategy` 중 선택
+- 최종 state에는 canonical `intent`를 유지하고, 세부 planner 뉘앙스는 `scenario_tags`로 전달
+- `position_review` 요청은 관련 없는 유니버스로 pivot하지 못하도록 제약
 
 쉽게 말해:
 - 팀장 역할. "누가 무엇을 볼지" 배정하고, 반려당하면 전략 방향을 바꾼다.
+- 다만 "보유 포지션 관리 질문"이면 새 종목 아이디어로 새지 않게 앞단 의미를 강하게 존중한다.
 
 ## 7.2 Macro (`agents/macro_agent.py`, `engines/macro_engine.py`)
 
@@ -447,21 +537,23 @@ Hard flag는 \"있으면 바로 강한 경고\"로 취급되는 항목이다.
 ## 9) LLM 호출 정책(운영에서 중요한 부분)
 
 핵심 정책:
-- 기본 provider: ZAI(GLM)
+- 기본 provider: agent별 `cerebras:gpt-oss-120b`
+- 전역 override: `LLM_PROVIDER`, `LLM_MODEL_NAME`
 - 전역 동시성 제한: 기본 1개
 - 전역 요청 간격: 기본 2초 (`LLM_MIN_REQUEST_INTERVAL_SEC`)
-- rate limit 시 10초 대기 후 1회 재시도
+- `gpt-oss` 예산 보호: 기본 30 RPM / 64,000 TPM
+- Cerebras rate limit 시 10초 대기 후 1회 재시도, 그리고 동일 provider의 `qwen-3-235B-A22B-2507` fallback 후보 사용
 
-데이터 fallback 정책:
-- 1차: 구조화/고신뢰 provider
-- 2차: 웹 수집 provider
-- 3차(옵션): Perplexity 검색 API (`PERPLEXITY_MODEL`, 기본 `sonar`)
+Provider chain 정책:
+- 에이전트별 fallback chain 정의는 존재한다.
+- 다만 현재 `_build_provider_chain`에서는 외부 provider chain이 비활성화되어, 실질적으로는 primary provider + Cerebras 내부 RL fallback 중심으로 동작한다.
+- pytest 환경에서는 기본적으로 캐시를 우회하고 실호출 정책을 강제한다.
 
 주의:
-- 설정상 fallback chain은 정의되어 있지만, 현재 `_build_provider_chain`에서 fallback 경로가 비활성화되어 GLM 단일 경로로 동작한다.
+- 문서상 "fallback이 많다"와 실제 런타임 "항상 다 돈다"는 다르다. 현재는 보수적으로 제한된 경로만 사용한다.
 
 쉽게 말해:
-- "한 번에 하나씩", "요청 사이 2초 쉬고", "막히면 10초 기다렸다 1번 재시도"한다.
+- "한 번에 하나씩", "요청 사이 2초 쉬고", "기본은 Cerebras를 쓰되 rate limit이면 제한된 fallback만 허용"한다.
 
 ---
 
@@ -474,9 +566,10 @@ Hard flag는 \"있으면 바로 강한 경고\"로 취급되는 항목이다.
 - `runs/{run_id}/final_state.json`: 최종 상태 스냅샷
 - `runs/{run_id}/operator_timeline.log`: 운영자용 읽기 쉬운 타임라인
 - `runs/{run_id}/operator_summary.md`: 핵심 이벤트 요약본
+- `runs/{run_id}/agent_empire.html`: self-contained replay dashboard
 
 쉽게 말해:
-- `events.jsonl`은 원본 로그, `operator_*`는 사람이 빠르게 읽는 요약이다.
+- `events.jsonl`은 원본 로그, `operator_*`는 사람이 빠르게 읽는 요약, `agent_empire.html`은 시각적 리플레이다.
 
 ## 10.2 API 사용량 파일
 
@@ -486,6 +579,38 @@ Hard flag는 \"있으면 바로 강한 경고\"로 취급되는 항목이다.
 
 쉽게 말해:
 - "오늘 어떤 API를 몇 번 불렀고, 몇 번 성공/실패했는지" 일 단위로 본다.
+
+## 10.3 Control Room / Replay UI
+
+- 실행 명령: `python -m visualization.webapp --host 127.0.0.1 --port 8000`
+- 메인 화면(`/`): 최근 run, launch 상태, 최종 결과 미리보기
+- run 화면(`/runs/{run_id}`): agent replay dashboard
+- API:
+  - `/api/runs`
+  - `/api/runs/{run_id}`
+  - `/api/runs/{run_id}/result`
+  - `/api/launch`
+
+기술 설명:
+- Launch 전에 `preview_launch_requirements()`를 사용해 frontdoor 결과와 clarification 필요 여부를 미리 계산한다.
+- rate limit로 멈춘 launch는 pending 상태로 추적된다.
+
+쉽게 말해:
+- 운영자는 웹 화면에서 "실행 전 확인", "실행 중 추적", "끝난 뒤 리플레이"를 한 곳에서 볼 수 있다.
+
+## 10.4 human_handoff가 뜻하는 것
+
+`human_handoff`는 그래프의 다음 노드라기보다 "자동 복구가 막혔으니 운영자 확인이 필요하다"는 운영 신호다.
+
+주로 이런 경우에 발생한다.
+- 리서치 라운드 한도 도달
+- 예산 소진
+- 추가 근거 증가량이 너무 적음
+- NewsAPI/FMP/provider restriction 같은 blocking issue가 남아 있음
+- 근거 점수가 낮은 상태로 조사 종료
+
+쉽게 말해:
+- 시스템이 "여기서부터는 사람이 보고 판단해야 한다"고 명시적으로 손드는 순간이다.
 
 ---
 
@@ -524,19 +649,31 @@ Hard flag는 \"있으면 바로 강한 경고\"로 취급되는 항목이다.
 ## 12.1 핵심 런타임
 
 - `investment_team.py`: 그래프 조립/노드 라우팅/실행
-- `agents/*`: 각 에이전트 판단 및 출력 구성
+- `agents/orchestrator_agent.py`: PM/CIO orchestration, intent-aware tasking
+- `agents/macro_agent.py`, `agents/fundamental_agent.py`, `agents/sentiment_agent.py`: 데스크 분석
+- `agents/risk_agent.py`, `agents/report_agent.py`: 리스크 심사와 최종 보고
+- `agents/autonomy_planner.py`, `agents/autonomy_overlay.py`: 런타임 복구/overlay 보강
 - `engines/*`: 순수 계산 로직
 - `data_providers/*`: 외부 데이터 수집 (`fred_provider`, `market_data_provider`, `fed_funds_futures_provider` 포함)
 - `llm/router.py`: LLM 호출 정책/제어
 - `telemetry.py`: 실행 이벤트 저장
 - `api_usage_stats.py`: API 일별 집계 저장
+- `visualization/agent_empire.py`: replay dashboard 생성
+- `visualization/webapp.py`: FastAPI Control Room
 
 ## 12.2 테스트
 
-- `tests/test_graph_end_to_end.py`: 전체 파이프라인 완료 검증
-- `tests/test_bounded_swarm_v01.py`: research/rerun 회귀 검증
+- `tests/test_regression_state_contract.py`: frontdoor/state/workflow 회귀 검증
+- `tests/test_coverage_expansion.py`: macro/fundamental/sentiment/orchestrator 확장 커버리지
 - `tests/test_llm_test_policy.py`: LLM 라우터 정책 검증
-- 기타 risk/sentiment/provider 테스트로 세부 규칙 검증
+- `tests/test_agent_empire_dashboard.py`: replay dashboard 검증
+- `tests/test_agent_empire_webapp.py`: FastAPI Control Room 검증
+- `tests/test_user_handoff.py`: human handoff 조건 검증
+
+테스트 규모(2026-03-09 수집 기준):
+- `tests/` 아래 31개 pytest 모듈
+- 전체 수집 260 tests
+- 추가로 `scripts/test_single_agent.py`가 script-level smoke 역할 수행
 
 ---
 
@@ -549,6 +686,7 @@ Hard flag는 \"있으면 바로 강한 경고\"로 취급되는 항목이다.
 - `runs/{run_id}/final_state.json`
 - `runs/{run_id}/operator_timeline.log`
 - `runs/{run_id}/operator_summary.md`
+- `runs/{run_id}/agent_empire.html`
 
 3. 리서치가 실제로 돌았는지 확인
 - `research_router`에서 `run=True/False`와 이유
@@ -561,6 +699,11 @@ Hard flag는 \"있으면 바로 강한 경고\"로 취급되는 항목이다.
 5. API/LLM 상태 점검
 - `.cache/api_usage/YYYY-MM-DD.json`
 - LLM rate limit 로그와 요청 간격 대기 로그
+
+6. 운영자 개입이 필요한지 확인
+- `final_state.json`의 `user_action_required`
+- `user_action_items`
+- `events.jsonl`의 `human_handoff`
 
 ---
 
@@ -585,4 +728,4 @@ Q5. 비개발자인데 어떤 파일부터 보면 되나?
 
 ## 15) 핵심 한 줄 요약
 
-이 시스템은 "근거를 모으고, 팀별로 해석하고, 리스크로 걸러서, 사람이 읽을 수 있는 결론"을 만드는 자동 투자 검토 파이프라인이다.
+이 시스템은 "질문을 구조화하고, 근거를 모으고, 팀별로 해석하고, 포지션/리스크로 조립하고, 사람이 읽을 수 있게 리플레이까지 남기는" 자동 투자 검토 파이프라인이다.

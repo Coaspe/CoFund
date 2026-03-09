@@ -1,137 +1,192 @@
-# 🚀 7-Agent AI Investment Team (CoFund)
+# AI Investment Team (CoFund)
 
-A high-performance, 7-agent AI investment system designed for multi-dimensional stock analysis and risk-managed portfolio allocation.
+AI-driven investment research pipeline with frontdoor intake, multi-desk analysis, bounded web research, risk gating, monitoring, and replay tooling.
 
-## 🏛️ Architecture
+The system analyzes ideas and portfolios. It does not place trades and does not contain broker integration.
 
-The system utilizes a modular architecture with clear separation between data retrieval, numerical computation (engines), and narrative interpretation (agents).
+## Current Runtime Shape
 
-### 1. Desk Agents (Analysts)
-- **Macro Agent**: Analyzes global economic indicators and regime shifts.
-- **Fundamental Agent**: Evaluates company financials, SEC filings, and structural risks.
-- **Sentiment Agent**: Processes news sentiment and tilt factors.
-- **Quant Agent**: Executes statistical models, Z-score analysis, and CVaR calculations.
+The repository still centers on 7 primary agents:
 
-### 2. Control Agents
-- **Orchestrator (CIO/PM)**: Delegated tasks to desk agents and reconciles feedback.
-- **Risk Manager**: Enforces a 5-Gate safety check (Gate 1 to 5) to filter high-risk positions.
-- **Report Writer**: Generates IC Memos and "Red Team" analysis for final investment decisions.
+- Orchestrator
+- Macro
+- Fundamental
+- Sentiment
+- Quant
+- Risk Manager
+- Report Writer
 
-### 3. Core Infrastructure
-- **Data Hub**: Centralized data provider interface (FRED, NewsAPI, FMP, AlphaVantage).
-- **Engines**: Pure Python logic for deterministic computations, isolated from LLM interpretation.
-- **Telemetry**: Full auditability with event logging (`events.jsonl`) and state tracking.
+Around those agents, the runtime now includes several non-desk stages:
 
-## ⚖️ Iron Rules (Enforced)
+- `question_understanding`: frontdoor parser for natural-language intake
+- `hedge_lite_builder`: quick hedge candidate screen
+- `portfolio_construction_quant`: post-desk portfolio assembly
+- `monitoring_router`: event-calendar and quality-trigger escalation
+- `research_router` and `research_executor`: bounded evidence loop
+- `autonomy_planner`, `bounded_swarm_planner`, `research_round`, `human_handoff`: telemetry-visible auxiliary stages used for recovery, planning, and operator escalation
 
-- **R0 (No Trading)**: Absolutely no broker API or order placement code.
-- **R1 (Python-LLM Separation)**: Engines compute numbers; LLMs only interpret narratives.
-- **R2 (No Evidence, No Trade)**: Every decision must be backed by a verifiable `evidence[]` array.
-- **R3 (Quant Isolation)**: Quant engines perform pure computation without direct data fetching.
-- **R4 (Risk Gate Order)**: Risk checks must strictly follow Gates 1 through 5.
-- **R5 (Sentiment Cap)**: Sentiment tilt factors are capped between [0.7, 1.3].
-- **R6 (Disagreement = Risk)**: High disagreement between agents is flagged as model risk.
-- **R7 (Auditability)**: Every run must generate a unique `run_id` and full trace documentation.
+## Graph Variants
 
-## 🛠️ Setup
+General workflow:
 
-1.  **Clone the repository**:
-    ```bash
-    git clone git@github.com:Coaspe/CoFund.git
-    cd ai-investment-team
-    ```
+```mermaid
+flowchart LR
+    A["START"] --> B["question_understanding"]
+    B --> C["orchestrator"]
+    C --> D["macro / fundamental / sentiment / quant"]
+    D --> E["barrier"]
+    E --> F["hedge_lite_builder"]
+    F --> G["portfolio_construction_quant"]
+    G --> H["monitoring_router"]
+    H --> I["research_router"]
+    I -->|"run_research=true"| J["research_executor + selected reruns"]
+    J --> F
+    I -->|"run_research=false"| K["risk_manager"]
+    K -->|"High + required + iter<3"| C
+    K -->|"otherwise"| L["report_writer"]
+    L --> M["END"]
+```
 
-2.  **Environment Setup**:
-    ```bash
-    python -m venv .venv
-    source .venv/bin/activate
-    pip install -r requirements.txt
-    cp .env.example .env  # Add your API keys here
-    ```
+Dedicated position-review workflow:
 
-## 🚀 Usage
+- Triggered when frontdoor intent is `position_review`
+- Uses a smaller graph: `question_understanding -> orchestrator -> 4 desks -> barrier -> risk_manager -> orchestrator/report_writer`
+- Skips hedge-lite, portfolio construction, monitoring, and research-loop nodes
 
-Run the investment pipeline in mock mode:
+## Frontdoor State Contract
+
+The runtime now uses a minimal frontdoor/planner contract:
+
+- `question_type`: intake form for the user's request
+  - `single_name_analysis`
+  - `single_position_review`
+  - `portfolio_rebalance`
+  - `hedge_request`
+  - `market_outlook`
+  - `compare_tickers`
+- `intent`: canonical workflow key shared across the graph
+  - `single_name`
+  - `position_review`
+  - `portfolio_rebalance`
+  - `hedge_design`
+  - `market_outlook`
+  - `relative_value`
+- `scenario_tags`: planner nuance tags layered on top of the canonical intent
+  - examples: `event_risk`, `overheated_check`
+- `workflow_kind`: graph selector
+  - `general`
+  - `position_review`
+
+In practice:
+
+- `state.intent` stays canonical
+- planner-specific nuance lives in `state.scenario_tags`
+- `question_understanding` drives graph selection and clarification prompts
+
+## Core Rules
+
+- No broker API or order placement code
+- Engines own deterministic computation; LLMs interpret and orchestrate
+- Every decision is expected to be evidence-backed
+- Quant logic remains isolated from direct data fetching
+- Risk gates run in fixed order 1 -> 2 -> 3 -> 4 -> 5
+- Sentiment tilt is capped to `[0.7, 1.3]`
+- Each run is auditable through `run_id`, `events.jsonl`, and `final_state.json`
+
+## Setup
+
+```bash
+git clone git@github.com:Coaspe/CoFund.git
+cd ai-investment-team
+
+python -m venv .venv
+source .venv/bin/activate
+pip install -r requirements.txt
+cp .env.example .env
+```
+
+Add the API keys you want to use to `.env`. Mock mode works without live provider keys.
+
+## Running The Pipeline
+
+Mock mode:
+
 ```bash
 python investment_team.py --mode mock --seed 42
 ```
 
-Run in live mode (requires API keys):
+Live mode:
+
 ```bash
-python investment_team.py --mode live
+python investment_team.py --mode live --seed 42
 ```
 
-## 📂 Project Structure
-
-- `agents/`: LLM-based decision logic for each desk.
-- `engines/`: Deterministic numerical computation engines.
-- `data_providers/`: API connectors and data normalization.
-- `schemas/`: Pydantic models for type-safe state and evidence.
-- `llm/`: Multi-provider LLM router (Groq, Gemini).
-- `risk/`: Risk gate engine — `risk/engine.py` (fixed 1→5 order) + `risk/gates/` (Gate 1–5 files).
-- `portfolio/`: Deterministic multi-ticker portfolio allocator.
-- `storage/`: Point-in-Time snapshot store — `pit_store.py`.
-- `validators/`: LLM output fact-check — `factcheck.py`.
-- `backtest/`: PIT-based reproducible backtest runner.
-- `runs/`: Output directory per `run_id` (raw/features/decisions/llm_io/final_report/config).
-- `tests/`: 58 tests covering all engines, agents, gates, and invariants.
-
-## 🧪 Running Tests
+Backtest runner:
 
 ```bash
-./.venv/bin/python -m pytest tests/ -v
-```
-
-Key test files:
-| File | Purpose |
-|------|---------|
-| `test_gate_order.py` | Risk Gates run strictly 1→2→3→4→5 |
-| `test_gate_parity.py` | New engine matches old compute_risk_decision (decision-level) |
-| `test_report_factcheck.py` | T3: LLM report/narrative fact-check + fallback |
-| `test_pipeline_reproducibility.py` | T4: same PIT → identical positions_final + gate_trace |
-| `test_quant_engine_isolation.py` | T1: quant_engine has no HTTP imports |
-
-## 📊 Backtest
-
-```bash
-# Mock mode (deterministic, no API keys needed)
 ./.venv/bin/python backtest/runner.py \
   --start 2024-01-01 --end 2024-06-30 \
   --universe AAPL MSFT --mode mock --seed 42
 ```
 
-Output files written to `runs/backtest_{id}/`:
-- `backtest_results.csv` — per-period returns, turnover, drawdown
-- `backtest_summary.json` — CAGR, Sharpe, MaxDD, config_hash
-- `config/config_hash.txt` — reproducibility key
+## Control Room And Replay
 
-## ✅ Definition of Done (DoD)
+Run replay dashboard artifacts are written into each run directory:
 
-| DoD | Status |
-|-----|--------|
-| DoD1: All agent outputs Pydantic-validated | ✅ `schemas/common.py` BaseAnalystOutput |
-| DoD2: `runs/{run_id}/raw/features/decisions/llm_io/final_report/config` | ✅ `storage/pit_store.py` |
-| DoD3: Risk gate trace always 1→2→3→4→5 | ✅ `risk/engine.py` GATES fixed array |
-| DoD4: Report/narrative fact-check + retry/fallback | ✅ `validators/factcheck.py` |
-| DoD5: Backtest runner reproducible PIT results | ✅ `backtest/runner.py` |
-| DoD6: T1–T4 pytest all PASS | ✅ 58/58 tests green |
+- `runs/{run_id}/events.jsonl`
+- `runs/{run_id}/final_state.json`
+- `runs/{run_id}/operator_timeline.log`
+- `runs/{run_id}/operator_summary.md`
+- `runs/{run_id}/agent_empire.html`
 
-## 🧮 Coverage Expansion v1 — Key Definitions
+You can also serve the FastAPI control room locally:
 
-### news_volume_z
-- **Definition**: `(today_article_count - 30d_mean) / 30d_std`
-- **When None**: `effective_article_count < 10` OR `baseline_days_with_data < 10`  
-- **When 0**: `std == 0` (all days identical volume)  
-- **data_quality.warnings**: `"insufficient_news_baseline"` added when None
+```bash
+python -m visualization.webapp --host 127.0.0.1 --port 8000
+```
 
-### vol_regime (infer_vol_regime)
-Priority chain — uses first available source:
-1. **Quant HMM** `regime_2_high_vol`: `≥0.50→crisis / ≥0.35→high / else normal`
-2. **Macro** `tail_risk_warning=True + credit_stress stressed → crisis`; `risk_off → high`
-3. **VIX** `≥30→crisis / ≥22→high / else normal`
-4. **Default fallback**: `normal` + `warnings: ["vol_regime_unknown"]`
+The control room supports:
 
-### Tilt hardening (R5 preserved)
-- `catalyst_risk_level="high"` → `tilt = 1.0` (no directional bet during catalyst)
-- `vol_regime="crisis"` → `tilt ≤ 0.9`
-- Hard cap [0.7, 1.3] always applies
+- recent run browsing
+- live launch tracking
+- launch preparation for position-review clarification
+- replay pages for completed runs
+
+## Repository Map
+
+- `investment_team.py`: graph assembly, node wiring, CLI entrypoint
+- `agents/`: orchestrator, desk agents, risk, report, and autonomy helpers
+- `engines/`: deterministic macro, quant, fundamental, sentiment, and policy logic
+- `data_providers/`: market, macro, filing, and web-research providers
+- `schemas/`: Pydantic models and shared `InvestmentState`
+- `llm/`: provider router, cache, concurrency guard, and fallback behavior
+- `risk/`: 5-gate implementation
+- `portfolio/`: deterministic portfolio allocator
+- `telemetry.py`: run artifact logging
+- `visualization/`: replay dashboard renderer and FastAPI control room
+- `tests/`: regression, policy, provider, graph, and visualization coverage
+
+## Testing
+
+Run the suite:
+
+```bash
+./.venv/bin/python -m pytest -q
+```
+
+If you want to inspect the currently collected tests:
+
+```bash
+./.venv/bin/python -m pytest --collect-only -q
+```
+
+As of 2026-03-09, the repository collects 260 tests. The `tests/` directory contains 31 pytest modules, and `scripts/test_single_agent.py` adds script-level smoke coverage.
+
+Representative test modules:
+
+- `tests/test_regression_state_contract.py`: state contract and workflow regressions
+- `tests/test_coverage_expansion.py`: expanded macro/fundamental/sentiment/orchestrator coverage
+- `tests/test_llm_test_policy.py`: LLM router and orchestrator fallback policy
+- `tests/test_agent_empire_dashboard.py`: replay dashboard rendering
+- `tests/test_agent_empire_webapp.py`: FastAPI control-room behavior
+- `tests/test_user_handoff.py`: operator escalation when automation cannot recover
