@@ -15,6 +15,8 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Optional
 
+from runtime_identity import agent_id_for_node, owner_agent_id_for_node
+
 
 RUNS_DIR = Path("runs")
 
@@ -46,6 +48,8 @@ def log_event(
     node_name: str,
     iteration: int,
     *,
+    agent_id: Optional[str] = None,
+    owner_agent_id: Optional[str] = None,
     phase: str = "exit",
     inputs_summary: Optional[dict] = None,
     outputs_summary: Optional[dict] = None,
@@ -56,8 +60,10 @@ def log_event(
 
     Args:
         run_id:          런 ID
-        node_name:       노드 이름 (e.g., "orchestrator", "risk_manager")
+        node_name:       실제 그래프 노드 이름 (e.g., "macro_analyst", "research_router")
         iteration:       현재 iteration
+        agent_id:        agent-backed node의 책임 에이전트 ID. 생략 시 node_name으로부터 추론.
+        owner_agent_id:  system node까지 포함한 책임 owner ID. 생략 시 node_name으로부터 추론.
         phase:           "enter" | "exit"
         inputs_summary:  입력 요약 (핵심 필드만)
         outputs_summary: 출력 요약 (핵심 필드만)
@@ -70,6 +76,8 @@ def log_event(
         "ts": datetime.now(timezone.utc).isoformat(),
         "run_id": run_id,
         "node_name": node_name,
+        "agent_id": agent_id or agent_id_for_node(node_name),
+        "owner_agent_id": owner_agent_id or owner_agent_id_for_node(node_name),
         "iteration": iteration,
         "phase": phase,
         "inputs_summary": _safe_truncate(inputs_summary),

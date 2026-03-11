@@ -12,6 +12,7 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 import agents.macro_agent as macro_agent
+import agents.sentiment_agent as sentiment_agent
 from agents.fundamental_agent import fundamental_analyst_run
 from agents.macro_agent import macro_analyst_run
 from agents.sentiment_agent import sentiment_analyst_run
@@ -115,6 +116,39 @@ def test_sentiment_no_articles_fallback_avoids_etf_specific_query_for_equity():
 
     assert not any("etf flow creation redemption" in query for query in queries)
     assert "press_release_or_ir" in kinds
+
+
+def test_sentiment_news_volume_requires_sufficient_baseline():
+    out = sentiment_analyst_run(
+        "NVDA",
+        {
+            "news_articles": [{"title": "A", "published_at": "2026-03-01T00:00:00+00:00"}],
+            "news_sentiment_score": 0.1,
+            "vix_level": 20,
+        },
+    )
+    rationales = [str(req.get("rationale", "")).lower() for req in out.get("evidence_requests", [])]
+    assert not any("news_volume_z" in rationale for rationale in rationales)
+
+
+def test_sentiment_confirmed_event_lowers_news_volume_threshold():
+    reqs = sentiment_agent._generate_evidence_requests(
+        "NVDA",
+        features={},
+        catalyst={"catalyst_risk_level": "high", "catalyst_type": ["earnings"], "confirmed_count": 1},
+        news_info={"news_volume_z": 1.7, "effective_article_count": 8, "baseline_days_used": 10, "baseline_std": 0.6},
+        vol_info={"vol_regime": "normal", "source": "news+options"},
+    )
+    assert any(
+        "news_volume_z=" in str(req.get("rationale", "")).lower()
+        for req in reqs
+    )
+
+
+def test_sentiment_no_articles_keeps_etf_flow_fallback_for_etf():
+    out = sentiment_analyst_run("SPY", {"vix_level": 25}, asset_type="ETF")
+    queries = [str(req.get("query", "")).lower() for req in out.get("evidence_requests", [])]
+    assert any("etf flow creation redemption" in query for query in queries)
 
 
 def test_research_router_seeds_when_requests_are_sparse():

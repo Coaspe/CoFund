@@ -49,6 +49,7 @@ from schemas.common import (
 )
 import telemetry
 from visualization.agent_empire import write_run_dashboard
+from runtime_identity import dashboard_node_id_for_event
 
 # ── Data Providers ────────────────────────────────────────────────────────
 from data_providers.data_hub import DataHub
@@ -104,6 +105,96 @@ MAX_ITERATIONS = 3
 MAX_WEB_QUERIES_PER_RUN = 6
 MAX_WEB_QUERIES_PER_TICKER = 3
 ALL_DESKS = ["macro", "fundamental", "sentiment", "quant"]
+_MONITORING_SEVERITY_LABELS = {0: "watch", 1: "triggered", 2: "severe", 3: "critical"}
+_QUALITY_ONLY_OVERALL_THRESHOLD = 0.65
+_QUALITY_ONLY_DESK_THRESHOLD = 0.35
+_MACRO_MONITOR_RULES: dict[str, dict[str, Any]] = {
+    "hy_oas": {
+        "plausible": (0.0, 2000.0),
+        "severity_levels": [[(">=", 500.0)], [(">=", 650.0)], [(">=", 800.0)]],
+        "allowed_ops": {">", ">="},
+        "validation_mode": "greater",
+        "validation_thresholds": [500.0],
+    },
+    "pmi": {
+        "plausible": (0.0, 100.0),
+        "severity_levels": [[("<", 48.0)], [("<", 45.0)], [("<", 42.0)]],
+        "allowed_ops": {"<", "<="},
+        "validation_mode": "less",
+        "validation_thresholds": [48.0],
+    },
+    "inflation_proxy": {
+        "plausible": (-10.0, 30.0),
+        "severity_levels": [[(">", 3.0)], [(">", 4.0)], [(">", 5.0)]],
+        "allowed_ops": {">", ">="},
+        "validation_mode": "greater",
+        "validation_thresholds": [3.0],
+    },
+    "core_cpi_yoy": {
+        "plausible": (-10.0, 30.0),
+        "severity_levels": [[(">", 3.0)], [(">", 4.0)], [(">", 5.0)]],
+        "allowed_ops": {">", ">="},
+        "validation_mode": "greater",
+        "validation_thresholds": [3.0],
+    },
+    "cpi_yoy": {
+        "plausible": (-10.0, 30.0),
+        "severity_levels": [[(">", 3.0)], [(">", 4.0)], [(">", 5.0)]],
+        "allowed_ops": {">", ">="},
+        "validation_mode": "greater",
+        "validation_thresholds": [3.0],
+    },
+    "vix_level": {
+        "plausible": (0.0, 150.0),
+        "severity_levels": [[(">", 20.0)], [(">", 30.0)], [(">", 40.0)]],
+        "allowed_ops": {">", ">="},
+        "validation_mode": "greater_multi",
+        "validation_thresholds": [20.0, 30.0],
+    },
+    "yield_curve_spread": {
+        "plausible": (-10.0, 10.0),
+        "severity_levels": [
+            [("<", -0.20), (">", 0.30)],
+            [("<", -0.50), (">", 0.60)],
+            [("<", -1.00), (">", 1.00)],
+        ],
+        "allowed_ops": {"<", "<=", ">", ">="},
+        "validation_mode": "two_sided",
+        "validation_thresholds": [-0.20, 0.30],
+    },
+    "sofr_ff_6m_basis_bp": {
+        "plausible": (-200.0, 200.0),
+        "severity_levels": [
+            [("<", -10.0), (">", 10.0)],
+            [("<", -20.0), (">", 20.0)],
+            [("<", -35.0), (">", 35.0)],
+        ],
+        "allowed_ops": {"<", "<=", ">", ">="},
+        "validation_mode": "abs_two_sided",
+        "validation_thresholds": [10.0, 10.0],
+    },
+    "wti/brent": {
+        "plausible": (0.0, 500.0),
+        "severity_levels": [[(">=", 80.0)], [(">=", 95.0)], [(">=", 110.0)]],
+        "allowed_ops": {">", ">="},
+        "validation_mode": "greater",
+        "validation_thresholds": [80.0],
+    },
+    "wti": {
+        "plausible": (0.0, 500.0),
+        "severity_levels": [[(">=", 80.0)], [(">=", 95.0)], [(">=", 110.0)]],
+        "allowed_ops": {">", ">="},
+        "validation_mode": "greater",
+        "validation_thresholds": [80.0],
+    },
+    "brent": {
+        "plausible": (0.0, 500.0),
+        "severity_levels": [[(">=", 80.0)], [(">=", 95.0)], [(">=", 110.0)]],
+        "allowed_ops": {">", ">="},
+        "validation_mode": "greater",
+        "validation_thresholds": [80.0],
+    },
+}
 _BLOCKING_ISSUE_CODES = {
     "fmp_endpoint_restricted",
     "newsapi_upgrade_required",
@@ -663,25 +754,19 @@ def _merge_understanding_with_intake_seed(understanding: dict, intake_seed: dict
     merged = dict(understanding or {})
     holdings = intake_seed.get("holdings") or []
     primary_tickers = _normalize_primary_tickers(
-        intake_seed.get("primary_tickers")
-        or merged.get("primary_tickers")
+        merged.get("primary_tickers")
+        or intake_seed.get("primary_tickers")
         or [item.get("ticker") for item in holdings]
     )
     if holdings:
         merged["holdings"] = holdings
-        primary_tickers = [item["ticker"] for item in holdings]
-        if len(holdings) >= 2:
-            merged["question_type"] = "portfolio_rebalance"
-            merged["intent"] = "portfolio_rebalance"
-        else:
-            merged["question_type"] = "single_position_review"
-            merged["intent"] = "position_review"
-        merged["user_goal"] = "review_or_rebalance"
+        if not primary_tickers:
+            primary_tickers = [item["ticker"] for item in holdings]
     if primary_tickers:
         merged["primary_tickers"] = primary_tickers
-    if intake_seed.get("cash") is not None:
+    if merged.get("cash") is None and intake_seed.get("cash") is not None:
         merged["cash"] = intake_seed.get("cash")
-    if intake_seed.get("account_value") is not None:
+    if merged.get("account_value") is None and intake_seed.get("account_value") is not None:
         merged["account_value"] = intake_seed.get("account_value")
     missing_fields = [str(x).strip() for x in (merged.get("missing_fields") or []) if str(x).strip()]
     if holdings and all(item.get("avg_cost") is not None for item in holdings):
@@ -690,6 +775,41 @@ def _merge_understanding_with_intake_seed(understanding: dict, intake_seed: dict
         missing_fields = [item for item in missing_fields if item != "ticker_confirmation"]
     merged["missing_fields"] = list(dict.fromkeys(missing_fields))
     return merged
+
+
+_PORTFOLIO_FRONTDOOR_INTENTS = {"position_review", "portfolio_rebalance", "hedge_design"}
+
+
+def _has_portfolio_payload(payload: Any) -> bool:
+    if not isinstance(payload, dict):
+        return False
+    if _normalize_holdings(payload.get("holdings") or []):
+        return True
+    return payload.get("cash") is not None or payload.get("account_value") is not None
+
+
+def _build_portfolio_intake(understanding: dict) -> dict:
+    return {
+        "holdings": _normalize_holdings(understanding.get("holdings") or []),
+        "cash": understanding.get("cash") if isinstance(understanding.get("cash"), dict) else None,
+        "account_value": understanding.get("account_value") if isinstance(understanding.get("account_value"), dict) else None,
+        "missing_fields": list(understanding.get("missing_fields", []) or []),
+    }
+
+
+def _is_portfolio_frontdoor_intent(understanding: dict) -> bool:
+    return str(understanding.get("intent", "")).strip() in _PORTFOLIO_FRONTDOOR_INTENTS
+
+
+def _should_apply_portfolio_seed(understanding: dict, intake_seed: dict) -> bool:
+    return _has_portfolio_payload(understanding) or (
+        _is_portfolio_frontdoor_intent(understanding)
+        and _has_portfolio_payload(intake_seed)
+    )
+
+
+def _should_normalize_frontdoor_portfolio(understanding: dict, intake: dict) -> bool:
+    return _is_portfolio_frontdoor_intent(understanding) or _has_portfolio_payload(intake)
 
 
 def _call_question_understanding_llm(user_request: str) -> dict:
@@ -720,25 +840,32 @@ def _call_question_understanding_llm(user_request: str) -> dict:
         return rules
 
 
-def _merge_portfolio_context(existing: dict, understanding: dict, intake: dict, normalized: dict) -> dict:
+def _merge_frontdoor_context(existing: dict, understanding: dict) -> dict:
     ctx = dict(existing or {})
-    ctx.setdefault("question_type", understanding.get("question_type"))
-    ctx.setdefault("frontdoor_intent", understanding.get("intent"))
-    ctx.setdefault("primary_tickers", understanding.get("primary_tickers", []))
-    ctx.setdefault("user_goal", understanding.get("user_goal"))
-    ctx.setdefault("frontdoor_confidence", understanding.get("confidence"))
-    ctx.setdefault("frontdoor_source", understanding.get("source"))
+    ctx["question_type"] = str(understanding.get("question_type", "") or "")
+    ctx["frontdoor_intent"] = str(understanding.get("intent", "") or "")
+    ctx["primary_tickers"] = _normalize_primary_tickers(understanding.get("primary_tickers") or [])
+    ctx["user_goal"] = str(understanding.get("user_goal", "") or "")
+    ctx["frontdoor_confidence"] = understanding.get("confidence")
+    ctx["frontdoor_source"] = understanding.get("source")
+    ctx["missing_fields"] = list(dict.fromkeys([
+        str(x).strip()
+        for x in (understanding.get("missing_fields") or [])
+        if str(x).strip()
+    ]))
+    return ctx
+
+
+def _merge_portfolio_context(existing: dict, intake: dict, normalized: dict) -> dict:
+    ctx = dict(existing or {})
     if intake.get("holdings"):
-        ctx.setdefault("holdings", intake.get("holdings"))
+        ctx["holdings"] = intake.get("holdings")
     if intake.get("cash") is not None:
-        ctx.setdefault("cash", intake.get("cash"))
+        ctx["cash"] = intake.get("cash")
     if intake.get("account_value") is not None:
-        ctx.setdefault("account_value", intake.get("account_value"))
+        ctx["account_value"] = intake.get("account_value")
     if normalized:
         ctx["normalized_portfolio_snapshot"] = normalized
-    missing = understanding.get("missing_fields", [])
-    if missing:
-        ctx["missing_fields"] = list(dict.fromkeys([*ctx.get("missing_fields", []), *missing]))
     return ctx
 
 
@@ -768,31 +895,34 @@ def _build_frontdoor_bundle(
 ) -> dict[str, Any]:
     if state.get("_frontdoor_prepared") and isinstance(state.get("question_understanding"), dict) and state.get("question_understanding"):
         understanding = dict(state.get("question_understanding", {}) or {})
-        intake = dict(state.get("portfolio_intake", {}) or {})
+        raw_intake = state.get("portfolio_intake", {}) if isinstance(state.get("portfolio_intake"), dict) else {}
+        intake = _build_portfolio_intake(raw_intake if raw_intake else understanding)
         normalized = dict(state.get("normalized_portfolio_snapshot", {}) or {})
-        if compute_normalized and not normalized:
+        if compute_normalized and not normalized and _should_normalize_frontdoor_portfolio(understanding, intake):
             normalized = _normalize_portfolio_snapshot(state, intake)
-        merged_ctx = _merge_portfolio_context(
+        merged_ctx = _merge_frontdoor_context(
             state.get("portfolio_context", {}) if isinstance(state.get("portfolio_context"), dict) else {},
             understanding,
-            intake,
-            normalized,
         )
+        if _has_portfolio_payload(intake) or normalized:
+            merged_ctx = _merge_portfolio_context(merged_ctx, intake, normalized)
         target, universe = _resolve_frontdoor_targets(state, understanding, intake)
     else:
         user_request = str(state.get("user_request", "") or "")
         understanding = _call_question_understanding_llm(user_request)
         intake_seed = _portfolio_context_intake_seed(state.get("portfolio_context", {}))
-        understanding = _merge_understanding_with_intake_seed(understanding, intake_seed)
-        intake = {
-            "holdings": _normalize_holdings(understanding.get("holdings") or []),
-            "cash": understanding.get("cash"),
-            "account_value": understanding.get("account_value"),
-            "missing_fields": list(understanding.get("missing_fields", []) or []),
-        }
-        normalized = _normalize_portfolio_snapshot(state, intake) if compute_normalized else {}
+        if _should_apply_portfolio_seed(understanding, intake_seed):
+            understanding = _merge_understanding_with_intake_seed(understanding, intake_seed)
+        intake = _build_portfolio_intake(understanding)
+        normalized = (
+            _normalize_portfolio_snapshot(state, intake)
+            if compute_normalized and _should_normalize_frontdoor_portfolio(understanding, intake)
+            else {}
+        )
         existing_ctx = state.get("portfolio_context", {}) if isinstance(state.get("portfolio_context"), dict) else {}
-        merged_ctx = _merge_portfolio_context(existing_ctx, understanding, intake, normalized)
+        merged_ctx = _merge_frontdoor_context(existing_ctx, understanding)
+        if _has_portfolio_payload(intake) or normalized:
+            merged_ctx = _merge_portfolio_context(merged_ctx, intake, normalized)
         target, universe = _resolve_frontdoor_targets(state, understanding, intake)
 
     out: dict[str, Any] = {
@@ -1460,10 +1590,7 @@ def _write_operator_summary(run_id: str) -> Path | None:
         "fundamental",
         "sentiment",
         "quant",
-        "research_router",
-        "research_executor",
-        "rerun_selector",
-        "research_round",
+        "research_manager",
         "risk_manager",
         "report_writer",
     }
@@ -1480,13 +1607,17 @@ def _write_operator_summary(run_id: str) -> Path | None:
             event = json.loads(raw)
             if event.get("phase") != "exit":
                 continue
-            node = str(event.get("node_name", ""))
-            if node not in interesting:
+            node = str(event.get("node_name", "")).strip()
+            display_node = dashboard_node_id_for_event(event)
+            if display_node not in interesting:
                 continue
             iteration = event.get("iteration", 0)
             summary = event.get("outputs_summary", {})
             brief = _short_text(json.dumps(summary, ensure_ascii=False), max_len=220)
-            lines.append(f"- iter={iteration} `{node}`: {brief}")
+            if node and node != display_node:
+                lines.append(f"- iter={iteration} `{display_node}` ({node}): {brief}")
+            else:
+                lines.append(f"- iter={iteration} `{display_node}`: {brief}")
     except (OSError, json.JSONDecodeError):
         return None
 
@@ -1788,11 +1919,11 @@ def _get_desk_task(
     return horizon_days, focus_areas, risk_budget
 
 
-def macro_analyst_node(state: InvestmentState) -> dict:
+def _macro_analyst_node_impl(state: InvestmentState, *, node_name: str) -> dict:
     """② Macro Analyst."""
     if state.get("completed_tasks", {}).get("macro", False):
         return {}
-    _log(state, "macro", "enter")
+    _log(state, node_name, "enter")
 
     mode = state.get("mode", "mock")
     seed = _make_seed(state)
@@ -1852,7 +1983,7 @@ def macro_analyst_node(state: InvestmentState) -> dict:
         ],
     )
 
-    _log(state, "macro", "exit", {"regime": output["macro_regime"]})
+    _log(state, node_name, "exit", {"regime": output["macro_regime"]})
     return {
         "macro_analysis": output,
         "completed_tasks": {"macro": True},
@@ -1860,11 +1991,15 @@ def macro_analyst_node(state: InvestmentState) -> dict:
     }
 
 
-def fundamental_analyst_node(state: InvestmentState) -> dict:
+def macro_analyst_node(state: InvestmentState) -> dict:
+    return _macro_analyst_node_impl(state, node_name="macro_analyst")
+
+
+def _fundamental_analyst_node_impl(state: InvestmentState, *, node_name: str) -> dict:
     """③ Fundamental Analyst."""
     if state.get("completed_tasks", {}).get("fundamental", False):
         return {}
-    _log(state, "fundamental", "enter")
+    _log(state, node_name, "enter")
 
     mode = state.get("mode", "mock")
     seed = _make_seed(state) + 1
@@ -1972,12 +2107,16 @@ def fundamental_analyst_node(state: InvestmentState) -> dict:
         ],
     )
 
-    _log(state, "fundamental", "exit", {"structural_risk": output["structural_risk_flag"]})
+    _log(state, node_name, "exit", {"structural_risk": output["structural_risk_flag"]})
     return {
         "fundamental_analysis": output,
         "completed_tasks": {"fundamental": True},
         "evidence_requests": output.get("evidence_requests", []),
     }
+
+
+def fundamental_analyst_node(state: InvestmentState) -> dict:
+    return _fundamental_analyst_node_impl(state, node_name="fundamental_analyst")
 
 
 def _collect_sentiment_upcoming_events(state: InvestmentState, ticker: str, as_of: str) -> list[dict]:
@@ -2024,16 +2163,17 @@ def _collect_sentiment_upcoming_events(state: InvestmentState, ticker: str, as_o
     return out[:8]
 
 
-def sentiment_analyst_node(state: InvestmentState) -> dict:
+def _sentiment_analyst_node_impl(state: InvestmentState, *, node_name: str) -> dict:
     """④ Sentiment Analyst."""
     if state.get("completed_tasks", {}).get("sentiment", False):
         return {}
-    _log(state, "sentiment", "enter")
+    _log(state, node_name, "enter")
 
     mode = state.get("mode", "mock")
     seed = _make_seed(state) + 2
     as_of = state.get("as_of", "")
     ticker = state.get("target_ticker", "AAPL")
+    asset_type = str((state.get("asset_type_by_ticker", {}) or {}).get(ticker, "")).strip().upper() or _infer_asset_type(ticker)
     horizon_days, focus_areas, _ = _get_desk_task(state, "sentiment", 7)
 
     hub = DataHub(run_id=state.get("run_id", ""), as_of=as_of, mode=mode)
@@ -2060,6 +2200,7 @@ def sentiment_analyst_node(state: InvestmentState) -> dict:
         horizon_days=horizon_days,
         focus_areas=focus_areas,
         state=state,
+        asset_type=asset_type,
         source_name="mock" if mode == "mock" else "multi_source",
     )
     rerun_reason = _rerun_reason_for_desk(state, "sentiment")
@@ -2118,12 +2259,16 @@ def sentiment_analyst_node(state: InvestmentState) -> dict:
         ],
     )
 
-    _log(state, "sentiment", "exit", {"tilt": output["tilt_factor"]})
+    _log(state, node_name, "exit", {"tilt": output["tilt_factor"]})
     return {
         "sentiment_analysis": output,
         "completed_tasks": {"sentiment": True},
         "evidence_requests": output.get("evidence_requests", []),
     }
+
+
+def sentiment_analyst_node(state: InvestmentState) -> dict:
+    return _sentiment_analyst_node_impl(state, node_name="sentiment_analyst")
 
 
 def _quant_select_pair_ticker(
@@ -2218,6 +2363,28 @@ def _safe_beta_to_main(hedge_prices: Any, main_prices: Any, window: int = 60) ->
         return None
 
 
+def _safe_min_variance_hedge_ratio(hedge_prices: Any, main_prices: Any, window: int = 60) -> float | None:
+    if not hasattr(hedge_prices, "__len__") or not hasattr(main_prices, "__len__"):
+        return None
+    n = min(len(hedge_prices), len(main_prices))
+    if n < window + 2:
+        return None
+    try:
+        hp = np.asarray(hedge_prices, dtype=float)[-n:]
+        mp = np.asarray(main_prices, dtype=float)[-n:]
+        rh = np.diff(np.log(hp))[-window:]
+        rm = np.diff(np.log(mp))[-window:]
+        if len(rh) == 0 or len(rm) == 0:
+            return None
+        var_hedge = float(np.var(rh, ddof=0))
+        if var_hedge < 1e-12:
+            return None
+        cov = float(np.cov(rm, rh, ddof=0)[0, 1])
+        return -cov / var_hedge
+    except Exception:
+        return None
+
+
 def _safe_downside_capture(hedge_prices: Any, main_prices: Any, window: int = 60) -> float | None:
     if not hasattr(hedge_prices, "__len__") or not hasattr(main_prices, "__len__"):
         return None
@@ -2234,7 +2401,11 @@ def _safe_downside_capture(hedge_prices: Any, main_prices: Any, window: int = 60
         mask = rm < 0
         if int(np.sum(mask)) < 3:
             return None
-        return float(np.mean(rh[mask]))
+        hedge_down_geo = float(np.exp(np.mean(rh[mask])) - 1.0)
+        main_down_geo = float(np.exp(np.mean(rm[mask])) - 1.0)
+        if abs(main_down_geo) < 1e-12:
+            return None
+        return hedge_down_geo / main_down_geo
     except Exception:
         return None
 
@@ -2708,12 +2879,6 @@ def _portfolio_construction_signal_snapshot(
         "source": "capital_competition" if row else "fallback",
     }
     if ticker != main:
-        hedge_lite = state.get("hedge_lite", {}) if isinstance(state.get("hedge_lite"), dict) else {}
-        hedge_rows = hedge_lite.get("hedges", {}) if isinstance(hedge_lite.get("hedges"), dict) else {}
-        hedge_row = hedge_rows.get(ticker, {}) if isinstance(hedge_rows.get(ticker), dict) else {}
-        if hedge_row:
-            snapshot["conviction_score"] = float(snapshot["conviction_score"]) + 0.40 * float(hedge_row.get("score", 0.0) or 0.0)
-            snapshot["source"] = "capital_competition+hedge_lite"
         return snapshot
 
     fundamental = state.get("fundamental_analysis", {}) if isinstance(state.get("fundamental_analysis"), dict) else {}
@@ -2775,6 +2940,7 @@ def _build_portfolio_construction_monitoring_triggers(
     cap_relative: float,
 ) -> list[dict]:
     triggers: list[dict] = []
+    multi_asset = len(rows) > 1
     if turnover_estimate >= 0.28:
         triggers.append({
             "name": "Turnover budget",
@@ -2784,7 +2950,7 @@ def _build_portfolio_construction_monitoring_triggers(
             "action": "construction 재균형 강도를 낮추고 catalyst 근거 재검토",
             "priority": 2,
         })
-    if diversification_score <= 0.32:
+    if multi_asset and diversification_score <= 0.32:
         triggers.append({
             "name": "Correlation crowding",
             "metric": "diversification_score",
@@ -2795,30 +2961,102 @@ def _build_portfolio_construction_monitoring_triggers(
         })
     for ticker, row in rows.items():
         target_weight = float(row.get("target_weight", 0.0) or 0.0)
-        if target_weight >= max(0.45, cap_relative * 0.97):
+        near_cap = max(0.45, cap_relative * 0.97)
+        if multi_asset and target_weight >= near_cap:
             triggers.append({
                 "name": "Concentration pressure",
                 "metric": f"{ticker}_target_weight",
                 "current_value": round(target_weight, 4),
-                "trigger": f"> {round(cap_relative, 4)}",
+                "trigger": f">= {round(near_cap, 4)}",
                 "action": "single-name concentration 재조정",
                 "priority": 1,
             })
         event_penalty = float(row.get("event_penalty", 0.0) or 0.0)
-        if event_penalty >= 0.20:
+        if event_penalty >= 0.12:
             triggers.append({
                 "name": "Event cluster risk",
                 "metric": f"{ticker}_event_penalty",
                 "current_value": round(event_penalty, 4),
-                "trigger": "> 0.20",
+                "trigger": ">= 0.12",
                 "action": "event window 동안 target weight 보수화",
                 "priority": 2,
             })
     return triggers[:8]
 
 
+def _shrunk_covariance_matrix(
+    return_map: dict[str, np.ndarray | None],
+    universe: list[str],
+) -> tuple[np.ndarray | None, dict[str, float], dict[str, float], float]:
+    valid = [
+        ticker
+        for ticker in universe
+        if isinstance(return_map.get(ticker), np.ndarray) and len(return_map[ticker]) >= 20
+    ]
+    if len(valid) < 2:
+        vols = {}
+        for ticker in universe:
+            series = return_map.get(ticker)
+            if isinstance(series, np.ndarray) and len(series) >= 20:
+                vols[ticker] = float(np.std(series, ddof=1))
+        return None, vols, {}, 0.0
+
+    min_len = min(len(return_map[ticker]) for ticker in valid if isinstance(return_map.get(ticker), np.ndarray))
+    if min_len < 20:
+        return None, {}, {}, 0.0
+
+    panel = np.column_stack([
+        np.asarray(return_map[ticker][-min_len:], dtype=float)
+        for ticker in valid
+    ])
+    sample = np.cov(panel, rowvar=False)
+    if sample.ndim == 0:
+        sample = np.asarray([[float(sample)]], dtype=float)
+    diag = np.diag(np.diag(sample))
+    n_obs, n_assets = panel.shape
+    shrinkage = max(0.15, min(0.65, float(n_assets) / max(float(n_obs), 1.0)))
+    shrunk = (1.0 - shrinkage) * sample + shrinkage * diag
+    diag_vals = np.clip(np.diag(shrunk), 1e-12, None)
+    vols = {
+        ticker: float(np.sqrt(diag_vals[idx]))
+        for idx, ticker in enumerate(valid)
+    }
+    corr = np.divide(
+        shrunk,
+        np.sqrt(np.outer(diag_vals, diag_vals)),
+        out=np.zeros_like(shrunk),
+        where=np.outer(diag_vals, diag_vals) > 0,
+    )
+    avg_positive_corr: dict[str, float] = {}
+    for idx, ticker in enumerate(valid):
+        vals = [
+            float(corr[idx, jdx])
+            for jdx in range(len(valid))
+            if jdx != idx and not np.isnan(corr[idx, jdx])
+        ]
+        positives = [max(v, 0.0) for v in vals]
+        avg_positive_corr[ticker] = float(np.mean(positives)) if positives else 0.0
+    return shrunk, vols, avg_positive_corr, round(float(shrinkage), 4)
+
+
+def _move_with_turnover_budget(
+    base_weights: dict[str, float],
+    target_weights: dict[str, float],
+    max_turnover: float,
+) -> tuple[dict[str, float], float, float]:
+    names = list(dict.fromkeys([*base_weights.keys(), *target_weights.keys()]))
+    base_vec = np.asarray([float(base_weights.get(name, 0.0) or 0.0) for name in names], dtype=float)
+    target_vec = np.asarray([float(target_weights.get(name, 0.0) or 0.0) for name in names], dtype=float)
+    raw_turnover = 0.5 * float(np.abs(target_vec - base_vec).sum())
+    if raw_turnover <= max_turnover + 1e-12:
+        return dict(zip(names, target_vec.tolist())), raw_turnover, 1.0
+    scale = max(0.0, min(1.0, max_turnover / max(raw_turnover, 1e-12)))
+    moved = base_vec + scale * (target_vec - base_vec)
+    return dict(zip(names, moved.tolist())), raw_turnover, scale
+
+
 def portfolio_construction_quant_node(state: InvestmentState) -> dict:
-    """Quant portfolio construction layer: positions_proposed를 construction-aware하게 재조정."""
+    """Quant portfolio construction layer: conservative constrained rebalancer."""
     if not _has_position_review_snapshot(state):
         return {}
     _log(state, "portfolio_construction_quant", "enter")
@@ -2862,6 +3100,9 @@ def portfolio_construction_quant_node(state: InvestmentState) -> dict:
     )
     single_name_cap = max(0.10, min(single_name_cap, gross_target))
     cap_relative = max(0.10, min(single_name_cap / max(gross_target, 1e-6), 1.0))
+    base_anchor = _cap_relative_weights(base_weights, cap_relative) if len(universe) >= 2 else dict(base_weights)
+    if not base_anchor:
+        base_anchor = dict(base_weights)
 
     capital_competition = state.get("capital_competition", []) if isinstance(state.get("capital_competition"), list) else []
     competition_by_ticker = {
@@ -2899,61 +3140,74 @@ def portfolio_construction_quant_node(state: InvestmentState) -> dict:
             "liquidity_proxy": _liquidity_proxy_score(ticker, state.get("asset_type_by_ticker", {})),
         }
 
-    median_vol = float(np.median(np.asarray(vol_values, dtype=float))) if vol_values else None
-    raw_weights: dict[str, float] = {}
-    diversification_components: list[float] = []
+    cov_matrix, shrunk_vol_map, avg_positive_corr_map, covariance_shrinkage = _shrunk_covariance_matrix(return_map, universe)
+    median_vol = float(np.median(np.asarray(list(shrunk_vol_map.values()) or vol_values, dtype=float))) if (shrunk_vol_map or vol_values) else None
+    risk_anchor_raw: dict[str, float] = {}
+    target_raw: dict[str, float] = {}
+    effective_anchor_raw: dict[str, float] = {}
     rows: dict[str, dict] = {}
     for ticker in universe:
         signal = _portfolio_construction_signal_snapshot(state, ticker, competition_by_ticker, main)
-        weighted_corr = _weighted_average_correlation(return_map, base_weights, ticker)
+        signal_source = str(signal.get("source", "fallback")).strip() or "fallback"
+        allocation_enabled = (
+            ticker == main
+            or float(base_weights.get(ticker, 0.0) or 0.0) > 1e-12
+            or signal_source != "fallback"
+        )
+        weighted_corr = _weighted_average_correlation(return_map, base_anchor, ticker)
         event_penalty, event_counts = _portfolio_construction_event_penalty(event_calendar, ticker)
-        vol_60d = metric_rows[ticker].get("vol_60d_ann")
-        inv_vol_multiplier = 1.0
+        vol_60d = shrunk_vol_map.get(ticker) or metric_rows[ticker].get("vol_60d_ann")
+        avg_positive_corr = avg_positive_corr_map.get(ticker)
+        risk_scale = 1.0
         if median_vol is not None and vol_60d not in (None, 0):
-            inv_vol_multiplier = max(0.55, min(median_vol / float(vol_60d), 1.65))
-        diversification_multiplier = 1.0
-        if weighted_corr is not None:
-            diversification_multiplier = max(0.45, min(1.30, 1.0 + (0.25 - float(weighted_corr)) * 0.85))
-            diversification_components.append(1.0 - max(float(weighted_corr), 0.0))
-        liquidity_multiplier = 0.75 + 0.35 * float(metric_rows[ticker].get("liquidity_proxy", 0.50) or 0.50)
-        drawdown_penalty = max(0.0, min(float(metric_rows[ticker].get("drawdown_60d", 0.0) or 0.0) * 3.5, 0.45))
+            risk_scale = max(0.60, min(median_vol / float(vol_60d), 1.40))
+        correlation_penalty = 1.0 + max(float(avg_positive_corr or 0.0), 0.0)
+        liquidity_multiplier = 0.85 + 0.30 * float(metric_rows[ticker].get("liquidity_proxy", 0.50) or 0.50)
+        drawdown_penalty = max(0.0, min(float(metric_rows[ticker].get("drawdown_60d", 0.0) or 0.0) * 2.5, 0.35))
         beta_penalty = 0.0
         beta = metric_rows[ticker].get("beta_to_market_60d")
         if beta is not None:
-            beta_penalty = max(0.0, min(abs(float(beta) - 1.0) * 0.12, 0.20))
+            beta_penalty = max(0.0, min(abs(float(beta) - 1.0) * 0.10, 0.18))
 
         conviction = float(signal.get("conviction_score", 0.0) or 0.0)
         expected_return = float(signal.get("expected_return_score", 0.0) or 0.0)
         downside_penalty = float(signal.get("downside_penalty", 0.0) or 0.0)
         catalyst_score = float(signal.get("catalyst_proximity_score", 0.0) or 0.0)
-
-        alpha_multiplier = max(
-            0.30,
-            1.0
-            + 0.35 * conviction
-            + 0.25 * expected_return
-            - 0.20 * downside_penalty
-            + 0.08 * catalyst_score,
+        tilt_score = _clip(
+            0.45 * conviction
+            + 0.30 * expected_return
+            - 0.40 * downside_penalty
+            - 0.30 * event_penalty
+            + 0.10 * catalyst_score,
+            -0.35,
+            0.35,
         )
-        risk_multiplier = max(
-            0.15,
-            inv_vol_multiplier
-            * diversification_multiplier
-            * liquidity_multiplier
-            * (1.0 - drawdown_penalty)
-            * (1.0 - beta_penalty)
-            * (1.0 - event_penalty),
-        )
-        base_anchor = max(0.02, float(base_weights.get(ticker, 0.0) or 0.0))
-        if ticker == main:
-            base_anchor = max(base_anchor, 0.20)
-        raw_weight = base_anchor * alpha_multiplier * risk_multiplier
-        raw_weights[ticker] = raw_weight
+        tilt_multiplier = float(np.exp(tilt_score))
+        anchor_weight = max(0.0, float(base_anchor.get(ticker, 0.0) or 0.0)) if allocation_enabled else 0.0
+        effective_anchor_raw[ticker] = anchor_weight
+        if allocation_enabled:
+            risk_anchor = max(
+                1e-6,
+                (1.0 / max(float(vol_60d or 0.25), 1e-6))
+                * (1.0 / correlation_penalty)
+                * liquidity_multiplier
+                * (1.0 - drawdown_penalty)
+                * (1.0 - beta_penalty)
+                * (1.0 - event_penalty),
+            )
+            target_raw[ticker] = max(
+                1e-6,
+                (0.75 * anchor_weight + 0.25 * risk_anchor) * tilt_multiplier,
+            )
+        else:
+            risk_anchor = 0.0
+            target_raw[ticker] = 0.0
+        risk_anchor_raw[ticker] = risk_anchor
         rows[ticker] = {
             **metric_rows[ticker],
             "weighted_avg_corr_60d": round(float(weighted_corr), 6) if weighted_corr is not None else None,
-            "inv_vol_multiplier": round(float(inv_vol_multiplier), 6),
-            "diversification_multiplier": round(float(diversification_multiplier), 6),
+            "avg_positive_corr_60d": round(float(avg_positive_corr), 6) if avg_positive_corr is not None else None,
+            "risk_scale": round(float(risk_scale), 6),
             "liquidity_multiplier": round(float(liquidity_multiplier), 6),
             "drawdown_penalty": round(float(drawdown_penalty), 6),
             "beta_penalty": round(float(beta_penalty), 6),
@@ -2963,13 +3217,18 @@ def portfolio_construction_quant_node(state: InvestmentState) -> dict:
             "catalyst_proximity_score": round(float(catalyst_score), 6),
             "event_penalty": round(float(event_penalty), 6),
             "event_counts": event_counts,
-            "raw_weight": round(float(raw_weight), 6),
-            "signal_source": str(signal.get("source", "fallback")).strip() or "fallback",
+            "base_anchor_weight": round(float(anchor_weight), 6),
+            "tilt_score": round(float(tilt_score), 6),
+            "tilt_multiplier": round(float(tilt_multiplier), 6),
+            "risk_anchor_raw": round(float(risk_anchor), 6),
+            "target_raw_weight": round(float(target_raw[ticker]), 6),
+            "signal_source": signal_source,
+            "allocation_enabled": allocation_enabled,
         }
         evidence.append(
             make_evidence(
                 metric=f"{ticker.lower()}_construction_raw_weight",
-                value=round(float(raw_weight), 6),
+                value=round(float(target_raw[ticker]), 6),
                 source_name="portfolio_construction_quant",
                 source_type="model",
                 quality=0.86,
@@ -2977,19 +3236,41 @@ def portfolio_construction_quant_node(state: InvestmentState) -> dict:
             )
         )
 
-    raw_norm = _normalize_long_only_weights(raw_weights)
-    turnover_raw = 0.5 * float(sum(abs(float(raw_norm.get(t, 0.0)) - float(base_weights.get(t, 0.0))) for t in universe))
-    avg_catalyst = float(np.mean([rows[t]["catalyst_proximity_score"] for t in universe])) if universe else 0.0
-    turnover_blend = max(0.45, min(0.85, 0.55 + 0.60 * turnover_raw - 0.15 * avg_catalyst))
-
-    blended = {}
+    effective_anchor = _normalize_long_only_weights(effective_anchor_raw) or dict(base_weights)
+    risk_anchor_weights = _normalize_long_only_weights(risk_anchor_raw) or dict(effective_anchor)
+    pre_target = {}
     for ticker in universe:
-        blended[ticker] = (
-            turnover_blend * float(base_weights.get(ticker, 0.0) or 0.0)
-            + (1.0 - turnover_blend) * float(raw_norm.get(ticker, 0.0) or 0.0)
+        if not bool(rows[ticker].get("allocation_enabled")):
+            pre_target[ticker] = 0.0
+            continue
+        pre_target[ticker] = max(
+            1e-6,
+            float(target_raw.get(ticker, 0.0) or 0.0)
+            * max(0.50, min(float(risk_anchor_weights.get(ticker, 0.0) or 0.0) / max(float(effective_anchor.get(ticker, 1e-6) or 1e-6), 1e-6), 1.50)),
         )
-    blended = _normalize_long_only_weights(blended)
-    final_weights = _cap_relative_weights(blended, cap_relative)
+    pre_target = _normalize_long_only_weights(pre_target) or dict(effective_anchor)
+    active_target_input = {
+        ticker: float(pre_target.get(ticker, 0.0) or 0.0)
+        for ticker in universe
+        if bool(rows[ticker].get("allocation_enabled"))
+    }
+    capped_active = _cap_relative_weights(active_target_input, cap_relative) or {
+        ticker: float(effective_anchor.get(ticker, 0.0) or 0.0)
+        for ticker in universe
+        if bool(rows[ticker].get("allocation_enabled"))
+    }
+    target_weights = {
+        ticker: float(capped_active.get(ticker, 0.0) or 0.0)
+        for ticker in universe
+    }
+
+    avg_event_penalty = float(np.mean([float(rows[t]["event_penalty"]) for t in universe])) if universe else 0.0
+    avg_tilt_abs = float(np.mean([abs(float(rows[t]["tilt_score"])) for t in universe])) if universe else 0.0
+    max_turnover = 0.0
+    if len(universe) >= 2:
+        max_turnover = max(0.08, min(0.25, 0.10 + 0.20 * avg_event_penalty + 0.15 * avg_tilt_abs))
+    moved_weights, turnover_raw, turnover_scale = _move_with_turnover_budget(effective_anchor, target_weights, max_turnover)
+    final_weights = moved_weights if len(universe) >= 2 else dict(effective_anchor)
     turnover_final = 0.5 * float(sum(abs(float(final_weights.get(t, 0.0)) - float(base_weights.get(t, 0.0))) for t in universe))
 
     for ticker in universe:
@@ -3007,8 +3288,19 @@ def portfolio_construction_quant_node(state: InvestmentState) -> dict:
         rows[ticker]["target_weight"] = round(target_weight, 6)
         rows[ticker]["delta_weight"] = round(delta, 6)
         rows[ticker]["rebalance_action"] = action
+        rows[ticker]["risk_anchor_weight"] = round(float(risk_anchor_weights.get(ticker, 0.0) or 0.0), 6)
+        rows[ticker]["target_pre_turnover"] = round(float(target_weights.get(ticker, 0.0) or 0.0), 6)
 
-    diversification_score = max(0.0, min(float(np.mean(diversification_components)) if diversification_components else 0.50, 1.0))
+    if len(universe) >= 2:
+        diversification_score = max(
+            0.0,
+            min(
+                1.0 - float(sum(float(final_weights.get(t, 0.0)) * max(float(rows[t].get("avg_positive_corr_60d", 0.0) or 0.0), 0.0) for t in universe)),
+                1.0,
+            ),
+        )
+    else:
+        diversification_score = 0.0
     monitoring_triggers = _build_portfolio_construction_monitoring_triggers(
         rows,
         turnover_estimate=turnover_final,
@@ -3023,15 +3315,20 @@ def portfolio_construction_quant_node(state: InvestmentState) -> dict:
         "main_ticker": main,
         "universe": universe,
         "base_weights": {t: round(float(base_weights.get(t, 0.0)), 6) for t in universe},
+        "anchor_weights": {t: round(float(effective_anchor.get(t, 0.0)), 6) for t in universe},
+        "risk_anchor_weights": {t: round(float(risk_anchor_weights.get(t, 0.0)), 6) for t in universe},
+        "target_pre_turnover": {t: round(float(target_weights.get(t, 0.0)), 6) for t in universe},
         "weights_proposed": {t: round(float(final_weights.get(t, 0.0)), 6) for t in universe},
         "target_gross_exposure": round(gross_target, 6),
         "single_name_cap": round(single_name_cap, 6),
         "relative_single_name_cap": round(cap_relative, 6),
         "turnover_estimate": round(turnover_final, 6),
-        "turnover_blend": round(turnover_blend, 6),
+        "turnover_budget": round(max_turnover, 6),
+        "turnover_scale": round(float(turnover_scale), 6),
         "diversification_score": round(diversification_score, 6),
         "event_risk_level": event_risk_level,
         "covariance_window_days": 60,
+        "covariance_shrinkage": covariance_shrinkage,
         "rows": rows,
         "rebalances": [
             {
@@ -3067,7 +3364,7 @@ def portfolio_construction_quant_node(state: InvestmentState) -> dict:
         "construction output",
         [
             f"gross_target={gross_target} cap={single_name_cap} base={base_weights}",
-            f"turnover={round(turnover_final, 4)} diversification={round(diversification_score, 4)}",
+            f"turnover={round(turnover_final, 4)} budget={round(max_turnover, 4)} diversification={round(diversification_score, 4)}",
             f"weights={final_weights}",
         ],
     )
@@ -3080,7 +3377,7 @@ def portfolio_construction_quant_node(state: InvestmentState) -> dict:
 
 
 def hedge_lite_builder_node(state: InvestmentState) -> dict:
-    """B 모드에서 메인+헤지 후보를 경량 분석해 positions_proposed를 생성."""
+    """B 모드에서 메인+헤지 후보를 경량 분석해 advisory hedge snapshot을 생성."""
     analysis_mode = str(state.get("analysis_execution_mode", "")).strip()
     universe = [str(t).strip().upper() for t in (state.get("universe", []) or []) if str(t).strip()]
     if not analysis_mode.startswith("B_") or len(universe) < 2:
@@ -3126,16 +3423,19 @@ def hedge_lite_builder_node(state: InvestmentState) -> dict:
             "corr_with_main_60d": _safe_corr(hp, main_prices, window=60),
             "corr_with_market_60d": _safe_corr(hp, market_prices, window=60),
             "beta_to_main_60d": _safe_beta_to_main(hp, main_prices, window=60),
-            "downside_capture_60d": _safe_downside_capture(hp, main_prices, window=60),
+            "downside_capture_ratio_60d": _safe_downside_capture(hp, main_prices, window=60),
+            "hedge_ratio_60d": _safe_min_variance_hedge_ratio(hp, main_prices, window=60),
             "tail_proxy_5pct_60d": _safe_tail_proxy(hp, window=60),
             "liquidity_proxy": _liquidity_proxy_score(hedge, state.get("asset_type_by_ticker", {})),
         }
+        row["downside_capture_60d"] = row.get("downside_capture_ratio_60d")
         hv20 = row.get("vol_20d_ann")
         hv60 = row.get("vol_60d_ann")
         row["vol_shift_20d_vs_60d"] = float(hv20) / float(hv60) if hv20 is not None and hv60 not in (None, 0) else None
 
         protect = _clip(-float(row["corr_with_main_60d"])) if row.get("corr_with_main_60d") is not None else 0.0
-        downside = _clip(float(row["downside_capture_60d"]) * 120.0) if row.get("downside_capture_60d") is not None else 0.0
+        downside_ratio = row.get("downside_capture_ratio_60d")
+        downside = _clip(1.0 - float(downside_ratio)) if downside_ratio is not None else 0.0
         stability = _clip(1.0 - abs(float(row["vol_shift_20d_vs_60d"]) - 1.0)) if row.get("vol_shift_20d_vs_60d") is not None else 0.0
         trend = _clip(float(row["trend_20d"]) * 8.0) if row.get("trend_20d") is not None else 0.0
         tail = _clip(-float(row["tail_proxy_5pct_60d"]) * 20.0) if row.get("tail_proxy_5pct_60d") is not None else 0.0
@@ -3159,10 +3459,29 @@ def hedge_lite_builder_node(state: InvestmentState) -> dict:
         }
         row["score"] = round(float(score), 6)
         row["status"] = "ok" if row.get("corr_with_main_60d") is not None and row.get("vol_20d_ann") is not None else "insufficient_data"
+        gate_reasons: list[str] = []
+        hedge_ratio = row.get("hedge_ratio_60d")
+        if row["status"] != "ok":
+            gate_reasons.append("insufficient_data")
+        if hedge_ratio is None or float(hedge_ratio) < 0.05:
+            gate_reasons.append("weak_hedge_ratio")
+        if downside_ratio is None or float(downside_ratio) > 1.0:
+            gate_reasons.append("poor_downside_capture")
+        if float(row["score"]) < 0.10:
+            gate_reasons.append("low_hedge_score")
+        row["qualified_for_selection"] = not gate_reasons
+        row["gate_reasons"] = gate_reasons
         row["selected"] = False
         hedge_rows[hedge] = row
 
-        for metric in ("ret_5d", "vol_shift_20d_vs_60d", "corr_with_main_60d", "beta_to_main_60d"):
+        for metric in (
+            "ret_5d",
+            "vol_shift_20d_vs_60d",
+            "corr_with_main_60d",
+            "beta_to_main_60d",
+            "downside_capture_ratio_60d",
+            "hedge_ratio_60d",
+        ):
             mv = row.get(metric)
             if mv is None:
                 continue
@@ -3177,70 +3496,87 @@ def hedge_lite_builder_node(state: InvestmentState) -> dict:
                 )
             )
 
-    valid = [t for t, row in hedge_rows.items() if row.get("status") == "ok"]
-    sorted_valid = sorted(valid, key=lambda t: float(hedge_rows[t].get("score", -999.0)), reverse=True)
+    valid = [t for t, row in hedge_rows.items() if bool(row.get("qualified_for_selection"))]
+    sorted_valid = sorted(
+        valid,
+        key=lambda t: (
+            float(hedge_rows[t].get("score", -999.0)),
+            float(hedge_rows[t].get("hedge_ratio_60d", 0.0) or 0.0),
+        ),
+        reverse=True,
+    )
     top_k = min(2, len(sorted_valid))
     selected = sorted_valid[:top_k]
     for t in selected:
         hedge_rows[t]["selected"] = True
 
-    hedge_budget = 0.15
+    hedge_budget_cap = 0.15
     main_vol_shift = main_metrics.get("vol_shift_20d_vs_60d")
     if intent == "hedge_design" or _state_has_scenario_tag(state, "event_risk") or (main_vol_shift is not None and float(main_vol_shift) > 1.2):
-        hedge_budget = 0.25
-    if not selected:
-        hedge_budget = 0.0
+        hedge_budget_cap = 0.25
 
-    hedge_raw_weights: dict[str, float] = {}
+    hedge_notional = {}
     for t in selected:
-        score = max(0.0, float(hedge_rows[t].get("score", 0.0)))
-        vol = hedge_rows[t].get("vol_20d_ann")
-        inv_vol = 1.0 / max(float(vol), 1e-6) if vol not in (None, 0) else 1.0
-        hedge_raw_weights[t] = (score if score > 0 else 0.25) * inv_vol
-    hedge_norm = _normalize_long_only_weights(hedge_raw_weights)
-    if selected and not hedge_norm:
-        hedge_norm = _normalize_long_only_weights({t: 1.0 for t in selected})
+        ratio = max(0.0, float(hedge_rows[t].get("hedge_ratio_60d", 0.0) or 0.0))
+        hedge_notional[t] = min(ratio, 0.35)
+    total_hedge_notional = float(sum(hedge_notional.values()))
+    max_hedge_notional = hedge_budget_cap / max(1.0 - hedge_budget_cap, 1e-6) if hedge_budget_cap < 1.0 else total_hedge_notional
+    hedge_notional_scale = 1.0
+    if total_hedge_notional > max_hedge_notional > 0.0:
+        hedge_notional_scale = max_hedge_notional / total_hedge_notional
+        hedge_notional = {
+            ticker: float(value) * hedge_notional_scale
+            for ticker, value in hedge_notional.items()
+        }
 
-    proposed_raw = {main: max(0.0, 1.0 - hedge_budget)}
+    proposed_raw = {main: 1.0}
     for t in hedges:
         proposed_raw.setdefault(t, 0.0)
-    for t, w in hedge_norm.items():
-        proposed_raw[t] = hedge_budget * float(w)
+    for t, value in hedge_notional.items():
+        proposed_raw[t] = float(value)
 
-    positions_proposed = _normalize_long_only_weights(proposed_raw)
-    if not positions_proposed:
-        positions_proposed = {main: 1.0}
+    advisory_weights = _normalize_long_only_weights(proposed_raw)
+    if not advisory_weights:
+        advisory_weights = {main: 1.0}
     for t in universe:
-        positions_proposed.setdefault(t, 0.0)
-    total = float(sum(float(v) for v in positions_proposed.values()))
+        advisory_weights.setdefault(t, 0.0)
+    total = float(sum(float(v) for v in advisory_weights.values()))
     if total > 1e-12:
-        positions_proposed = {t: float(v) / total for t, v in positions_proposed.items()}
-    residual = 1.0 - float(sum(float(v) for v in positions_proposed.values()))
+        advisory_weights = {t: float(v) / total for t, v in advisory_weights.items()}
+    residual = 1.0 - float(sum(float(v) for v in advisory_weights.values()))
     if abs(residual) > 1e-12:
-        positions_proposed[main] = max(0.0, float(positions_proposed.get(main, 0.0)) + residual)
-        positions_proposed = _normalize_long_only_weights(positions_proposed) or {main: 1.0}
+        advisory_weights[main] = max(0.0, float(advisory_weights.get(main, 0.0)) + residual)
+        advisory_weights = _normalize_long_only_weights(advisory_weights) or {main: 1.0}
     for t in universe:
-        positions_proposed.setdefault(t, 0.0)
+        advisory_weights.setdefault(t, 0.0)
+    hedge_budget = float(sum(float(advisory_weights.get(t, 0.0) or 0.0) for t in hedges))
 
     status = "ok" if selected else "insufficient_data"
-    reason = "selected_top_scores" if selected else "no_hedge_with_minimum_data"
+    reason = (
+        "selected_qualified_hedges"
+        if selected
+        else ("no_good_hedge_candidates" if hedge_rows else "no_hedge_with_minimum_data")
+    )
     hedge_lite = {
         "status": status,
         "reason": reason,
+        "advisory_only": True,
         "analysis_execution_mode": analysis_mode,
         "main": main,
         "universe": universe,
         "hedges": hedge_rows,
         "selected_hedges": selected,
         "hedge_budget": hedge_budget,
-        "main_weight": positions_proposed.get(main, 0.0),
+        "hedge_budget_cap": hedge_budget_cap,
+        "hedge_notional_scale": hedge_notional_scale if selected else 0.0,
+        "main_weight": advisory_weights.get(main, 0.0),
         "main_metrics": main_metrics,
-        "weights_proposed": {t: positions_proposed.get(t, 0.0) for t in universe},
+        "weights_advisory": {t: advisory_weights.get(t, 0.0) for t in universe},
         "intent": intent,
         "scenario_tags": scenario_tags,
         "timestamp": as_of,
         "seed": seed,
-        "build_version": "hedge_lite_v1",
+        "build_version": "hedge_lite_v2_advisory",
         "evidence": evidence,
     }
 
@@ -3262,13 +3598,12 @@ def hedge_lite_builder_node(state: InvestmentState) -> dict:
         [
             f"mode={analysis_mode} main={main} hedges={hedges}",
             f"status={status} selected={selected}",
-            f"hedge_budget={hedge_budget:.2f} weights={positions_proposed}",
+            f"hedge_budget={hedge_budget:.2f} cap={hedge_budget_cap:.2f} advisory_weights={advisory_weights}",
         ],
     )
     _log(state, "hedge_lite_builder", "exit", {"status": status, "selected": selected})
     return {
         "hedge_lite": hedge_lite,
-        "positions_proposed": positions_proposed,
         "audit": audit,
     }
 
@@ -3380,11 +3715,11 @@ def _event_regime_quant_decision(payload: dict) -> dict:
     }
 
 
-def quant_analyst_node(state: InvestmentState) -> dict:
+def _quant_analyst_node_impl(state: InvestmentState, *, node_name: str) -> dict:
     """⑤ Quant Analyst (wrapper: data_provider → quant_engine → mock decision)."""
     if state.get("completed_tasks", {}).get("quant", False):
         return {}
-    _log(state, "quant", "enter")
+    _log(state, node_name, "enter")
 
     mode = state.get("mode", "mock")
     seed = _make_seed(state) + 3
@@ -3582,8 +3917,12 @@ def quant_analyst_node(state: InvestmentState) -> dict:
         [f"decision_change={output.get('decision_change_log', {}).get('status')}"],
     )
 
-    _log(state, "quant", "exit", {"decision": decision["decision"]})
+    _log(state, node_name, "exit", {"decision": decision["decision"]})
     return {"technical_analysis": output, "completed_tasks": {"quant": True}, "evidence_requests": []}
+
+
+def quant_analyst_node(state: InvestmentState) -> dict:
+    return _quant_analyst_node_impl(state, node_name="quant_analyst")
 
 
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
@@ -3996,54 +4335,192 @@ def _event_days_to(as_of: str, value: Any) -> int | None:
     return int((event_dt.date() - base_dt.date()).days)
 
 
-def _macro_trigger_breached(trigger: dict) -> bool:
-    if not isinstance(trigger, dict):
-        return False
-    metric = str(trigger.get("metric", "")).strip().lower()
-    value = trigger.get("current_value")
+def _coerce_float(value: Any) -> float | None:
     try:
-        current = float(value)
+        return float(value)
     except (TypeError, ValueError):
-        return False
+        return None
 
-    if metric == "hy_oas":
-        bp = current * 100.0 if abs(current) < 50 else current
-        return bp >= 500
-    if metric == "pmi":
-        return current < 48
-    if metric in {"inflation_proxy", "core_cpi_yoy", "cpi_yoy"}:
-        return current > 3.0
-    if metric == "vix_level":
-        return current > 20
-    if metric == "yield_curve_spread":
-        return current < -0.20 or current > 0.30
-    if metric == "sofr_ff_6m_basis_bp":
-        return abs(current) > 10
-    if metric in {"wti/brent", "wti", "brent"}:
-        return current >= 80
+
+def _normalize_monitor_value(metric: str, value: Any) -> float | None:
+    current = _coerce_float(value)
+    if current is None:
+        return None
+    metric = str(metric or "").strip().lower()
+    if metric == "hy_oas" and abs(current) < 50.0:
+        return current * 100.0
+    return current
+
+
+def _comparison_hit(current: float, op: str, threshold: float) -> bool:
+    if op == ">":
+        return current > threshold
+    if op == ">=":
+        return current >= threshold
+    if op == "<":
+        return current < threshold
+    if op == "<=":
+        return current <= threshold
     return False
 
 
+def _severity_label(rank: int) -> str:
+    return _MONITORING_SEVERITY_LABELS.get(max(0, min(int(rank or 0), 3)), "watch")
+
+
+def _severity_rank_from_levels(current: float, levels: list[list[tuple[str, float]]]) -> int:
+    rank = 0
+    for exprs in levels:
+        if any(_comparison_hit(current, op, threshold) for op, threshold in exprs):
+            rank += 1
+    return min(rank, 3)
+
+
+def _parse_trigger_thresholds(trigger_text: str) -> list[tuple[str, float]]:
+    parsed: list[tuple[str, float]] = []
+    for op, raw in re.findall(r"(<=|>=|<|>)\s*(-?\d+(?:\.\d+)?)", str(trigger_text or "")):
+        try:
+            parsed.append((op, float(raw)))
+        except ValueError:
+            continue
+    return parsed
+
+
+def _threshold_tolerance(expected: float) -> float:
+    return max(0.01, abs(expected) * 0.05)
+
+
+def _validate_macro_trigger_thresholds(metric: str, trigger_text: str) -> dict:
+    rule = _MACRO_MONITOR_RULES.get(str(metric or "").strip().lower())
+    parsed = _parse_trigger_thresholds(trigger_text)
+    if rule is None:
+        return {
+            "status": "unknown_metric",
+            "policy_thresholds": [],
+            "parsed_thresholds": parsed,
+        }
+    if not parsed:
+        return {
+            "status": "inconclusive",
+            "policy_thresholds": list(rule.get("validation_thresholds", [])),
+            "parsed_thresholds": [],
+        }
+
+    allowed_ops = set(rule.get("allowed_ops", set()))
+    if allowed_ops and any(op not in allowed_ops for op, _ in parsed):
+        return {
+            "status": "invalid_direction",
+            "policy_thresholds": list(rule.get("validation_thresholds", [])),
+            "parsed_thresholds": parsed,
+        }
+
+    expected = list(rule.get("validation_thresholds", []))
+    mode = str(rule.get("validation_mode", "")).strip().lower()
+    valid = True
+    if mode == "greater":
+        values = [val for op, val in parsed if op in {">", ">="}]
+        valid = bool(values) and abs(values[0] - expected[0]) <= _threshold_tolerance(expected[0])
+    elif mode == "less":
+        values = [val for op, val in parsed if op in {"<", "<="}]
+        valid = bool(values) and abs(values[0] - expected[0]) <= _threshold_tolerance(expected[0])
+    elif mode == "greater_multi":
+        values = [val for op, val in parsed if op in {">", ">="}]
+        valid = len(values) >= len(expected) and all(
+            abs(values[idx] - exp) <= _threshold_tolerance(exp)
+            for idx, exp in enumerate(expected)
+        )
+    elif mode == "two_sided":
+        lows = [val for op, val in parsed if op in {"<", "<="}]
+        highs = [val for op, val in parsed if op in {">", ">="}]
+        valid = (
+            bool(lows)
+            and bool(highs)
+            and abs(lows[0] - expected[0]) <= _threshold_tolerance(expected[0])
+            and abs(highs[0] - expected[1]) <= _threshold_tolerance(expected[1])
+        )
+    elif mode == "abs_two_sided":
+        values = [abs(val) for _, val in parsed]
+        valid = len(values) >= len(expected) and all(
+            any(abs(value - exp) <= _threshold_tolerance(exp) for value in values)
+            for exp in expected
+        )
+    else:
+        return {
+            "status": "inconclusive",
+            "policy_thresholds": expected,
+            "parsed_thresholds": parsed,
+        }
+
+    return {
+        "status": "valid" if valid else "invalid_threshold",
+        "policy_thresholds": expected,
+        "parsed_thresholds": parsed,
+    }
+
+
+def _macro_trigger_signal(trigger: dict) -> dict:
+    if not isinstance(trigger, dict):
+        return {
+            "metric": "",
+            "current_value": None,
+            "plausible": False,
+            "breached": False,
+            "severity_rank": 0,
+            "severity_label": _severity_label(0),
+            "threshold_validation": {"status": "invalid_payload", "policy_thresholds": [], "parsed_thresholds": []},
+        }
+    metric = str(trigger.get("metric", "")).strip().lower()
+    current = _normalize_monitor_value(metric, trigger.get("current_value"))
+    validation = _validate_macro_trigger_thresholds(metric, str(trigger.get("trigger", "")))
+    if current is None:
+        return {
+            "metric": metric,
+            "current_value": None,
+            "plausible": False,
+            "breached": False,
+            "severity_rank": 0,
+            "severity_label": _severity_label(0),
+            "threshold_validation": validation,
+        }
+    rule = _MACRO_MONITOR_RULES.get(metric)
+    if rule is None:
+        plausible = abs(current) <= 10_000.0
+        return {
+            "metric": metric,
+            "current_value": current,
+            "plausible": plausible,
+            "breached": False,
+            "severity_rank": 0,
+            "severity_label": _severity_label(0),
+            "threshold_validation": validation,
+        }
+    lower, upper = rule["plausible"]
+    plausible = lower <= current <= upper
+    severity_rank = _severity_rank_from_levels(current, list(rule.get("severity_levels", []))) if plausible else 0
+    return {
+        "metric": metric,
+        "current_value": current,
+        "plausible": plausible,
+        "breached": severity_rank > 0,
+        "severity_rank": severity_rank,
+        "severity_label": _severity_label(severity_rank),
+        "threshold_validation": validation,
+    }
+
+
+def _macro_trigger_breached(trigger: dict) -> bool:
+    return bool(_macro_trigger_signal(trigger).get("breached", False))
+
+
 def _macro_trigger_value_is_plausible(metric: str, value: Any) -> bool:
-    try:
-        current = float(value)
-    except (TypeError, ValueError):
+    current = _normalize_monitor_value(metric, value)
+    if current is None:
         return False
     metric = str(metric or "").strip().lower()
-    if metric == "pmi":
-        return 0.0 <= current <= 100.0
-    if metric == "hy_oas":
-        return 0.0 <= current <= 2000.0
-    if metric in {"inflation_proxy", "core_cpi_yoy", "cpi_yoy"}:
-        return -10.0 <= current <= 30.0
-    if metric == "vix_level":
-        return 0.0 <= current <= 150.0
-    if metric == "yield_curve_spread":
-        return -10.0 <= current <= 10.0
-    if metric == "sofr_ff_6m_basis_bp":
-        return -200.0 <= current <= 200.0
-    if metric in {"wti/brent", "wti", "brent"}:
-        return 0.0 <= current <= 500.0
+    rule = _MACRO_MONITOR_RULES.get(metric)
+    if rule is not None:
+        lower, upper = rule["plausible"]
+        return lower <= current <= upper
     return abs(current) <= 10_000.0
 
 
@@ -4066,6 +4543,39 @@ def _event_key(item: dict) -> str:
     return "::".join(part for part in [desk, ticker, event_type, subtype, date, trigger] if part)
 
 
+def _event_handle_key(item: dict) -> str:
+    base = _event_key(item)
+    try:
+        severity_rank = int(item.get("severity_rank", 0) or 0)
+    except (TypeError, ValueError):
+        severity_rank = 0
+    if base and severity_rank > 0:
+        return f"{base}::sev{severity_rank}"
+    return base
+
+
+def _severity_rank_from_trigger_text(current_value: Any, trigger_text: str) -> int:
+    current = _coerce_float(current_value)
+    if current is None:
+        return 0
+    rank = 0
+    for op, threshold in _parse_trigger_thresholds(trigger_text)[:3]:
+        if _comparison_hit(current, op, threshold):
+            rank += 1
+    return min(rank, 3)
+
+
+def _quant_risk_severity(high_vol_prob: float, asset_cvar: float) -> int:
+    rank = 0
+    if high_vol_prob >= 0.20 or asset_cvar >= 0.05:
+        rank = 1
+    if high_vol_prob >= 0.35 or asset_cvar >= 0.07:
+        rank = 2
+    if high_vol_prob >= 0.50 or asset_cvar >= 0.10:
+        rank = 3
+    return rank
+
+
 def _build_event_calendar(state: InvestmentState) -> list[dict]:
     as_of = str(state.get("as_of", "")).strip()
     target = str(state.get("target_ticker", "")).strip().upper()
@@ -4081,10 +4591,12 @@ def _build_event_calendar(state: InvestmentState) -> list[dict]:
         if not isinstance(trigger, dict):
             continue
         metric = str(trigger.get("metric", "")).strip()
-        current_value = trigger.get("current_value")
-        if not _macro_trigger_value_is_plausible(metric, current_value):
+        signal = _macro_trigger_signal(trigger)
+        validation = signal.get("threshold_validation", {})
+        if not signal.get("plausible", False):
             continue
-        breached = _macro_trigger_breached(trigger)
+        if str(validation.get("status", "")).strip().lower().startswith("invalid"):
+            continue
         item = {
             "desk": "macro",
             "ticker": "__GLOBAL__",
@@ -4092,16 +4604,21 @@ def _build_event_calendar(state: InvestmentState) -> list[dict]:
             "subtype": str(trigger.get("name", "")).strip() or metric,
             "metric": metric,
             "priority": int(trigger.get("priority", 3) or 3),
-            "status": "triggered" if breached else "watch",
-            "current_value": current_value,
+            "status": "triggered" if signal.get("breached", False) else "watch",
+            "current_value": signal.get("current_value"),
             "trigger": str(trigger.get("trigger", "")).strip(),
             "action": str(trigger.get("action", "")).strip(),
             "source": "macro_monitoring_triggers",
             "confirmed": False,
             "affected_tickers": universe[:6],
-            "breached": breached,
+            "breached": bool(signal.get("breached", False)),
+            "severity_rank": int(signal.get("severity_rank", 0) or 0),
+            "severity_label": str(signal.get("severity_label", _severity_label(0))),
+            "threshold_validation_status": str(validation.get("status", "")).strip() or "inconclusive",
+            "threshold_policy": list(validation.get("policy_thresholds", [])),
         }
         item["event_key"] = _event_key(item)
+        item["handled_event_key"] = _event_handle_key(item)
         events.append(item)
     for raw_event in macro.get("macro_event_calendar", []) or []:
         if not isinstance(raw_event, dict):
@@ -4130,6 +4647,7 @@ def _build_event_calendar(state: InvestmentState) -> list[dict]:
             "notes": str(raw_event.get("notes", "")).strip(),
         }
         event["event_key"] = _event_key(event)
+        event["handled_event_key"] = _event_handle_key(event)
         events.append(event)
 
     fundamental = state.get("fundamental_analysis", {}) if isinstance(state.get("fundamental_analysis"), dict) else {}
@@ -4161,6 +4679,7 @@ def _build_event_calendar(state: InvestmentState) -> list[dict]:
             "thesis_change_trigger": str(item.get("thesis_change_trigger", "")).strip(),
         }
         event["event_key"] = _event_key(event)
+        event["handled_event_key"] = _event_handle_key(event)
         events.append(event)
 
     sentiment = state.get("sentiment_analysis", {}) if isinstance(state.get("sentiment_analysis"), dict) else {}
@@ -4177,8 +4696,11 @@ def _build_event_calendar(state: InvestmentState) -> list[dict]:
             "confirmed": False,
             "catalyst_type": list(catalyst_risk.get("catalyst_type", []) or []),
             "volatility_regime": str(sentiment.get("volatility_regime", "")).strip(),
+            "severity_rank": 1 if catalyst_risk.get("catalyst_present") else 0,
+            "severity_label": _severity_label(1 if catalyst_risk.get("catalyst_present") else 0),
         }
         event["event_key"] = _event_key(event)
+        event["handled_event_key"] = _event_handle_key(event)
         events.append(event)
 
     quant = state.get("technical_analysis", {}) if isinstance(state.get("technical_analysis"), dict) else {}
@@ -4186,7 +4708,8 @@ def _build_event_calendar(state: InvestmentState) -> list[dict]:
     regime_probs = (quant_payload.get("market_regime_context", {}) or {}).get("state_probabilities", {}) or {}
     high_vol_prob = float(regime_probs.get("regime_2_high_vol", 0.0) or 0.0)
     asset_cvar = float(quant.get("asset_cvar_99_daily", 0.0) or 0.0)
-    if high_vol_prob >= 0.20 or asset_cvar >= 0.05:
+    quant_severity = _quant_risk_severity(high_vol_prob, asset_cvar)
+    if quant_severity > 0:
         event = {
             "desk": "quant",
             "ticker": target or "__GLOBAL__",
@@ -4198,8 +4721,11 @@ def _build_event_calendar(state: InvestmentState) -> list[dict]:
             "confirmed": True,
             "high_vol_prob": round(high_vol_prob, 4),
             "asset_cvar_99_daily": round(asset_cvar, 6),
+            "severity_rank": quant_severity,
+            "severity_label": _severity_label(quant_severity),
         }
         event["event_key"] = _event_key(event)
+        event["handled_event_key"] = _event_handle_key(event)
         events.append(event)
 
     construction = state.get("portfolio_construction_analysis", {}) if isinstance(state.get("portfolio_construction_analysis"), dict) else {}
@@ -4219,8 +4745,11 @@ def _build_event_calendar(state: InvestmentState) -> list[dict]:
             "action": str(trigger.get("action", "")).strip(),
             "source": "portfolio_construction_quant",
             "confirmed": True,
+            "severity_rank": max(1, _severity_rank_from_trigger_text(trigger.get("current_value"), str(trigger.get("trigger", "")))),
+            "severity_label": _severity_label(max(1, _severity_rank_from_trigger_text(trigger.get("current_value"), str(trigger.get("trigger", ""))))),
         }
         item["event_key"] = _event_key(item)
+        item["handled_event_key"] = _event_handle_key(item)
         events.append(item)
 
     deduped: dict[str, dict] = {}
@@ -4347,6 +4876,85 @@ def _monitoring_request_from_event(item: dict) -> dict | None:
     return None
 
 
+def _quality_only_escalation_desks(scorecard: dict) -> list[str]:
+    desks = scorecard.get("desks", {}) if isinstance(scorecard, dict) else {}
+    overall_score = _coerce_float((scorecard or {}).get("overall_score"))
+    overall_score = overall_score if overall_score is not None else 0.0
+    selected: list[str] = []
+    for desk, row in desks.items():
+        if desk not in ALL_DESKS or not isinstance(row, dict):
+            continue
+        status = str(row.get("status", "")).strip().lower()
+        quality_score = _coerce_float(row.get("quality_score"))
+        quality_score = quality_score if quality_score is not None else 0.0
+        needs_more_data = bool(row.get("needs_more_data", False))
+        evidence_count = int(row.get("evidence_count", 0) or 0)
+        if status == "missing" or quality_score < _QUALITY_ONLY_DESK_THRESHOLD:
+            selected.append(desk)
+            continue
+        if needs_more_data and (overall_score < _QUALITY_ONLY_OVERALL_THRESHOLD or evidence_count == 0):
+            selected.append(desk)
+    return sorted(set(selected))
+
+
+def _quality_monitoring_request_for_desk(state: InvestmentState, desk: str) -> dict | None:
+    ticker = str(state.get("target_ticker", "")).strip().upper()
+    if desk == "macro":
+        return {
+            "desk": "macro",
+            "kind": "macro_headline_context",
+            "ticker": "__GLOBAL__",
+            "query": "latest macro release drivers and policy stance",
+            "priority": 2,
+            "recency_days": 7,
+            "max_items": 3,
+            "rationale": "quality_only_monitoring:macro",
+            "source_tag": "monitoring",
+            "impacted_desks": ["macro", "sentiment"],
+        }
+    if desk == "fundamental" and ticker:
+        return {
+            "desk": "fundamental",
+            "kind": "press_release_or_ir",
+            "ticker": ticker,
+            "query": f"{ticker} latest official update guidance filing",
+            "priority": 2,
+            "recency_days": 14,
+            "max_items": 3,
+            "rationale": "quality_only_monitoring:fundamental",
+            "source_tag": "monitoring",
+            "impacted_desks": ["fundamental"],
+        }
+    if desk == "sentiment":
+        return {
+            "desk": "sentiment",
+            "kind": "catalyst_event_detail",
+            "ticker": ticker or "__GLOBAL__",
+            "query": f"{ticker or 'market'} sentiment volatility positioning catalyst update",
+            "priority": 2,
+            "recency_days": 7,
+            "max_items": 3,
+            "rationale": "quality_only_monitoring:sentiment",
+            "source_tag": "monitoring",
+            "impacted_desks": ["sentiment"],
+        }
+    return None
+
+
+def _is_new_monitoring_event(item: dict, handled: set[str]) -> bool:
+    handled_event_key = str(item.get("handled_event_key", "")).strip() or _event_handle_key(item)
+    if handled_event_key and handled_event_key in handled:
+        return False
+    try:
+        severity_rank = int(item.get("severity_rank", 0) or 0)
+    except (TypeError, ValueError):
+        severity_rank = 0
+    base_key = str(item.get("event_key", "")).strip()
+    if severity_rank <= 0 and base_key and base_key in handled:
+        return False
+    return True
+
+
 def _build_monitoring_actions(
     state: InvestmentState,
     event_calendar: list[dict],
@@ -4359,12 +4967,21 @@ def _build_monitoring_actions(
         if str(key).strip()
     }
     weak_desks = set(scorecard.get("weak_desks", []) or [])
+    quality_only_desks = _quality_only_escalation_desks(scorecard)
 
     triggered_events = [
         item for item in event_calendar
         if isinstance(item, dict) and str(item.get("status", "")).strip().lower() in {"triggered", "imminent"}
     ]
-    new_triggered = [item for item in triggered_events if str(item.get("event_key", "")).strip() not in handled]
+    new_triggered = [item for item in triggered_events if _is_new_monitoring_event(item, handled)]
+    retriggered_events = []
+    for item in new_triggered:
+        base_key = str(item.get("event_key", "")).strip()
+        handled_key = str(item.get("handled_event_key", "")).strip()
+        if not base_key or handled_key in handled:
+            continue
+        if any(prev == base_key or prev.startswith(f"{base_key}::sev") for prev in handled):
+            retriggered_events.append(item)
 
     selected_desks: set[str] = set()
     risk_refresh_required = False
@@ -4383,12 +5000,22 @@ def _build_monitoring_actions(
 
     if new_triggered and weak_desks:
         selected_desks.update(weak_desks)
+    if not new_triggered and quality_only_desks:
+        selected_desks.update(quality_only_desks)
+        if any(desk in {"macro", "quant"} for desk in quality_only_desks):
+            risk_refresh_required = True
 
     monitoring_requests = []
     for item in new_triggered:
         req = _monitoring_request_from_event(item)
         if req:
             sanitized = _sanitize_swarm_request(req, default_source_tag="monitoring")
+            if sanitized:
+                monitoring_requests.append(sanitized)
+    if not new_triggered and quality_only_desks:
+        for desk in quality_only_desks:
+            req = _quality_monitoring_request_for_desk(state, desk)
+            sanitized = _sanitize_swarm_request(req, default_source_tag="monitoring") if req else None
             if sanitized:
                 monitoring_requests.append(sanitized)
     monitoring_requests = _dedupe_requests(monitoring_requests)
@@ -4407,18 +5034,31 @@ def _build_monitoring_actions(
             "params": {"source": "monitoring_router"},
         })
 
-    handled_event_keys = sorted(handled | {str(item.get("event_key", "")).strip() for item in new_triggered if str(item.get("event_key", "")).strip()})
+    handled_event_keys = sorted(
+        handled
+        | {
+            str(item.get("handled_event_key", "")).strip() or str(item.get("event_key", "")).strip()
+            for item in new_triggered
+            if str(item.get("handled_event_key", "")).strip() or str(item.get("event_key", "")).strip()
+        }
+    )
     return {
         "status": "ok",
         "triggered_events": triggered_events[:8],
         "new_triggered_events": new_triggered[:8],
+        "retriggered_events": retriggered_events[:8],
         "selected_desks": sorted(selected_desks),
         "risk_refresh_required": risk_refresh_required,
         "monitoring_requests": monitoring_requests[:MAX_WEB_QUERIES_PER_RUN],
         "force_research": bool(monitoring_requests or selected_desks),
-        "reason": "new_triggered_events" if new_triggered else ("weak_desk_monitoring" if weak_desks else "no_escalation"),
+        "reason": (
+            "new_triggered_events"
+            if new_triggered
+            else ("quality_only_monitoring" if quality_only_desks else ("weak_desks_watch_only" if weak_desks else "no_escalation"))
+        ),
         "handled_event_keys": handled_event_keys[-64:],
         "weak_desks": sorted(weak_desks),
+        "quality_escalation_desks": quality_only_desks,
         "task_actions": task_actions,
     }
 
@@ -4773,19 +5413,6 @@ def research_router_node(state: InvestmentState) -> dict:
 
     recovery = plan_runtime_recovery(state, desk_outputs)
     merged_backlog = _merge_actions(state.get("task_backlog", []), followup_actions, recovery.get("actions", []))
-    if recovery.get("issues") or recovery.get("actions"):
-        telemetry.log_event(
-            state.get("run_id", ""),
-            node_name="autonomy_planner",
-            iteration=state.get("iteration_count", 0),
-            phase="exit",
-            outputs_summary={
-                "issues": len(recovery.get("issues", [])),
-                "actions": len(recovery.get("actions", [])),
-                "added_requests": len(recovery.get("evidence_requests", [])),
-                "notes": recovery.get("notes", []),
-            },
-        )
 
     swarm = _bounded_swarm_plan_step(
         state,
@@ -4823,33 +5450,11 @@ def research_router_node(state: InvestmentState) -> dict:
 
     planned = _dedupe_requests(planned)
 
-    rid = state.get("run_id", "")
-    if rid:
-        source_tag_counts: dict[str, int] = {}
-        for req in planned:
-            tag = str(req.get("source_tag", "unknown"))
-            source_tag_counts[tag] = int(source_tag_counts.get(tag, 0)) + 1
-        selected_kinds = sorted({str(req.get("kind", "")) for req in planned if req.get("kind")})
-        telemetry.log_event(
-            rid,
-            node_name="bounded_swarm_planner",
-            iteration=state.get("iteration_count", 0),
-            phase="exit",
-            outputs_summary={
-                "research_round": int(state.get("research_round", 0)),
-                "evidence_score": int(score_block.get("score", 0)),
-                "missing_buckets": missing_buckets,
-                "covered_buckets": covered_buckets,
-                "candidate_count": len(swarm_candidates),
-                "selected_count": len(planned),
-                "selected_kinds": selected_kinds[:6],
-                "source_tag_counts": source_tag_counts,
-                "budget": {
-                    "per_run": MAX_WEB_QUERIES_PER_RUN,
-                    "per_ticker": MAX_WEB_QUERIES_PER_TICKER,
-                },
-            },
-        )
+    source_tag_counts: dict[str, int] = {}
+    for req in planned:
+        tag = str(req.get("source_tag", "unknown"))
+        source_tag_counts[tag] = int(source_tag_counts.get(tag, 0)) + 1
+    selected_kinds = sorted({str(req.get("kind", "")) for req in planned if req.get("kind")})
 
     policy_input = dict(state)
     policy_input["evidence_score"] = score_block["score"]
@@ -4963,32 +5568,47 @@ def research_router_node(state: InvestmentState) -> dict:
             f"run_research={run_research}, reason={reason}, "
             f"planned={len(planned)}, allowed={len(allowed)}, allowed_kinds={kinds[:6]}"
         )
-    if user_action_required:
-        telemetry.log_event(
-            state.get("run_id", ""),
-            node_name="human_handoff",
-            iteration=state.get("iteration_count", 0),
-            phase="exit",
-            outputs_summary={
-                "reason": out["research_stop_reason"],
-                "items": user_action_items,
+    exit_summary = {
+        "run": run_research,
+        "reason": out["trace"][0]["reason"],
+        "issues": len(recovery.get("issues", [])),
+        "actions": len(recovery.get("actions", [])),
+        "evidence_score": score_block["score"],
+        "planned_requests": len(planned),
+        "allowed_requests": allowed_count,
+        "selected_desks": list(monitoring_actions.get("selected_desks", [])),
+        "recovery": {
+            "issues": len(recovery.get("issues", [])),
+            "actions": len(recovery.get("actions", [])),
+            "added_requests": len(recovery.get("evidence_requests", [])),
+            "notes": recovery.get("notes", []),
+        },
+        "swarm_plan": {
+            "candidate_count": len(swarm_candidates),
+            "selected_count": len(planned),
+            "covered_buckets": covered_buckets,
+            "missing_buckets": missing_buckets,
+            "selected_kinds": selected_kinds[:6],
+            "source_tag_counts": source_tag_counts,
+            "budget": {
+                "per_run": MAX_WEB_QUERIES_PER_RUN,
+                "per_ticker": MAX_WEB_QUERIES_PER_TICKER,
             },
-        )
-    if not run_research:
-        telemetry.log_event(
-            state.get("run_id", ""),
-            node_name="research_round",
-            iteration=state.get("iteration_count", 0),
-            phase="exit",
-            outputs_summary={
-                "research_round": state.get("research_round", 0),
-                "queries_executed": 0,
-                "last_research_delta": state.get("last_research_delta", 0),
-                "evidence_score": score_block["score"],
-                "stop_reason": out["research_stop_reason"],
-            },
-        )
-    _log(state, "research_router", "exit", {"run": run_research, "reason": out["trace"][0]["reason"]})
+        },
+        "handoff": {
+            "required": user_action_required,
+            "reason": out["research_stop_reason"],
+            "items": user_action_items,
+        },
+        "research_round": {
+            "round": state.get("research_round", 0),
+            "queries_executed": 0,
+            "last_research_delta": state.get("last_research_delta", 0),
+            "evidence_score": score_block["score"],
+            "stop_reason": out["research_stop_reason"],
+        },
+    }
+    _log(state, "research_router", "exit", exit_summary)
     return out
 
 
@@ -5410,21 +6030,6 @@ def research_executor_node(state: InvestmentState) -> dict:
     audit_research["web_queries_by_ticker"] = by_ticker
     audit["research"] = audit_research
 
-    rid = state.get("run_id", "")
-    if rid:
-        telemetry.log_event(
-            rid,
-            node_name="rerun_selector",
-            iteration=state.get("iteration_count", 0),
-            phase="exit",
-            outputs_summary={
-                "selected_desks": sorted(rerun_desks),
-                "executed_requests": len(executed_requests),
-                "executed_kinds": rerun_plan.get("executed_kinds", []),
-                "k": _MAX_RERUN_DESKS,
-            },
-        )
-
     stop_reason = ""
     if score_block["score"] >= 75:
         stop_reason = "evidence_score_enough"
@@ -5471,23 +6076,6 @@ def research_executor_node(state: InvestmentState) -> dict:
             f"rerun_reasons={rerun_plan.get('reasons', {})}, executed_kinds={rerun_plan.get('executed_kinds', [])}"
         )
 
-    telemetry.log_event(
-        state.get("run_id", ""),
-        node_name="research_round",
-        iteration=state.get("iteration_count", 0),
-        phase="exit",
-        outputs_summary={
-            "research_round": research_round,
-            "queries_executed": queries_executed,
-            "last_research_delta": delta,
-            "bucket_delta": bucket_delta,
-            "resolved_request_ratio": round(resolved_request_ratio, 4),
-            "evidence_score": score_block["score"],
-            "rerun_desks": sorted(rerun_desks),
-            "stop_reason": stop_reason,
-        },
-    )
-
     out = {
         "evidence_store": store,
         "evidence_score": score_block["score"],
@@ -5519,7 +6107,35 @@ def research_executor_node(state: InvestmentState) -> dict:
             "forced_rerun_desks": sorted(forced_desks),
         }],
     }
-    _log(state, "research_executor", "exit", {"queries_executed": queries_executed, "delta": delta, "score": score_block["score"]})
+    _log(
+        state,
+        "research_executor",
+        "exit",
+        {
+            "queries_executed": queries_executed,
+            "delta": delta,
+            "score": score_block["score"],
+            "selected_desks": sorted(rerun_desks),
+            "rerun": {
+                "selected_desks": sorted(rerun_desks),
+                "forced_desks": sorted(forced_desks),
+                "executed_requests": len(executed_requests),
+                "executed_kinds": rerun_plan.get("executed_kinds", []),
+                "reasons": rerun_plan.get("reasons", {}),
+                "k": _MAX_RERUN_DESKS,
+            },
+            "research_round": {
+                "round": research_round,
+                "queries_executed": queries_executed,
+                "last_research_delta": delta,
+                "bucket_delta": bucket_delta,
+                "resolved_request_ratio": round(resolved_request_ratio, 4),
+                "evidence_score": score_block["score"],
+                "rerun_desks": sorted(rerun_desks),
+                "stop_reason": stop_reason,
+            },
+        },
+    )
     return out
 
 
@@ -5533,19 +6149,19 @@ def research_barrier_node(state: InvestmentState) -> dict:
 
 
 def macro_analyst_research_node(state: InvestmentState) -> dict:
-    return macro_analyst_node(state)
+    return _macro_analyst_node_impl(state, node_name="macro_analyst_research")
 
 
 def fundamental_analyst_research_node(state: InvestmentState) -> dict:
-    return fundamental_analyst_node(state)
+    return _fundamental_analyst_node_impl(state, node_name="fundamental_analyst_research")
 
 
 def sentiment_analyst_research_node(state: InvestmentState) -> dict:
-    return sentiment_analyst_node(state)
+    return _sentiment_analyst_node_impl(state, node_name="sentiment_analyst_research")
 
 
 def quant_analyst_research_node(state: InvestmentState) -> dict:
-    return quant_analyst_node(state)
+    return _quant_analyst_node_impl(state, node_name="quant_analyst_research")
 
 
 def risk_manager_node(state: InvestmentState) -> dict:

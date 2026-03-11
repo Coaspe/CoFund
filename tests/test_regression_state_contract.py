@@ -244,6 +244,47 @@ def test_ac1d_question_understanding_merges_manual_position_input(monkeypatch):
     assert out["positions_final"] == {"NVDA": 1.0}
 
 
+def test_ac1d_question_understanding_skips_portfolio_enrichment_for_non_portfolio_intent(monkeypatch):
+    monkeypatch.setattr(investment_team, "HAS_FRONTDOOR_LLM", False)
+    state = create_initial_state(
+        user_request="시장 전망 어때?",
+        mode="mock",
+        seed=125,
+        portfolio_context={
+            "holdings": [{"ticker": "AAPL", "shares": 10, "avg_cost": 180, "currency": "USD"}],
+            "frontdoor_intent": "position_review",
+            "question_type": "single_position_review",
+            "primary_tickers": ["AAPL"],
+        },
+    )
+
+    out = investment_team.question_understanding_node(state)
+
+    assert out["question_understanding"]["intent"] == "market_outlook"
+    assert out["portfolio_intake"]["holdings"] == []
+    assert out["normalized_portfolio_snapshot"] == {}
+    assert out["portfolio_context"]["frontdoor_intent"] == "market_outlook"
+    assert out["portfolio_context"]["primary_tickers"] == []
+
+
+def test_ac1d_portfolio_seed_does_not_override_hedge_intent(monkeypatch):
+    monkeypatch.setattr(investment_team, "HAS_FRONTDOOR_LLM", False)
+    state = create_initial_state(
+        user_request="헤지 전략 제안해줘",
+        mode="mock",
+        seed=126,
+        portfolio_context={
+            "holdings": [{"ticker": "SPY", "shares": 10, "avg_cost": 500, "currency": "USD"}],
+        },
+    )
+
+    out = investment_team._build_frontdoor_bundle(state, compute_normalized=False)
+
+    assert out["question_understanding"]["question_type"] == "hedge_request"
+    assert out["question_understanding"]["intent"] == "hedge_design"
+    assert out["portfolio_intake"]["holdings"][0]["ticker"] == "SPY"
+
+
 def test_ac1d_llm_frontdoor_cannot_override_position_review_rule_match(monkeypatch):
     monkeypatch.setattr(investment_team, "HAS_FRONTDOOR_LLM", True)
     monkeypatch.setattr(
@@ -927,10 +968,13 @@ def test_ac1i_monitoring_router_builds_event_calendar_and_escalation():
     event_calendar = out.get("event_calendar", [])
     actions = out.get("monitoring_actions", {})
     scorecard = out.get("decision_quality_scorecard", {})
+    macro_monitor = next(item for item in event_calendar if item.get("desk") == "macro" and item.get("status") == "triggered")
 
     assert any(item.get("desk") == "macro" and item.get("status") == "triggered" for item in event_calendar)
     assert any(item.get("desk") == "macro" and item.get("type") == "fomc" and item.get("status") == "imminent" for item in event_calendar)
     assert any(item.get("desk") == "fundamental" and item.get("status") == "imminent" for item in event_calendar)
+    assert macro_monitor.get("threshold_validation_status") == "valid"
+    assert macro_monitor.get("severity_rank") == 1
     assert actions.get("force_research") is True
     assert set(actions.get("selected_desks", [])) >= {"macro", "fundamental", "sentiment"}
     assert actions.get("risk_refresh_required") is True
@@ -985,6 +1029,48 @@ def test_ac1k_research_executor_forces_monitoring_rerun_without_queries():
     assert out.get("completed_tasks", {}).get("macro") is False
     assert "macro" in (out.get("_rerun_plan", {}) or {}).get("selected_desks", [])
     assert "macro" in (out.get("trace", [{}])[0] or {}).get("forced_rerun_desks", [])
+
+
+def test_ac1l_monitoring_router_retriggers_on_severity_upgrade():
+    state = create_initial_state(user_request="변동성 재점검", mode="mock", seed=50)
+    state["as_of"] = "2026-03-08T00:00:00+00:00"
+    state["target_ticker"] = "SPY"
+    state["universe"] = ["SPY", "TLT"]
+    state["macro_analysis"] = {
+        "confidence": 0.62,
+        "data_ok": True,
+        "evidence": [{}],
+        "monitoring_triggers": [
+            {
+                "name": "Volatility regime shift",
+                "metric": "vix_level",
+                "current_value": 21.0,
+                "trigger": "> 20 / > 30",
+                "action": "beta 조정",
+                "priority": 1,
+            }
+        ],
+    }
+    state["fundamental_analysis"] = {"ticker": "SPY", "confidence": 0.60, "data_ok": True, "evidence": [{}]}
+    state["sentiment_analysis"] = {"confidence": 0.48, "data_ok": True, "evidence": [{}]}
+    state["technical_analysis"] = {"confidence": 0.54, "data_ok": True, "evidence": [{}]}
+
+    first = investment_team.monitoring_router_node(state)
+    first_actions = first.get("monitoring_actions", {})
+    assert first_actions.get("new_triggered_events")
+
+    state["monitoring_actions"] = {
+        "handled_event_keys": list(first_actions.get("handled_event_keys", [])),
+    }
+    state["macro_analysis"]["monitoring_triggers"][0]["current_value"] = 34.0
+
+    second = investment_team.monitoring_router_node(state)
+    second_actions = second.get("monitoring_actions", {})
+
+    assert second_actions.get("new_triggered_events")
+    assert second_actions.get("retriggered_events")
+    assert second_actions.get("reason") == "new_triggered_events"
+    assert second_actions["retriggered_events"][0]["severity_rank"] >= 2
 
 
 def test_ac2_etf_fundamental_no_insider_form4_requests():
@@ -1274,6 +1360,59 @@ def test_ac6d_monitoring_router_filters_stale_events_and_implausible_macro_value
     assert event_calendar == []
 
 
+def test_ac6e_monitoring_router_filters_invalid_macro_threshold_definitions():
+    state = create_initial_state(user_request="SPY 모니터링", mode="mock", seed=652)
+    state["as_of"] = "2026-03-08T00:00:00+00:00"
+    state["target_ticker"] = "SPY"
+    state["universe"] = ["SPY"]
+    state["macro_analysis"] = {
+        "confidence": 0.60,
+        "data_ok": True,
+        "evidence": [{}],
+        "monitoring_triggers": [
+            {
+                "name": "Broken VIX trigger",
+                "metric": "vix_level",
+                "current_value": 25.0,
+                "trigger": "< 20",
+                "priority": 1,
+                "action": "beta 조정",
+            }
+        ],
+    }
+    state["fundamental_analysis"] = {"ticker": "SPY", "confidence": 0.60, "data_ok": True, "evidence": [{}]}
+    state["sentiment_analysis"] = {"confidence": 0.44, "data_ok": True, "evidence": [{}]}
+    state["technical_analysis"] = {"confidence": 0.52, "data_ok": True, "evidence": [{}]}
+
+    out = investment_team.monitoring_router_node(state)
+
+    assert out.get("event_calendar", []) == []
+
+
+def test_ac6f_monitoring_router_quality_only_escalates_weak_desks():
+    state = create_initial_state(user_request="리서치 품질 점검", mode="mock", seed=653)
+    state["target_ticker"] = "AAPL"
+    state["macro_analysis"] = {"confidence": 0.63, "data_ok": True, "evidence": [{}]}
+    state["fundamental_analysis"] = {"ticker": "AAPL", "confidence": 0.61, "data_ok": True, "evidence": [{}]}
+    state["sentiment_analysis"] = {
+        "confidence": 0.10,
+        "data_ok": False,
+        "evidence": [],
+        "needs_more_data": True,
+    }
+    state["technical_analysis"] = {"confidence": 0.56, "data_ok": True, "evidence": [{}]}
+
+    out = investment_team.monitoring_router_node(state)
+    actions = out.get("monitoring_actions", {})
+
+    assert actions.get("new_triggered_events") == []
+    assert actions.get("reason") == "quality_only_monitoring"
+    assert "sentiment" in actions.get("quality_escalation_desks", [])
+    assert "sentiment" in actions.get("selected_desks", [])
+    assert actions.get("force_research") is True
+    assert any(req.get("desk") == "sentiment" for req in actions.get("monitoring_requests", []))
+
+
 def test_ac6_market_outlook_quant_uses_event_regime_indicators():
     state = create_initial_state(user_request="시장 전망 점검", mode="mock", seed=42)
     state["target_ticker"] = "SPY"
@@ -1393,6 +1532,30 @@ def test_ac6c_portfolio_construction_quant_rebalances_with_diversification(monke
     assert "Event cluster risk" in trigger_names or "Concentration pressure" in trigger_names
 
 
+def test_ac6d_portfolio_construction_quant_single_asset_passes_through_without_spurious_triggers():
+    state = create_initial_state(user_request="단일 종목 점검", mode="mock", seed=92)
+    state["as_of"] = "2026-03-08T00:00:00+00:00"
+    state["target_ticker"] = "TSLA"
+    state["universe"] = ["TSLA"]
+    state["asset_type_by_ticker"] = {"TSLA": "EQUITY"}
+    state["positions_proposed"] = {"TSLA": 1.0}
+    state["book_allocation_plan"] = {
+        "gross_target": 0.35,
+        "single_name_cap": 0.35,
+        "weights_relative": {"TSLA": 1.0},
+    }
+
+    out = investment_team.portfolio_construction_quant_node(state)
+    analysis = out["portfolio_construction_analysis"]
+    weights = out["positions_proposed"]
+
+    assert weights == {"TSLA": 1.0}
+    assert analysis["turnover_estimate"] == 0.0
+    assert analysis["turnover_budget"] == 0.0
+    assert analysis["diversification_score"] == 0.0
+    assert analysis["monitoring_triggers"] == []
+
+
 def test_rerun_decision_change_log_records_unchanged_with_evidence_refs():
     output = {
         "primary_decision": "neutral",
@@ -1440,7 +1603,7 @@ def test_ac_b1_b_mode_hedge_lite_populates_candidates():
         assert ("score" in row) or ("status" in row)
 
 
-def test_ac_b2_positions_proposed_include_main_plus_hedge_and_sum_to_one():
+def test_ac_b2_hedge_lite_is_advisory_only_and_does_not_emit_positions_proposed():
     state = create_initial_state(user_request="시장 전망 + 헤지", mode="mock", seed=77)
     state["analysis_execution_mode"] = "B_main_plus_hedge_lite"
     state["target_ticker"] = "SPY"
@@ -1448,17 +1611,166 @@ def test_ac_b2_positions_proposed_include_main_plus_hedge_and_sum_to_one():
     state["universe"] = ["SPY", "QQQ", "GLD", "TLT", "XLE"]
 
     out = investment_team.hedge_lite_builder_node(state)
-    weights = out.get("positions_proposed", {})
     hedge_lite = out.get("hedge_lite", {})
+    advisory_weights = hedge_lite.get("weights_advisory", {})
 
-    assert "SPY" in weights
-    assert any(t in weights for t in ["QQQ", "GLD", "TLT", "XLE"])
-    assert abs(sum(float(v) for v in weights.values()) - 1.0) < 1e-6
+    assert "positions_proposed" not in out
+    assert hedge_lite.get("advisory_only") is True
+    assert "SPY" in advisory_weights
+    assert abs(sum(float(v) for v in advisory_weights.values()) - 1.0) < 1e-6
 
-    hedge_positive = [t for t in ["QQQ", "GLD", "TLT", "XLE"] if float(weights.get(t, 0.0)) > 0]
+    hedge_positive = [t for t in ["QQQ", "GLD", "TLT", "XLE"] if float(advisory_weights.get(t, 0.0)) > 0]
     if not hedge_positive:
         assert hedge_lite.get("status") == "insufficient_data"
         assert hedge_lite.get("reason")
+
+
+def _price_series_from_returns(returns: list[float], start: float = 100.0) -> np.ndarray:
+    prices = [float(start)]
+    for value in returns:
+        prices.append(prices[-1] * (1.0 + float(value)))
+    return np.asarray(prices, dtype=float)
+
+
+def test_ac_b2a_downside_capture_uses_ratio_of_geometric_down_returns():
+    main_returns = [0.01, -0.02, -0.03, -0.01, 0.015]
+    hedge_returns = [0.004, -0.01, -0.015, -0.005, 0.006]
+    main_prices = _price_series_from_returns(main_returns)
+    hedge_prices = _price_series_from_returns(hedge_returns)
+
+    actual = investment_team._safe_downside_capture(hedge_prices, main_prices, window=4)
+    main_down = np.asarray([-0.02, -0.03, -0.01], dtype=float)
+    hedge_down = np.asarray([-0.01, -0.015, -0.005], dtype=float)
+    expected = (float(np.exp(np.mean(np.log1p(hedge_down))) - 1.0) / float(np.exp(np.mean(np.log1p(main_down))) - 1.0))
+
+    assert actual is not None
+    assert abs(float(actual) - expected) < 1e-9
+
+
+def test_ac_b2b_portfolio_construction_keeps_zero_signal_candidates_at_zero(monkeypatch):
+    state = create_initial_state(user_request="시장 전망 + 헤지", mode="mock", seed=79)
+    state["as_of"] = "2026-03-08T00:00:00+00:00"
+    state["target_ticker"] = "SPY"
+    state["universe"] = ["SPY", "QQQ", "TLT"]
+    state["asset_type_by_ticker"] = {"SPY": "ETF", "QQQ": "ETF", "TLT": "ETF"}
+
+    prices = np.linspace(100.0, 120.0, 260)
+
+    class DummyHub:
+        def __init__(self, *args, **kwargs):
+            pass
+
+        def get_price_series(self, ticker, seed=None, lookback_days=None):
+            return np.asarray(prices), [], {"data_ok": True, "limitations": []}
+
+        def get_market_series(self, ticker, seed=None, lookback_days=None):
+            return np.asarray(prices), [], {"data_ok": True, "limitations": []}
+
+    monkeypatch.setattr(investment_team, "DataHub", DummyHub)
+
+    out = investment_team.portfolio_construction_quant_node(state)
+    analysis = out["portfolio_construction_analysis"]
+    weights = out["positions_proposed"]
+
+    assert abs(float(weights.get("SPY", 0.0)) - 1.0) < 1e-6
+    assert float(weights.get("QQQ", 0.0)) == 0.0
+    assert float(weights.get("TLT", 0.0)) == 0.0
+    assert analysis["anchor_weights"]["QQQ"] == 0.0
+    assert analysis["anchor_weights"]["TLT"] == 0.0
+    assert analysis["rows"]["QQQ"]["allocation_enabled"] is False
+    assert analysis["rows"]["TLT"]["allocation_enabled"] is False
+
+
+def test_ac_b2c_orchestrator_treats_hedge_lite_as_observational_only():
+    state = create_initial_state(user_request="시장 전망 + 헤지", mode="mock", seed=83)
+    state["target_ticker"] = "SPY"
+    state["hedge_lite"] = {
+        "hedges": {
+            "TLT": {"score": 0.8, "selected": True, "status": "ok"},
+        }
+    }
+
+    snapshot = orch._current_conviction_snapshot(state, "TLT", "hedge_candidate")
+
+    assert snapshot["hedge_lite"]["selected"] is True
+    assert snapshot["composite_score"] == 0.0
+    assert snapshot["source"] == "neutral"
+
+
+def test_ac_b2d_no_good_hedge_gate_blocks_positive_corr_candidates(monkeypatch):
+    state = create_initial_state(user_request="시장 전망 + 헤지", mode="mock", seed=85)
+    state["analysis_execution_mode"] = "B_main_plus_hedge_lite"
+    state["target_ticker"] = "SPY"
+    state["intent"] = "hedge_design"
+    state["universe"] = ["SPY", "QQQ", "SOXX"]
+
+    main_prices = _price_series_from_returns(([0.01, -0.02, 0.015, -0.01] * 20))
+    qqq_prices = _price_series_from_returns(([0.012, -0.024, 0.018, -0.012] * 20))
+    soxx_prices = _price_series_from_returns(([0.014, -0.03, 0.021, -0.015] * 20))
+
+    class DummyHub:
+        def __init__(self, *args, **kwargs):
+            pass
+
+        def get_price_series(self, ticker, seed=None, lookback_days=None):
+            if ticker == "SPY":
+                return main_prices, [], {"data_ok": True, "limitations": []}
+            if ticker == "QQQ":
+                return qqq_prices, [], {"data_ok": True, "limitations": []}
+            return soxx_prices, [], {"data_ok": True, "limitations": []}
+
+        def get_market_series(self, ticker, seed=None, lookback_days=None):
+            return main_prices, [], {"data_ok": True, "limitations": []}
+
+    monkeypatch.setattr(investment_team, "DataHub", DummyHub)
+
+    out = investment_team.hedge_lite_builder_node(state)
+    hedge_lite = out["hedge_lite"]
+
+    assert hedge_lite["selected_hedges"] == []
+    assert hedge_lite["reason"] == "no_good_hedge_candidates"
+    assert hedge_lite["weights_advisory"]["SPY"] == 1.0
+    assert "weak_hedge_ratio" in hedge_lite["hedges"]["QQQ"]["gate_reasons"]
+    assert "poor_downside_capture" in hedge_lite["hedges"]["SOXX"]["gate_reasons"]
+
+
+def test_ac_b2e_hedge_lite_sizes_advisory_weights_by_hedge_ratio(monkeypatch):
+    state = create_initial_state(user_request="시장 전망 + 헤지", mode="mock", seed=87)
+    state["analysis_execution_mode"] = "B_main_plus_hedge_lite"
+    state["target_ticker"] = "SPY"
+    state["intent"] = "hedge_design"
+    state["scenario_tags"] = ["event_risk"]
+    state["universe"] = ["SPY", "TLT", "UUP"]
+
+    main_prices = _price_series_from_returns(([0.02, -0.02, 0.018, -0.015] * 20))
+    tlt_prices = _price_series_from_returns(([-0.015, 0.012, -0.014, 0.01] * 20))
+    uup_prices = _price_series_from_returns(([-0.12, 0.01, -0.1, 0.008] * 20))
+
+    class DummyHub:
+        def __init__(self, *args, **kwargs):
+            pass
+
+        def get_price_series(self, ticker, seed=None, lookback_days=None):
+            if ticker == "SPY":
+                return main_prices, [], {"data_ok": True, "limitations": []}
+            if ticker == "TLT":
+                return tlt_prices, [], {"data_ok": True, "limitations": []}
+            return uup_prices, [], {"data_ok": True, "limitations": []}
+
+        def get_market_series(self, ticker, seed=None, lookback_days=None):
+            return main_prices, [], {"data_ok": True, "limitations": []}
+
+    monkeypatch.setattr(investment_team, "DataHub", DummyHub)
+
+    out = investment_team.hedge_lite_builder_node(state)
+    hedge_lite = out["hedge_lite"]
+    weights = hedge_lite["weights_advisory"]
+    hedges = hedge_lite["hedges"]
+
+    assert hedge_lite["selected_hedges"] == ["TLT", "UUP"]
+    assert hedges["TLT"]["hedge_ratio_60d"] > hedges["UUP"]["hedge_ratio_60d"] > 0.0
+    assert weights["TLT"] > weights["UUP"] > 0.0
+    assert hedge_lite["hedge_budget"] <= hedge_lite["hedge_budget_cap"] + 1e-6
 
 
 def test_ac1l_sentiment_node_merges_market_snapshot_and_confirmed_events(monkeypatch):

@@ -9,6 +9,8 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
+import telemetry
+import investment_team
 from investment_team import main as run_pipeline
 
 
@@ -62,6 +64,39 @@ def test_events_jsonl_created():
     # 최소 orchestrator, risk_manager, report_writer가 로깅됨
     for expected in ["orchestrator", "risk_manager", "report_writer"]:
         assert expected in nodes_logged, f"{expected} not in events.jsonl"
+
+
+def test_desk_events_record_graph_node_and_agent_id():
+    """_log should emit graph node names, agent_id, and owner_agent_id consistently."""
+    run_id = "identity-log-test"
+    run_dir = Path("runs") / run_id
+    if run_dir.exists():
+        for path in run_dir.iterdir():
+            path.unlink()
+        run_dir.rmdir()
+
+    telemetry.init_run(run_id, mode="mock")
+    state = {
+        "run_id": run_id,
+        "iteration_count": 1,
+        "target_ticker": "NVDA",
+    }
+
+    investment_team._log(state, "macro_analyst", "enter")
+    investment_team._log(state, "research_router", "enter")
+
+    events_path = run_dir / "events.jsonl"
+    assert events_path.exists()
+
+    with open(events_path, encoding="utf-8") as f:
+        events = [json.loads(line) for line in f if line.strip()]
+
+    assert events[0]["node_name"] == "macro_analyst"
+    assert events[0]["agent_id"] == "macro"
+    assert events[0]["owner_agent_id"] == "macro"
+    assert events[1]["node_name"] == "research_router"
+    assert events[1]["agent_id"] == "research_manager"
+    assert events[1]["owner_agent_id"] == "research_manager"
 
 
 def test_no_broker_code():

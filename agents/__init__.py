@@ -1,1 +1,1 @@
-"""agents — 에이전트 노드 패키지."""
+"""agents — agent-owned role logic and LangGraph node adapters."""

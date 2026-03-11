@@ -1009,6 +1009,8 @@ def _build_fidelity_report(state: dict) -> str:
         lines.append(
             f"- 빌드 상태: {hedge_lite.get('status', 'unknown')} / reason={hedge_lite.get('reason', '')} / seed={hedge_lite.get('seed', 'n/a')}"
         )
+        if bool(hedge_lite.get("advisory_only")):
+            lines.append("- 역할: advisory-only (자동 비중 반영 안 함)")
         selected = hedge_lite.get("selected_hedges", []) or []
         lines.append(f"- 선택 헤지: {selected if selected else '없음'}")
         for ht in [t for t in universe if t != ticker]:
@@ -1038,6 +1040,8 @@ def _build_fidelity_report(state: dict) -> str:
         lines.append(
             f"- Build status: {hedge_lite.get('status', 'unknown')} / reason={hedge_lite.get('reason', '')} / seed={hedge_lite.get('seed', 'n/a')}"
         )
+        if bool(hedge_lite.get("advisory_only")):
+            lines.append("- Role: advisory-only (not auto-applied to weights)")
         selected = hedge_lite.get("selected_hedges", []) or []
         lines.append(f"- Selected hedges: {selected if selected else 'none'}")
         for ht in [t for t in universe if t != ticker]:

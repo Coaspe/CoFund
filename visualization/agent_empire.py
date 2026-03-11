@@ -13,6 +13,8 @@ from datetime import datetime
 from pathlib import Path
 from typing import Any
 
+from runtime_identity import dashboard_node_id_for_event, event_agent_id, event_node_name, event_owner_agent_id
+
 
 RUNS_DIR = Path("runs")
 
@@ -30,6 +32,13 @@ CHARACTER_META: dict[str, dict[str, Any]] = {
         "room_label": "Command Deck",
         "home_dx": 0.0,
         "home_dy": 15.0,
+    },
+    "research_manager": {
+        "avatar": "RG",
+        "accent": "#f4c152",
+        "room_label": "Research Ops",
+        "home_dx": 3.0,
+        "home_dy": 12.0,
     },
     "macro": {
         "avatar": "M",
@@ -73,41 +82,6 @@ CHARACTER_META: dict[str, dict[str, Any]] = {
         "home_dx": 0.0,
         "home_dy": 11.5,
     },
-    "monitoring_router": {
-        "avatar": "MR",
-        "accent": "#f4c152",
-        "room_label": "Monitor Gate",
-        "home_dx": 4.0,
-        "home_dy": 11.5,
-    },
-    "research_router": {
-        "avatar": "RR",
-        "accent": "#f4c152",
-        "room_label": "Evidence Gate",
-        "home_dx": 0.0,
-        "home_dy": 13.0,
-    },
-    "autonomy_planner": {
-        "avatar": "AP",
-        "accent": "#ff9f68",
-        "room_label": "Recovery Pod",
-        "home_dx": -3.0,
-        "home_dy": 11.0,
-    },
-    "bounded_swarm_planner": {
-        "avatar": "BS",
-        "accent": "#fdcf63",
-        "room_label": "Swarm Table",
-        "home_dx": 0.0,
-        "home_dy": 11.0,
-    },
-    "research_executor": {
-        "avatar": "RX",
-        "accent": "#ffd966",
-        "room_label": "Fetch Bay",
-        "home_dx": 3.0,
-        "home_dy": 11.0,
-    },
     "risk_manager": {
         "avatar": "RM",
         "accent": "#ff6e78",
@@ -121,13 +95,6 @@ CHARACTER_META: dict[str, dict[str, Any]] = {
         "room_label": "Memo Studio",
         "home_dx": 2.0,
         "home_dy": 9.5,
-    },
-    "human_handoff": {
-        "avatar": "OPS",
-        "accent": "#93a2bc",
-        "room_label": "Operator Queue",
-        "home_dx": 0.0,
-        "home_dy": 9.0,
     },
 }
 
@@ -145,6 +112,13 @@ PRIMARY_NODE_META: dict[str, dict[str, Any]] = {
         "group": "control",
         "x": 50,
         "y": 16,
+    },
+    "research_manager": {
+        "label": "Research Manager",
+        "subtitle": "Monitoring / Evidence Ops",
+        "group": "research",
+        "x": 68,
+        "y": 58,
     },
     "macro": {
         "label": "Macro",
@@ -188,41 +162,6 @@ PRIMARY_NODE_META: dict[str, dict[str, Any]] = {
         "x": 50,
         "y": 46,
     },
-    "monitoring_router": {
-        "label": "Monitoring Router",
-        "subtitle": "Trigger Gate",
-        "group": "research",
-        "x": 72,
-        "y": 50,
-    },
-    "research_router": {
-        "label": "Research Router",
-        "subtitle": "Evidence Gate",
-        "group": "research",
-        "x": 50,
-        "y": 57,
-    },
-    "autonomy_planner": {
-        "label": "Autonomy Planner",
-        "subtitle": "Gap Recovery",
-        "group": "research",
-        "x": 20,
-        "y": 66,
-    },
-    "bounded_swarm_planner": {
-        "label": "Swarm Planner",
-        "subtitle": "Bounded Search",
-        "group": "research",
-        "x": 41,
-        "y": 70,
-    },
-    "research_executor": {
-        "label": "Research Executor",
-        "subtitle": "Evidence Fetch",
-        "group": "research",
-        "x": 64,
-        "y": 70,
-    },
     "risk_manager": {
         "label": "Risk Manager",
         "subtitle": "5-Gate Barrier",
@@ -236,13 +175,6 @@ PRIMARY_NODE_META: dict[str, dict[str, Any]] = {
         "group": "control",
         "x": 64,
         "y": 86,
-    },
-    "human_handoff": {
-        "label": "Human Handoff",
-        "subtitle": "Operator Queue",
-        "group": "control",
-        "x": 86,
-        "y": 72,
     },
 }
 
@@ -314,6 +246,62 @@ def _format_seconds(value: float | None) -> str:
     minutes = int(value // 60)
     seconds = int(value % 60)
     return f"{minutes}m {seconds:02d}s"
+
+
+def _event_outputs(event: dict[str, Any]) -> dict[str, Any]:
+    outputs = event.get("outputs_summary", {})
+    return outputs if isinstance(outputs, dict) else {}
+
+
+def _research_round_payload(event: dict[str, Any]) -> dict[str, Any]:
+    outputs = _event_outputs(event)
+    if event_node_name(event) == "research_round":
+        return outputs
+    nested = outputs.get("research_round", {})
+    return nested if isinstance(nested, dict) else {}
+
+
+def _rerun_selected_desks(event: dict[str, Any]) -> list[str]:
+    outputs = _event_outputs(event)
+    if event_node_name(event) == "rerun_selector":
+        raw = outputs.get("selected_desks", [])
+    elif event_node_name(event) == "research_executor":
+        rerun = outputs.get("rerun", {})
+        if isinstance(rerun, dict) and isinstance(rerun.get("selected_desks"), list):
+            raw = rerun.get("selected_desks", [])
+        else:
+            raw = outputs.get("selected_desks", [])
+    else:
+        raw = []
+    if not isinstance(raw, list):
+        return []
+    out: list[str] = []
+    seen: set[str] = set()
+    for item in raw:
+        key = str(item or "").strip()
+        if not key or key in seen:
+            continue
+        seen.add(key)
+        out.append(key)
+    return out
+
+
+def _count_raw_node_events(
+    events: list[dict[str, Any]],
+    *,
+    node_name: str,
+    phase: str,
+) -> int:
+    target_node = str(node_name or "").strip()
+    target_phase = str(phase or "").strip().lower()
+    count = 0
+    for event in events:
+        if event_node_name(event) != target_node:
+            continue
+        if str(event.get("phase", "")).strip().lower() != target_phase:
+            continue
+        count += 1
+    return count
 
 
 def _summary_text(payload: Any) -> str:
@@ -443,38 +431,44 @@ def list_runs(runs_dir: Path = RUNS_DIR, *, limit: int = 40) -> list[dict[str, A
 
 
 def _infer_event_flow(event: dict[str, Any]) -> dict[str, str] | None:
-    node = str(event.get("node_name", "")).strip()
+    raw_node = event_node_name(event)
+    node = dashboard_node_id_for_event(event)
     phase = str(event.get("phase", "")).strip().lower()
-    iteration = _coerce_int(event.get("iteration")) or 0
     if phase == "enter":
-        if node == "question_understanding":
+        if raw_node == "question_understanding":
             return None
-        if node == "orchestrator":
-            source = "risk_manager" if iteration > 0 else "question_understanding"
+        if raw_node == "orchestrator":
+            source = "risk_manager" if (_coerce_int(event.get("iteration")) or 0) > 0 else "question_understanding"
             return {"source": source, "target": node}
-        if node in {"macro", "fundamental", "sentiment", "quant"}:
-            source = "research_executor" if iteration > 1 else "orchestrator"
+        if raw_node in {
+            "macro",
+            "macro_analyst",
+            "macro_analyst_research",
+            "fundamental",
+            "fundamental_analyst",
+            "fundamental_analyst_research",
+            "sentiment",
+            "sentiment_analyst",
+            "sentiment_analyst_research",
+            "quant",
+            "quant_analyst",
+            "quant_analyst_research",
+        }:
+            source = "research_manager" if raw_node.endswith("_research") else "orchestrator"
             return {"source": source, "target": node}
-        if node == "hedge_lite_builder":
-            source = "research_executor" if iteration > 1 else "quant"
+        if raw_node == "hedge_lite_builder":
+            source = "research_manager" if (_coerce_int(event.get("iteration")) or 0) > 1 else "quant"
             return {"source": source, "target": node}
-        if node == "portfolio_construction_quant":
+        if raw_node == "portfolio_construction_quant":
             return {"source": "hedge_lite_builder", "target": node}
-        if node == "monitoring_router":
+        if raw_node == "monitoring_router":
             return {"source": "portfolio_construction_quant", "target": node}
-        if node == "research_executor":
-            return {"source": "bounded_swarm_planner", "target": node}
-        if node == "risk_manager":
-            return {"source": "research_router", "target": node}
-        if node == "report_writer":
+        if raw_node in {"research_router", "research_executor", "research_barrier"}:
+            return None
+        if raw_node == "risk_manager":
+            return {"source": "research_manager", "target": node}
+        if raw_node == "report_writer":
             return {"source": "risk_manager", "target": node}
-    if phase == "exit":
-        if node == "autonomy_planner":
-            return {"source": "research_router", "target": node}
-        if node == "bounded_swarm_planner":
-            return {"source": "autonomy_planner", "target": node}
-        if node == "human_handoff":
-            return {"source": "research_router", "target": node}
     return None
 
 
@@ -494,7 +488,7 @@ def _build_dashboard_model(run_id: str, runs_dir: Path = RUNS_DIR) -> dict[str, 
     end_ts = _parse_ts(events[-1].get("ts"))
 
     for event in events:
-        node = str(event.get("node_name", "")).strip() or "unknown"
+        node = dashboard_node_id_for_event(event)
         iteration = _coerce_int(event.get("iteration")) or 0
         unique_iterations.add(iteration)
         stats = node_stats.setdefault(
@@ -573,55 +567,42 @@ def _build_dashboard_model(run_id: str, runs_dir: Path = RUNS_DIR) -> dict[str, 
     if construction_hits > 0:
         interaction_counts[("hedge_lite_builder", "portfolio_construction_quant")] += construction_hits
 
-    monitoring_hits = int(node_stats.get("monitoring_router", {}).get("enter_count", 0))
+    monitoring_hits = _count_raw_node_events(events, node_name="monitoring_router", phase="enter")
     if monitoring_hits > 0:
-        interaction_counts[("portfolio_construction_quant", "monitoring_router")] += monitoring_hits
+        interaction_counts[("portfolio_construction_quant", "research_manager")] += monitoring_hits
 
-    research_router_hits = int(node_stats.get("research_router", {}).get("enter_count", 0))
-    if research_router_hits > 0:
-        interaction_counts[("monitoring_router", "research_router")] += research_router_hits
-
-    autonomy_hits = int(node_stats.get("autonomy_planner", {}).get("exit_count", 0))
-    if autonomy_hits > 0:
-        interaction_counts[("research_router", "autonomy_planner")] += autonomy_hits
-
-    swarm_hits = int(node_stats.get("bounded_swarm_planner", {}).get("exit_count", 0))
-    if swarm_hits > 0:
-        interaction_counts[("autonomy_planner", "bounded_swarm_planner")] += swarm_hits
-
-    executor_hits = int(node_stats.get("research_executor", {}).get("enter_count", 0))
-    if executor_hits > 0:
-        interaction_counts[("bounded_swarm_planner", "research_executor")] += executor_hits
+    risk_from_research_hits = 0
+    for event in events:
+        if event_node_name(event) != "research_router":
+            continue
+        if str(event.get("phase", "")).strip().lower() != "exit":
+            continue
+        outputs = _event_outputs(event)
+        if outputs.get("run") is False:
+            risk_from_research_hits += 1
 
     risk_hits = int(node_stats.get("risk_manager", {}).get("enter_count", 0))
-    if risk_hits > 0:
-        interaction_counts[("research_router", "risk_manager")] += risk_hits
+    if risk_from_research_hits > 0:
+        interaction_counts[("research_manager", "risk_manager")] += risk_from_research_hits
+    if risk_hits > risk_from_research_hits:
+        interaction_counts[("barrier", "risk_manager")] += (risk_hits - risk_from_research_hits)
 
     report_hits = int(node_stats.get("report_writer", {}).get("enter_count", 0))
     if report_hits > 0:
         interaction_counts[("risk_manager", "report_writer")] += report_hits
 
-    handoff_hits = int(node_stats.get("human_handoff", {}).get("exit_count", 0))
-    if handoff_hits > 0:
-        interaction_counts[("research_router", "human_handoff")] += handoff_hits
-
     for event in events:
         if (
-            str(event.get("node_name", "")).strip() == "orchestrator"
+            event_node_name(event) == "orchestrator"
             and str(event.get("phase", "")).strip().lower() == "enter"
             and (_coerce_int(event.get("iteration")) or 0) > 0
         ):
             interaction_counts[("risk_manager", "orchestrator")] += 1
 
     for event in events:
-        if str(event.get("node_name", "")).strip() != "rerun_selector":
-            continue
-        outputs = event.get("outputs_summary", {})
-        if not isinstance(outputs, dict):
-            continue
-        for desk in outputs.get("selected_desks", []) or []:
+        for desk in _rerun_selected_desks(event):
             if str(desk).strip() in PRIMARY_NODE_META:
-                interaction_counts[("research_executor", str(desk).strip())] += 1
+                interaction_counts[("research_manager", str(desk).strip())] += 1
 
     primary_nodes: list[dict[str, Any]] = []
     for node_id, meta_row in PRIMARY_NODE_META.items():
@@ -690,13 +671,11 @@ def _build_dashboard_model(run_id: str, runs_dir: Path = RUNS_DIR) -> dict[str, 
     research_rounds = 0
     evidence_score = None
     for event in events:
-        if str(event.get("node_name", "")).strip() != "research_round":
+        payload = _research_round_payload(event)
+        if not payload:
             continue
-        outputs = event.get("outputs_summary", {})
-        if not isinstance(outputs, dict):
-            continue
-        research_rounds = max(research_rounds, _coerce_int(outputs.get("research_round")) or 0)
-        score = _coerce_int(outputs.get("evidence_score"))
+        research_rounds = max(research_rounds, _coerce_int(payload.get("research_round") or payload.get("round")) or 0)
+        score = _coerce_int(payload.get("evidence_score"))
         if score is not None:
             evidence_score = score
 
@@ -706,7 +685,8 @@ def _build_dashboard_model(run_id: str, runs_dir: Path = RUNS_DIR) -> dict[str, 
         offset_seconds = 0.0
         if ts is not None and start_ts is not None:
             offset_seconds = max((ts - start_ts).total_seconds(), 0.0)
-        node = str(event.get("node_name", "")).strip() or "unknown"
+        raw_node = event_node_name(event) or "unknown"
+        node = dashboard_node_id_for_event(event)
         phase = str(event.get("phase", "")).strip().lower() or "event"
         payload = event.get("outputs_summary") if phase == "exit" else event.get("inputs_summary")
         flow = _infer_event_flow(event)
@@ -714,7 +694,10 @@ def _build_dashboard_model(run_id: str, runs_dir: Path = RUNS_DIR) -> dict[str, 
             {
                 "index": index,
                 "node": node,
-                "label": PRIMARY_NODE_META.get(node, {}).get("label", node.replace("_", " ").title()),
+                "node_name": raw_node,
+                "agent_id": event_agent_id(event),
+                "owner_agent_id": event_owner_agent_id(event),
+                "label": PRIMARY_NODE_META.get(node, {}).get("label", raw_node.replace("_", " ").title()),
                 "phase": phase,
                 "iteration": _coerce_int(event.get("iteration")) or 0,
                 "ts": str(event.get("ts", "")),
@@ -773,7 +756,7 @@ def _build_dashboard_model(run_id: str, runs_dir: Path = RUNS_DIR) -> dict[str, 
     return {
         "run_id": run_id,
         "title": "Agent Empire Replay",
-        "subtitle": "AI investment agents activity map",
+        "subtitle": "AI investment activity map",
         "request": _short_text(request_text, max_len=220),
         "as_of": str(final_state.get("as_of") or meta.get("created_at") or ""),
         "metrics": metrics,
@@ -1740,6 +1723,17 @@ def _render_html(model: dict[str, Any]) -> str:
       font-weight: 700;
     }
 
+    .execution-node-line {
+      margin-top: 3px;
+      color: var(--muted);
+      font-size: 11px;
+      font-family: "IBM Plex Mono", monospace;
+    }
+
+    .execution-node-name {
+      color: var(--text);
+    }
+
     .current-event-meta {
       color: var(--muted);
       font-size: 12px;
@@ -1910,8 +1904,8 @@ def _render_html(model: dict[str, Any]) -> str:
         </div>
         <div class="standby-dock-wrap">
           <div class="standby-head">
-            <div class="standby-headline">Standby Agents</div>
-            <div class="standby-note">이번 run에서 움직이지 않은 에이전트는 여기로 축약합니다.</div>
+            <div class="standby-headline">Standby Units</div>
+            <div class="standby-note">이번 run에서 움직이지 않은 에이전트와 system node는 여기로 축약합니다.</div>
           </div>
           <div class="standby-dock" id="standby-dock"></div>
         </div>
@@ -1932,8 +1926,8 @@ def _render_html(model: dict[str, Any]) -> str:
 
           <div class="panel side-section">
             <div class="section-head">
-              <h2>Live Agent Work</h2>
-              <div class="section-subtle">실행 중인 에이전트의 현재 작업</div>
+              <h2>Live Work</h2>
+              <div class="section-subtle">실행 중인 에이전트 또는 system node의 현재 작업</div>
             </div>
             <div class="agent-work-list" id="agent-work-list"></div>
           </div>
@@ -2001,20 +1995,15 @@ def _render_html(model: dict[str, Any]) -> str:
     const WORK_LABELS = {
       question_understanding: "Parsing request",
       orchestrator: "Coordinating desks",
+      research_manager: "Managing research loop",
       macro: "Checking macro regime",
       fundamental: "Reviewing company setup",
       sentiment: "Reading narrative flow",
       quant: "Sizing trade",
       hedge_lite_builder: "Building hedge overlay",
       portfolio_construction_quant: "Assembling portfolio",
-      monitoring_router: "Routing monitor triggers",
-      research_router: "Triaging evidence gaps",
-      autonomy_planner: "Recovering missing evidence",
-      bounded_swarm_planner: "Planning bounded search",
-      research_executor: "Fetching evidence",
       risk_manager: "Running risk gates",
       report_writer: "Writing memo",
-      human_handoff: "Waiting for operator",
     };
 
     function layoutStorageKey() {
@@ -2117,6 +2106,19 @@ def _render_html(model: dict[str, Any]) -> str:
       return text;
     }
 
+    function executionNodeForEvent(event) {
+      if (!event) {
+        return "";
+      }
+      const rawNode = String(event.node_name || "").trim();
+      const displayNode = String(event.node || "").trim();
+      const agentId = String(event.agent_id || "").trim();
+      if (!rawNode || !displayNode || !agentId || rawNode === displayNode) {
+        return "";
+      }
+      return rawNode;
+    }
+
     function taskLabelForNode(nodeId, fallbackLabel) {
       return WORK_LABELS[nodeId] || fallbackLabel || "Processing";
     }
@@ -2127,10 +2129,18 @@ def _render_html(model: dict[str, Any]) -> str:
       }
       const base = overrideLabel || taskLabelForNode(event.node, event.label);
       const detail = cleanTaskDetail(event.detail);
-      if (event.phase === "exit") {
-        return detail ? `${base} complete · ${detail}` : `${base} complete`;
+      const executionNode = executionNodeForEvent(event);
+      const parts = [];
+      if (executionNode) {
+        parts.push(`node=${executionNode}`);
       }
-      return detail ? `${base} · ${detail}` : base;
+      if (detail) {
+        parts.push(detail);
+      }
+      if (event.phase === "exit") {
+        return parts.length ? `${base} complete · ${parts.join(" · ")}` : `${base} complete`;
+      }
+      return parts.length ? `${base} · ${parts.join(" · ")}` : base;
     }
 
     function createNode(node) {
@@ -2736,17 +2746,21 @@ def _render_html(model: dict[str, Any]) -> str:
         const row = document.createElement("div");
         row.className = "agent-work-item";
         row.innerHTML = `
-          <div class="agent-work-body">No agents are currently active. Work detail appears here as new live events arrive.</div>
+          <div class="agent-work-body">No mapped agents or system nodes are currently active. Work detail appears here as new live events arrive.</div>
         `;
         agentWorkList.appendChild(row);
       }
 
       currentEvent.innerHTML = "";
       if (activeEvent) {
+        const executionNode = executionNodeForEvent(activeEvent);
         const box = document.createElement("div");
         box.innerHTML = `
           <div class="current-event-head">
-            <div class="current-event-title">${activeEvent.label}</div>
+            <div>
+              <div class="current-event-title">${activeEvent.label}</div>
+              ${executionNode ? `<div class="execution-node-line">execution node · <span class="execution-node-name">${executionNode}</span></div>` : ""}
+            </div>
             <div class="current-event-meta">${activeEvent.phase} · iter ${activeEvent.iteration}</div>
           </div>
           <div class="current-event-body">
@@ -2763,12 +2777,13 @@ def _render_html(model: dict[str, Any]) -> str:
       for (let i = start; i <= end; i += 1) {
         const item = model.timeline[i];
         if (!item) continue;
+        const executionNode = executionNodeForEvent(item);
         const row = document.createElement("div");
         row.className = `feed-item ${i === state.index ? "active" : ""}`;
         row.innerHTML = `
           <div class="feed-head">
             <div class="feed-title">${item.label} · ${item.phase}</div>
-            <div class="feed-meta">#${i + 1} · iter ${item.iteration}</div>
+            <div class="feed-meta">#${i + 1} · iter ${item.iteration}${executionNode ? ` · ${executionNode}` : ""}</div>
           </div>
           <div class="feed-body">${item.detail}<br>${item.ts}</div>
         `;

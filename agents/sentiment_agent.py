@@ -476,12 +476,25 @@ def _generate_evidence_requests(
     vol_info: dict,
     no_articles: bool = False,
     focus_areas: Optional[list[str]] = None,
+    asset_type: str = "EQUITY",
 ) -> list:
     """센티먼트 evidence request 생성."""
     reqs = []
     cat_level = catalyst.get("catalyst_risk_level", "low")
     cat_types = catalyst.get("catalyst_type", [])
     vol_z = news_info.get("news_volume_z")
+    confirmed_count = int(catalyst.get("confirmed_count", 0) or 0)
+    effective_article_count = int(news_info.get("effective_article_count", 0) or 0)
+    baseline_days_used = int(news_info.get("baseline_days_used", 0) or 0)
+    baseline_std = _safe_float(news_info.get("baseline_std"))
+    has_sufficient_baseline = (
+        vol_z is not None
+        and effective_article_count >= 5
+        and baseline_days_used >= 5
+        and baseline_std not in (None, 0.0)
+    )
+    threshold = 1.5 if confirmed_count > 0 or cat_level == "high" else 2.5
+    asset_type = str(asset_type or "EQUITY").strip().upper() or "EQUITY"
 
     if cat_level == "high":
         cats = ", ".join(cat_types[:3]) if cat_types else "unknown"
@@ -497,17 +510,17 @@ def _generate_evidence_requests(
                 "rationale": f"catalyst_risk_level=high ({cats})",
             }
         )
-    if vol_z is not None and vol_z > 2.0:
+    if has_sufficient_baseline and vol_z is not None and vol_z >= threshold:
         reqs.append(
             {
                 "desk": "sentiment",
-                "kind": "macro_headline_context",
+                "kind": "web_search",
                 "ticker": ticker,
                 "query": f"{ticker} news volume spike reason",
                 "priority": 2,
                 "recency_days": 3,
                 "max_items": 3,
-                "rationale": f"news_volume_z={vol_z:.1f} spike — cause unknown",
+                "rationale": f"news_volume_z={vol_z:.1f} spike >= {threshold:.1f} with sufficient baseline",
             }
         )
     if vol_info.get("vol_regime") == "crisis" and vol_info.get("source") == "default_fallback":
@@ -538,13 +551,21 @@ def _generate_evidence_requests(
                 },
                 {
                     "desk": "sentiment",
-                    "kind": "press_release_or_ir",
+                    "kind": "web_search" if asset_type in {"ETF", "INDEX"} else "press_release_or_ir",
                     "ticker": ticker,
-                    "query": f"{ticker} investor relations press release latest catalyst update",
+                    "query": (
+                        f"{ticker} ETF flow creation redemption tracking error liquidity options put call skew"
+                        if asset_type in {"ETF", "INDEX"}
+                        else f"{ticker} investor relations press release latest catalyst update"
+                    ),
                     "priority": 2,
                     "recency_days": 14,
                     "max_items": 4,
-                    "rationale": "no_articles_provided -> fallback to official issuer updates",
+                    "rationale": (
+                        "no_articles_provided -> fallback to ETF flow/liquidity context"
+                        if asset_type in {"ETF", "INDEX"}
+                        else "no_articles_provided -> fallback to official issuer updates"
+                    ),
                 },
             ]
         )
@@ -587,6 +608,7 @@ def sentiment_analyst_run(
     state: Optional[dict] = None,
     score_series: Optional[list] = None,
     focus_areas: Optional[list[str]] = None,
+    asset_type: str = "EQUITY",
 ) -> dict:
     """
     Sentiment Analyst v2: news dedupe, news_volume_z, infer_vol_regime (3-tier),
@@ -747,6 +769,7 @@ def sentiment_analyst_run(
         vol_info,
         no_articles=no_articles,
         focus_areas=focus_areas,
+        asset_type=asset_type,
     )
 
     features["_velocity"] = velocity
@@ -825,6 +848,7 @@ def sentiment_analyst_run(
         "generated_at": datetime.now(timezone.utc).isoformat(),
         "as_of": as_of,
         "ticker": ticker,
+        "asset_type": asset_type,
         "horizon_days": horizon_days,
         "focus_areas": focus_areas,
         "primary_decision": primary_decision,

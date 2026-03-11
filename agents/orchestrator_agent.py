@@ -901,12 +901,6 @@ def _current_conviction_snapshot(state: InvestmentState, ticker: str, role: str)
             "selected": bool(row.get("selected")),
             "status": str(row.get("status", "")).strip() or "unknown",
         }
-        if role == "hedge_candidate":
-            base = float(snapshot.get("composite_score", 0.0) or 0.0)
-            blended = max(base, raw_score * 0.8)
-            snapshot["composite_score"] = round(blended, 6)
-            if snapshot.get("source") == "neutral":
-                snapshot["source"] = "hedge_lite"
 
     return snapshot
 
@@ -1197,10 +1191,6 @@ def _build_book_allocation_plan(
         elif conviction_score < 0:
             score -= min(abs(conviction_score), 0.8) * (1.6 if current_weight > 0 else 1.0)
             reasons.append("negative_conviction")
-        hedge_component = conviction.get("hedge_lite", {}) if isinstance(conviction.get("hedge_lite"), dict) else {}
-        if role == "hedge_candidate" and hedge_component.get("selected"):
-            score += 0.35
-            reasons.append("selected_hedge")
         if expected_return_score > 0:
             score += expected_return_score * (1.25 if ticker == main else 0.85)
             reasons.append("expected_return_support")

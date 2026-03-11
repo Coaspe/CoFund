@@ -28,14 +28,19 @@
 - Orchestrator: 이번 라운드에 누가 무엇을 볼지 지시
 - Macro/Fundamental/Sentiment/Quant: 각자 전문 관점으로 분석
 - Hedge Lite / Portfolio Construction Quant: 데스크 결과를 포지션/헤지 후보로 조립
-- Monitoring Router: 이벤트 일정과 품질 저하를 감지해 재검토 필요 여부 판단
-- Research Router/Executor: 근거가 부족하면 자동으로 추가 조사
+- Research Manager: 모니터링, 추가 근거 판단, 실제 조사 실행을 관리
 - Risk Manager: 5개 게이트로 최종 리스크 심사
 - Report Writer: 투자심의 메모 작성
 
 쉽게 말해:
 - 사람으로 치면 "접수창구 -> 팀장 -> 실무자 보고 -> 조립/모니터링 -> 심사위원회 -> 최종 보고서" 흐름이다.
 - 데이터가 약하면 자동으로 "자료 더 찾아와"를 수행한다.
+
+용어 규칙:
+- `agent`: 투자팀 내 책임 주체(Macro, Fundamental, Sentiment, Quant, Orchestrator, Research Manager, Risk Manager, Report Writer)
+- `owner agent`: system node까지 포함해 누가 책임지는지 나타내는 owner
+- `node`: LangGraph에서 실제로 실행되는 단계(`macro_analyst`, `research_router` 등)
+- 일부 node는 agent가 없고 시스템 단계로만 존재한다(`question_understanding`, `barrier`, `hedge_lite_builder` 등)
 
 ---
 
@@ -116,14 +121,12 @@ flowchart LR
 
 ### 2.3 대시보드에만 보이는 보조 단계
 
-운영 화면과 `events.jsonl`에는 아래 보조 단계가 별도 노드처럼 보일 수 있다.
+리서치 보강/복구/운영자 handoff 정보는 별도 그래프 노드가 아니라 `research_router` / `research_executor`의 exit telemetry에 접혀 들어간다.
 
-- `autonomy_planner`: 실행 중 복구/보강 아이디어 생성
-- `bounded_swarm_planner`: 추가 리서치 후보 우선순위 정리
-- `research_round`: 리서치 라운드 감사 이벤트
-- `human_handoff`: 자동 복구가 안 되는 경우 운영자 개입 신호
-
-이들은 모두 LangGraph의 1급 노드는 아니고, 감사/운영 추적을 위한 이벤트 계층이다.
+- `recovery`: 실행 중 복구/보강 아이디어 요약
+- `swarm_plan`: 추가 리서치 후보 우선순위 요약
+- `research_round`: 현재 리서치 라운드와 정보 증가량 요약
+- `handoff`: 자동 복구가 막힌 경우 운영자 확인 필요 여부
 
 ---
 
@@ -600,7 +603,7 @@ Provider chain 정책:
 
 ## 10.4 human_handoff가 뜻하는 것
 
-`human_handoff`는 그래프의 다음 노드라기보다 "자동 복구가 막혔으니 운영자 확인이 필요하다"는 운영 신호다.
+`human_handoff`는 별도 다음 노드라기보다, 현재는 `research_router` exit telemetry 안의 `handoff.required=true`로 표현되는 운영 신호다.
 
 주로 이런 경우에 발생한다.
 - 리서치 라운드 한도 도달
@@ -703,7 +706,7 @@ Provider chain 정책:
 6. 운영자 개입이 필요한지 확인
 - `final_state.json`의 `user_action_required`
 - `user_action_items`
-- `events.jsonl`의 `human_handoff`
+- `events.jsonl`의 `research_router` exit 안 `handoff`
 
 ---
 

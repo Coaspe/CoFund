@@ -6,9 +6,10 @@ The system analyzes ideas and portfolios. It does not place trades and does not 
 
 ## Current Runtime Shape
 
-The repository still centers on 7 primary agents:
+The repository still centers on 8 primary agents:
 
 - Orchestrator
+- Research Manager
 - Macro
 - Fundamental
 - Sentiment
@@ -21,9 +22,27 @@ Around those agents, the runtime now includes several non-desk stages:
 - `question_understanding`: frontdoor parser for natural-language intake
 - `hedge_lite_builder`: quick hedge candidate screen
 - `portfolio_construction_quant`: post-desk portfolio assembly
-- `monitoring_router`: event-calendar and quality-trigger escalation
-- `research_router` and `research_executor`: bounded evidence loop
-- `autonomy_planner`, `bounded_swarm_planner`, `research_round`, `human_handoff`: telemetry-visible auxiliary stages used for recovery, planning, and operator escalation
+- `monitoring_router`, `research_router`, `research_executor`, `research_barrier`: graph nodes owned by `research_manager`
+- recovery/planning/handoff details are folded into `research_router` / `research_executor` telemetry rather than emitted as separate runtime nodes
+
+## Terminology
+
+- `agent`: responsibility owner in the investment team (`macro`, `research_manager`, `risk_manager`)
+- `owner agent`: responsibility owner for a node, even when the node itself is still a system node
+- `node`: concrete LangGraph execution step (`macro_analyst`, `macro_analyst_research`, `research_router`)
+- `system node`: a node without an owning investment agent (`question_understanding`, `barrier`, `hedge_lite_builder`)
+
+Telemetry stores both when available:
+
+- `node_name`: actual graph node that ran
+- `agent_id`: owning agent for agent-mapped nodes
+- `owner_agent_id`: owner for the node, including system-owned control nodes
+
+Examples:
+
+- `macro_analyst` -> `agent_id=macro`
+- `macro_analyst_research` -> `agent_id=macro`
+- `research_router` -> `agent_id=research_manager`, `owner_agent_id=research_manager`
 
 ## Graph Variants
 

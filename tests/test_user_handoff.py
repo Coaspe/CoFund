@@ -60,7 +60,8 @@ def test_handoff_required_on_hard_stop_with_blocking_issue(monkeypatch):
     assert out["research_stop_reason"] == "max_research_rounds"
     assert out["user_action_required"] is True
     assert out["user_action_items"][0]["code"] == "newsapi_upgrade_required"
-    assert "human_handoff" in events
+    assert "research_router" in events
+    assert "human_handoff" not in events
 
 
 def test_no_handoff_while_research_still_running(monkeypatch):
